@@ -25,15 +25,6 @@ function _evaluate!(weighted_values, func, xmat, batch)
     return weighted_values
 end
 
-function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
-    x = zeros(nbins + 1, length(lb))
-    delx = zeros(nbins, length(lb))
-    for dim in eachindex(lb, ub)
-        _set_uniform_grid_axis!(view(x, :, dim), view(delx, :, dim), Float64(lb[dim]), Float64(ub[dim]))
-    end
-    return x, delx
-end
-
 _initialize_vegas_grid(lb, ub, nbins, initial_grid) = initial_grid
 
 function _set_uniform_grid_axis!(edges, widths, a, b)

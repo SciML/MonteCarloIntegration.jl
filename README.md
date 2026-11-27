@@ -1,78 +1,45 @@
-# Monte Carlo Integration 
+# MonteCarloIntegration.jl
 
-![CI](https://github.com/ranjanan/MonteCarloIntegration.jl/workflows/CI/badge.svg)
-[![Coverage Status](https://coveralls.io/repos/github/ranjanan/MonteCarloIntegration.jl/badge.svg?branch=master)](https://coveralls.io/github/ranjanan/MonteCarloIntegration.jl?branch=master)
+[![Tests](https://github.com/SciML/MonteCarloIntegration.jl/actions/workflows/Tests.yml/badge.svg?branch=master)](https://github.com/SciML/MonteCarloIntegration.jl/actions/workflows/Tests.yml)
 
-This package provides multidimensional integration 
-algorithms based on monte carlo methods. The biggest
-advantage of using monte carlo methods is that their
-convergence rate is **independent of the dimension of
-the integral**. 
-
-Currently, this package only provides a routine 
-called VEGAS: 
-
-    vegas(f, st, en; kwargs...)
-
-VEGAS is a Monte Carlo algorithm for 
-multidimensional integration based on 
-adaptive importance sampling. It divides
-each dimension into bins and adaptively adjusts
-bin widths so points are sampled from the
-region where the function has highest magnitude. 
-
-Arguments:
-----------
-- st: Array of starting values in each dimension. 
-Defaults to zeros(2)
-- end: Array of ending values in each dimension. 
-Defaults to ones(2)
-
-Kwargs:
-------
-- nbins: Number of bins in each dimension. 
-Defaults to 100. 
-- ncalls: Number of function calls per iteration. 
-Defaults to 1000.
-- maxiter: Maximum number of iterations. 
-Defaults to 100.
-- rtol: Relative tolerance required. 
-Defaults to 1e-4.
-- atol: Absolute tolerance required. 
-Defaults to 1e-2.
-- debug: Prints `abs(sd/I)` every 100 iterations. 
-Defaults to false.
-- `batch = false`: Pass one sample at a time to `f` and return a scalar for each.
-- `batch = true`: Pass a vector of column views to `f` once per iteration.
-- `batch = :matrix`: Pass an `ndims × ncalls` matrix to `f` once per iteration,
-  with one sample per column. Return a vector with one value per column.
-
-Output:
-------
-- Estimate for the integral 
-- Standard deviation
-- χ^2 / (numiter - 1): should be less than 1 
-otherwise integral estimate should not be trusted. 
-
-References:
------------
-- Lepage, G. Peter. "A new algorithm for adaptive 
-multidimensional integration." Journal of 
-Computational Physics 27.2 (1978): 192-203.
-
-### Matrix batches and grid reuse
+`vegas` estimates a scalar integral over a multidimensional box and reports its
+Monte Carlo standard error. It learns a grid on each axis to concentrate samples
+where the integrand has large magnitude.
 
 ```julia
 using MonteCarloIntegration
 
+result = vegas(x -> exp(-sum(abs2, x)), zeros(2), ones(2))
+result.integral_estimate, result.standard_deviation
+```
+
+By default, VEGAS uses at most 10 iterations, 10,000 samples per iteration, and
+1,000 bins per axis. `rtol` and `atol` both default to `1e-4`. A reduced
+chi-squared near one is consistent with iteration-to-iteration scatter of the
+size predicted by the uncertainty estimates. Inspect `?vegas` for stopping
+criteria and the fields of the result.
+
+## Matrix batches and grid reuse
+
+For a model that processes many points at once, use `batch = :matrix`. Each
+column is a sample, and the integrand returns one value per column. The
+`batch = true` interface supplies a vector of column views.
+
+```julia
 gaussian_batch(points) = exp.(-vec(sum(abs2, points; dims = 1)))
-trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
+trained = vegas(gaussian_batch, zeros(2), ones(2); batch = :matrix)
 second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 ```
 
-`vegas(f, trained)` starts a new estimate over the same bounds using a copy of
-the adaptive grid in `trained`.
+The second call starts from a copy of the trained grid and computes fresh
+estimates for the new integrand. More examples are in the [package manual](https://github.com/SciML/MonteCarloIntegration.jl/tree/master/docs/src).
 
-### Roadmap 
-- Supporting vector valued functions
-- Other integration algorithms
+## Reference
+
+G. Peter Lepage describes the grid adaptation, uncertainty estimates, and
+stratified sampling in [*Adaptive multidimensional integration: VEGAS enhanced*](https://arxiv.org/abs/2009.05112).
+
+## Roadmap
+
+- Vector-valued integrands
+- Additional integration algorithms
