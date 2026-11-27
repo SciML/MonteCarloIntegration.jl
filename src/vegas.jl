@@ -25,6 +25,12 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 `f` receives a vector of `ncalls` coordinate vectors. With `batch = :matrix`, it
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
+Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
+when bins approach the spacing between adjacent `Float64` values or an integer
+bound cannot be represented as `Float64`. Sample coordinates, edges, and widths
+then use the active `BigFloat` precision. Integral estimates and standard errors
+use `Float64`.
+
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
 bin edges and widths in `adaptive_grid` and `grid_spacing`. The standard error
@@ -55,8 +61,14 @@ function _vegas(
     ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
     grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+end
+
+function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+    nbins = size(widths, 1)
     ndim = size(grid, 2)
-    points = zeros(ndim, ncalls)
+    points = Matrix{eltype(grid)}(undef, ndim, ncalls)
+    unit_points = eltype(points) === Float64 ? points : similar(points, Float64)
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     mass = similar(widths)
@@ -66,16 +78,16 @@ function _vegas(
     errors = Float64[]
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
-        rand!(points)
+        rand!(unit_points)
         for j in axes(points, 2)
             jacobian = 1.0
             for dim in axes(points, 1)
-                y = points[dim, j] * nbins
+                y = unit_points[dim, j] * nbins
                 bin = floor(Int, y) + 1
                 bins[dim, j] = bin
                 width = widths[bin, dim]
                 points[dim, j] = muladd(y - (bin - 1), width, grid[bin, dim])
-                jacobian *= nbins * width
+                jacobian *= Float64(nbins * width)
             end
             values[j] = jacobian
         end
@@ -99,7 +111,8 @@ end
 """
 	sample_from_adaptive_grid(res, ncalls)
 
-Sample using a finetuned adaptive grid.  
+Sample using a finetuned adaptive grid. Sample coordinates preserve the grid's
+floating-point precision.
 """
 function sample_from_adaptive_grid(res, ncalls)
 
@@ -118,7 +131,7 @@ function sample_from_adaptive_grid(res, ncalls)
     from_y_to_x(y, dim) = x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y)
     J(y, dim) = nbins * delx[from_y_to_i(y), dim]
 
-    xmat = similar(ymat)
+    xmat = similar(ymat, _grid_coordinate_type(x, delx))
     for dim in 1:ndim
         xmat[dim, :] .= map(y -> from_y_to_x(y, dim), ymat[dim, :])
     end

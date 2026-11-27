@@ -59,7 +59,8 @@ function _copy_vegas_grid(previous)
     nbins, ndim = size(widths)
     nbins > 0 && ndim > 0 && size(edges) == (nbins + 1, ndim) ||
         throw(ArgumentError("the previous grid must have one more edge than width per dimension"))
-    x, delx = Matrix{Float64}(edges), Matrix{Float64}(widths)
+    T = _grid_coordinate_type(edges, widths)
+    x, delx = Matrix{T}(edges), Matrix{T}(widths)
     all(isfinite, x) && all(isfinite, delx) ||
         throw(ArgumentError("the previous grid must contain finite edges and widths"))
     rtol = eltype(widths) in (Float16, Float32) ? 2eps(eltype(widths)) : 2eps(eltype(delx))
@@ -82,8 +83,28 @@ function _canonicalize_grid_axis!(edges, widths, rtol)
     direction = sign(span)
     for i in eachindex(widths)
         actual = edges[i + 1] - edges[i]
-        (iszero(actual) || sign(actual) == direction) && isapprox(actual, widths[i]; rtol) || return false
+        width = widths[i]
+        width_rtol = width isa BigFloat ? _bigfloat_width_rtol(width) : rtol
+        (iszero(actual) || sign(actual) == direction) && isapprox(actual, width; rtol = width_rtol) || return false
         widths[i] = actual
+    end
+    return true
+end
+
+_bigfloat_width_rtol(width) = ldexp(one(width), 2 - precision(width))
+
+function _matches_uniform_grid(edges, width, ::Type{BigFloat})
+    a, b = first(edges), last(edges)
+    nbins = length(edges) - 1
+    isapprox(width, (b - a) / nbins; rtol = _bigfloat_width_rtol(width)) || return false
+    for i in 1:nbins
+        point = edges[i]
+        point_precision = precision(point)
+        fused = BigFloat(fma(i - 1, width, a); precision = point_precision)
+        if point != fused
+            offset = BigFloat((i - 1) * width; precision = precision(width))
+            point == BigFloat(a + offset; precision = point_precision) || return false
+        end
     end
     return true
 end

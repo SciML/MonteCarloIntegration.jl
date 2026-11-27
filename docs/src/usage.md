@@ -15,6 +15,11 @@ trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
 trained.integral_estimate
 ```
 
+VEGAS uses `BigFloat` coordinates when integration bins approach the local
+spacing between representable `Float64` values or an integer bound cannot be
+represented as `Float64`. A matrix-batched integrand can accept both types by
+preserving the element type of its inputs.
+
 ## Reuse the adaptive grid
 
 Pass a previous result to start a fresh estimate on the same bounds and grid.

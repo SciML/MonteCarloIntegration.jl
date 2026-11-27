@@ -1,15 +1,29 @@
 function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
     length(lb) == length(ub) || throw(DimensionMismatch("bounds must have the same length"))
     isempty(lb) && throw(ArgumentError("the integration box needs at least one dimension"))
-    grid = Matrix{Float64}(undef, nbins + 1, length(lb))
-    widths = Matrix{Float64}(undef, nbins, length(lb))
+    wide_coordinates = false
     for dim in eachindex(lb, ub)
         a, b = Float64(lb[dim]), Float64(ub[dim])
         isfinite(a) && isfinite(b) || throw(ArgumentError("bounds must be finite"))
+        spacing = eps(max(abs(a), abs(b)))
+        lossy_endpoint = (lb[dim] isa Integer && a != lb[dim]) || (ub[dim] isa Integer && b != ub[dim])
+        wide_coordinates |= lossy_endpoint || (lb[dim] != ub[dim] && abs((b - a) / nbins) <= 2spacing)
+    end
+    return _uniform_vegas_grid(wide_coordinates ? BigFloat : Float64, lb, ub, nbins)
+end
+
+function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
+    grid = Matrix{T}(undef, nbins + 1, length(lb))
+    widths = Matrix{T}(undef, nbins, length(lb))
+    for dim in eachindex(lb, ub)
+        a, b = T(lb[dim]), T(ub[dim])
         _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
     end
     return grid, widths
 end
+
+_grid_coordinate_type(edges, widths) =
+    eltype(edges) === BigFloat || eltype(widths) === BigFloat ? BigFloat : Float64
 
 function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha)
     nbins, ndim = size(mass)
@@ -109,7 +123,7 @@ each axis. Axes with zero total weight retain their grid.
 function update_grid(edges, widths, weights)
     new_edges = copy(edges)
     new_widths = copy(widths)
-    proposed = zeros(size(weights, 1))
+    proposed = similar(new_widths, size(weights, 1))
     for dim in axes(weights, 2)
         _rebin!(view(new_edges, :, dim), view(new_widths, :, dim), view(weights, :, dim), proposed)
     end
