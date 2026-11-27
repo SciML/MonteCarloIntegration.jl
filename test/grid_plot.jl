@@ -1,4 +1,4 @@
-using MonteCarloIntegration: VEGASResult, vegas
+using MonteCarloIntegration
 using RecipesBase: apply_recipe
 using Test: @test, @testset, @test_throws
 

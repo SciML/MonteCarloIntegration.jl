@@ -36,8 +36,8 @@ res.integral_estimate, res.standard_deviation
 
 ## Adaptive grid
 
-With Plots.jl installed, pass the integration result to `plot` to draw the
-final VEGAS bin boundaries in the original integration coordinates.
+With Plots.jl installed, pass the [`VEGASResult`](@ref) from `vegas` to `plot`
+to draw the final bin boundaries in the original integration coordinates.
 
 ```julia
 using Plots
