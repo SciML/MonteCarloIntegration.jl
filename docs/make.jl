@@ -11,6 +11,7 @@ makedocs(;
     ),
     pages = [
         "Home" => "index.md",
+        "Using VEGAS" => "usage.md",
         "API" => "api.md",
     ],
 )

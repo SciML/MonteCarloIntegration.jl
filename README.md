@@ -12,7 +12,7 @@ the integral**.
 Currently, this package only provides a routine 
 called VEGAS: 
 
-    vegas(f, st, en, kwargs...)
+    vegas(f, st, en; kwargs...)
 
 VEGAS is a Monte Carlo algorithm for 
 multidimensional integration based on 
@@ -42,12 +42,10 @@ Defaults to 1e-4.
 Defaults to 1e-2.
 - debug: Prints `abs(sd/I)` every 100 iterations. 
 Defaults to false.
-- batch: Whether `f` returns batches of function
-evaluations. `f` is assumed to take one argument 
-`pts`, an `ncalls × ndims` matrix. Each row
-is a unique point and returns an `ncalls` length
-vector of function evals. This argument defaults
-to false. 
+- `batch = false`: Pass one sample at a time to `f` and return a scalar for each.
+- `batch = true`: Pass a vector of column views to `f` once per iteration.
+- `batch = :matrix`: Pass an `ndims × ncalls` matrix to `f` once per iteration,
+  with one sample per column. Return a vector with one value per column.
 
 Output:
 ------
@@ -62,14 +60,18 @@ References:
 multidimensional integration." Journal of 
 Computational Physics 27.2 (1978): 192-203.
 
-### Batch interface
+### Matrix batches and grid reuse
 
-Most of the computation time in an integration
-algorithm is usually spent in function evaluations. 
-The batch interface allows users to provide 
-batches of function evaluations, instead of supplying
-a function directly to be integrated. Users can now
-evaluate a number of points in parallel. 
+```julia
+using MonteCarloIntegration
+
+gaussian_batch(points) = exp.(-vec(sum(abs2, points; dims = 1)))
+trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
+second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
+```
+
+`vegas(f, trained)` starts a new estimate over the same bounds using a copy of
+the adaptive grid in `trained`.
 
 ### Roadmap 
 - Supporting vector valued functions

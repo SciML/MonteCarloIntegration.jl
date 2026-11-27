@@ -12,7 +12,7 @@ struct VEGASResult{T1,T2,T3,T4,T5}
 	grid_spacing::T5
 end
 """
-    vegas(f, st, en, kwargs...)
+    vegas(f, lb = [0.0, 0.0], ub = [1.0, 1.0]; kwargs...)
 
 VEGAS is a Monte Carlo algorithm for 
 multidimensional integration based on 
@@ -42,12 +42,14 @@ Defaults to 1e-4.
 Defaults to 1e-2.
 - debug: Prints `abs(sd/I)` every 100 iterations. 
 Defaults to false.
-- batch: Whether `f` returns batches of function
-evaluations. `f` is assumed to take one argument 
-`pts`, an `ncalls × `ndims` matrix. Each row
-is a unique point and returns an `ncalls` length
-vector of function evals. This argument defaults
-to false. 
+- `batch = false`: Call `f(point)` for each sample and return a scalar per point.
+- `batch = true`: Call `f(points)` once per iteration with a vector of column views.
+- `batch = :matrix`: Call `f(points)` once per iteration with a matrix of size
+  `length(lb) × ncalls`. Each column contains one sample. The matrix is reused
+  across iterations.
+
+For batched evaluation, return one scalar per sample in the input order. With
+`batch = :matrix`, return a vector of length `ncalls`.
 
 Output:
 ------
@@ -67,31 +69,22 @@ Computational Physics 27.2 (1978): 192-203.
 integration: VEGAS enhanced." Journal of 
 Computational Physics 439 (2021): 110386.
 """
-function vegas(func, 
-               lb = [0.,0.], 
-               ub = [1.,1.];
-               maxiter = 10, 
-               nbins = 1000, # from paper
-               ncalls = 10000,
-               rtol = 1e-4, 
-               atol = 1e-4,
-               debug = false, 
-               batch = false,
-			   alpha = 1.5)
+function vegas(func, lb = [0.0, 0.0], ub = [1.0, 1.0]; kwargs...)
+    return _vegas(func, lb, ub, nothing; kwargs...)
+end
+
+function _vegas(
+        func, lb, ub, initial_grid;
+        maxiter = 10, nbins = 1000, ncalls = 10000,
+        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5,
+    )
 
     @assert length(lb) == length(ub)
+    _check_vegas_batch(batch)
 
     ndim = length(lb)
 
-    # Start out with uniform grid
-	x = zeros(nbins+1, ndim)
-	for i = 1:(nbins+1)
-		x[i,:] .= lb + ((ub .- lb) ./ nbins)*(i-1)
-	end
-	delx = zeros(nbins, ndim)
-	for dim = 1:ndim
-		delx[:,dim] .= ((ub[dim] - lb[dim]) / nbins)
-	end
+    x, delx = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
 
 
 
@@ -134,15 +127,8 @@ function vegas(func,
 
 		imat .= from_y_to_i.(ymat)
 
-        # Estimate integral. 
-		# Get all fevals in one shot
-		if batch
-			fevals = func(collect(eachcol(xmat)))
-			@assert length(fevals) == ncalls 
-		else
-			fevals = map(func, eachcol(xmat))
-		end
-		Jsf .= Js .* fevals
+        copyto!(Jsf, Js)
+        _evaluate!(Jsf, func, xmat, batch)
 
 		integral_mc = sum(Jsf) / ncalls
 		variance_mc = (sum(x-> x^2, Jsf)/ncalls - integral_mc^2) / (ncalls - 1) + eps()
@@ -153,12 +139,12 @@ function vegas(func,
 
 		# Now the algorithm tries to make average J^2f^2 
 		# the same in every interval. Do this for every dimension
-		d = calculate_d(Jsf, imat, nbins, alpha)
-	
-        # Update grid to make d equal in all intervals
-        xnew, delxnew = update_grid(x, delx, d)
-		x .= xnew
-		delx .= delxnew
+        if !all(iszero, Jsf)
+            d = calculate_d(Jsf, imat, nbins, alpha)
+            xnew, delxnew = update_grid(x, delx, d)
+            x .= xnew
+            delx .= delxnew
+        end
 
         # Calculate integral and s.d upto this point
 		Itot = sum(integrals ./ sigma_squares) / sum(1 ./ sigma_squares)
