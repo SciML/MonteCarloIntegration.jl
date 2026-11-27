@@ -25,7 +25,9 @@ using Test: @test, @testset
     @test result.standard_deviation > 0
     @test a < result.adaptive_grid[2] < b
     points = MonteCarloIntegration.sample_from_adaptive_grid(result, 128)
+    @test points isa Vector{NTuple{1, BigFloat}}
     @test all(point -> a < only(point) < b, points)
+    @test MonteCarloIntegration.sample_from_adaptive_grid(result, 0) isa Vector{NTuple{1, BigFloat}}
 
     grid = copy(result.adaptive_grid)
     f_batch(points) = map(f, eachcol(points))

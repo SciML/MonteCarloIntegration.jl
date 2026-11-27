@@ -1,6 +1,4 @@
 using Random: rand!
-using Distributions: Uniform
-import QuasiMonteCarlo
 
 struct VEGASResult{T1, T2, T3, T4, T5}
     integral_estimate::T1
@@ -109,31 +107,32 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
 end
 
 """
-	sample_from_adaptive_grid(res, ncalls)
+    sample_from_adaptive_grid(res, ncalls)
 
-Sample using a finetuned adaptive grid. Sample coordinates preserve the grid's
-floating-point precision.
+Draw `ncalls` independent points from the adaptive grid in `res` as a vector
+of coordinate tuples. Each coordinate picks a bin with equal probability
+and samples uniformly within it. The coordinates preserve the grid's
+floating-point precision. Use `Random.seed!` to seed the default RNG.
+The sample count must be nonnegative.
 """
-function sample_from_adaptive_grid(res, ncalls)
+function sample_from_adaptive_grid(res, ncalls::Integer)
+    ncalls >= 0 || throw(ArgumentError("ncalls must be nonnegative"))
+    edges, widths = res.adaptive_grid, res.grid_spacing
+    ndim = size(edges, 2)
+    T = _grid_coordinate_type(edges, widths)
+    samples = Vector{NTuple{ndim, T}}(undef, ncalls)
+    return _sample_grid!(samples, edges, widths, T)
+end
 
-    x = res.adaptive_grid
-    delx = res.grid_spacing
-
-    nbins = size(delx, 1)
-    ndim = size(x, 2)
-
-    # Sample `ncalls` points from this grid
-    # Uniform sampling in `y` space
-    ymat = QuasiMonteCarlo.sample(ncalls, zeros(ndim), ones(ndim), Uniform())
-
-    from_y_to_i(y) = floor(Int, nbins * y) + 1
-    delta(y) = y * nbins + 1 - from_y_to_i(y)
-    from_y_to_x(y, dim) = x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y)
-    J(y, dim) = nbins * delx[from_y_to_i(y), dim]
-
-    xmat = similar(ymat, _grid_coordinate_type(x, delx))
-    for dim in 1:ndim
-        xmat[dim, :] .= map(y -> from_y_to_x(y, dim), ymat[dim, :])
+function _sample_grid!(samples::Vector{NTuple{N, T}}, edges, widths, ::Type{T}) where {N, T}
+    nbins = size(widths, 1)
+    for i in eachindex(samples)
+        samples[i] = ntuple(Val(N)) do dim
+            scaled = nbins * rand()
+            bin = floor(Int, scaled) + 1
+            fraction = scaled + 1 - bin
+            return convert(T, edges[bin, dim] + widths[bin, dim] * fraction)
+        end
     end
-    return map(x -> tuple(x...), eachcol(xmat))
+    return samples
 end
