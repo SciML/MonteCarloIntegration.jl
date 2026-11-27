@@ -34,10 +34,31 @@ reused.integral_estimate, reused.standard_deviation
 ## Interpreting the uncertainty
 
 `result.standard_deviation` estimates the standard error of the integral. For a
-single iteration with independent Jacobian-weighted samples, it is their sample
-standard deviation divided by the square root of the sample count. VEGAS uses
-inverse-variance weights when all iteration variances are positive. If any iteration
-has zero variance, it keeps every estimate with equal weight and also accounts
-for the scatter between iterations. A rare peak can
-escape every sample. Increase the budget and compare independent runs when the
-integral is dominated by a small region.
+single classic VEGAS iteration, it is the sample standard deviation of the
+Jacobian-weighted samples divided by the square root of the sample count.
+VEGAS uses inverse-variance weights when all iteration variances are positive.
+If any iteration has zero variance, it keeps every estimate with equal weight
+and also accounts for the scatter between iterations. A rare peak can escape
+every sample. Increase the budget and compare independent runs when the integral
+is dominated by a small region.
+
+## Adaptive stratification
+
+Enable VEGAS+ with `stratified = true`. VEGAS+ divides the transformed unit box
+into equal-volume strata and allocates more evaluations to strata with larger
+estimated variation. Each iteration uses exactly `ncalls` evaluations and
+reserves at least two per stratum to estimate its variance. Stratification can
+help with narrow ridges and peaks aligned along a diagonal.
+
+```@example matrix_batch
+ridge(x) = max(1 - abs(x[1] - x[2]) / 0.025, 0.0)
+result = vegas(ridge; stratified = true, nbins = 32, ncalls = 2053)
+result.integral_estimate, result.standard_deviation
+```
+
+Each iteration uses a volume-weighted sum of the stratum means and adds the
+estimated variances of the individual stratum contributions. Each iteration
+after the first uses the grid and allocation learned from earlier iterations.
+
+Stratified runs require a positive estimated error for tolerance-based stopping.
+A sampled stratum can appear flat when all of its draws miss a feature.

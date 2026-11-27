@@ -12,11 +12,12 @@ end
 
 include("estimates.jl")
 include("grid.jl")
+include("stratified.jl")
 
 """
     vegas(f, lb = zeros(2), ub = ones(2); maxiter = 10, nbins = 1000,
           ncalls = 10000, rtol = 1e-4, atol = 1e-4, debug = false, batch = false,
-          alpha = 1.5)
+          alpha = 1.5, stratified = false)
 
 Estimate the integral of a real scalar function over the box from `lb` to `ub`
 using adaptive importance sampling. Each of up to `maxiter` iterations draws
@@ -31,10 +32,18 @@ bound cannot be represented as `Float64`. Sample coordinates, edges, and widths
 then use the active `BigFloat` precision. Integral estimates and standard errors
 use `Float64`.
 
+With `stratified = true`, VEGAS+ partitions the transformed unit box into
+equal-volume strata, samples at least twice per stratum, and uses the previous
+iteration's variation to allocate additional samples. Each stratum contributes
+its volume-weighted mean, and the iteration variance sums the variances of these
+contributions.
+
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
 bin edges and widths in `adaptive_grid` and `grid_spacing`. The standard error
 must satisfy both `atol` and `rtol * abs(integral_estimate)` for early stopping.
+With `stratified = true`, early stopping requires a positive standard error.
+Flat integrands with zero estimated error run for all `maxiter` iterations.
 Use `debug = true` to print the relative standard error each iteration.
 
 Iterations use inverse-variance weights when every sample variance is positive.
@@ -53,7 +62,7 @@ end
 
 function _vegas(
         func, lb, ub, initial_grid; maxiter = 10, nbins = 1000, ncalls = 10000,
-        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5
+        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5, stratified = false
     )
     _check_vegas_batch(batch)
     maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
@@ -61,10 +70,11 @@ function _vegas(
     ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
     grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+    strata = stratified ? _VegasStrata(size(grid, 2), ncalls) : nothing
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata)
 end
 
-function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata)
     nbins = size(widths, 1)
     ndim = size(grid, 2)
     points = Matrix{eltype(grid)}(undef, ndim, ncalls)
@@ -72,13 +82,17 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     mass = similar(widths)
-    counts = similar(bins, nbins, ndim)
+    counts = isnothing(strata) ? similar(bins, nbins, ndim) : nothing
     scratch = zeros(nbins)
     estimates = Float64[]
     errors = Float64[]
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
-        rand!(unit_points)
+        if isnothing(strata)
+            rand!(unit_points)
+        else
+            _sample_strata!(unit_points, strata)
+        end
         for j in axes(points, 2)
             jacobian = 1.0
             for dim in axes(points, 1)
@@ -92,17 +106,21 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
             values[j] = jacobian
         end
         _evaluate!(values, func, points, batch)
-        estimate, stderr = _iteration_estimate(values)
+        estimate, stderr = isnothing(strata) ? _iteration_estimate(values) : _stratified_estimate!(strata, values)
         push!(estimates, estimate)
         push!(errors, stderr)
-        if !iszero(stderr)
-            _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha)
+        if !iszero(stderr) && !iszero(alpha) && nbins > 1
+            training_weights = isnothing(strata) ? nothing : _stratified_training_weights!(strata)
+            _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, training_weights)
         end
         mean, error, chi_squared = _combine_estimates(estimates, errors)
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
-        if error < atol && error < rtol * abs(mean)
+        if error < atol && error < rtol * abs(mean) && (isnothing(strata) || error > 0)
             println("Converged in $(iter * ncalls) evaluations")
             break
+        end
+        if !isnothing(strata) && iter < maxiter
+            _redistribute_strata!(strata)
         end
     end
     return VEGASResult(mean, error, chi_squared, grid, widths)

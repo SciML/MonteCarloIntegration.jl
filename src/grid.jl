@@ -25,12 +25,12 @@ end
 _grid_coordinate_type(edges, widths) =
     eltype(edges) === BigFloat || eltype(widths) === BigFloat ? BigFloat : Float64
 
-function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha)
+function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, training_weights = nothing)
     nbins, ndim = size(mass)
     (iszero(alpha) || nbins == 1) && return
     scale = maximum(abs, values)
     iszero(scale) && return
-    _bin_means!(mass, counts, bins, values, scale)
+    _bin_means!(mass, counts, bins, values, scale, training_weights)
     for dim in 1:ndim
         _smooth_weights!(scratch, view(mass, :, dim), alpha)
         _rebin!(view(grid, :, dim), view(widths, :, dim), scratch, view(mass, :, dim))
@@ -38,19 +38,25 @@ function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha)
     return nothing
 end
 
-function _bin_means!(mass, counts, bins, values, scale)
+function _bin_means!(mass, counts, bins, values, scale, training_weights = nothing)
     fill!(mass, 0)
-    fill!(counts, 0)
+    isnothing(training_weights) && fill!(counts, 0)
     for j in eachindex(values)
-        squared = abs2(values[j] / scale)
+        weight = isnothing(training_weights) ? 1.0 : training_weights[j]
+        squared = weight * abs2(values[j] / scale)
         for dim in axes(bins, 1)
             bin = bins[dim, j]
             mass[bin, dim] += squared
-            counts[bin, dim] += 1
+            isnothing(training_weights) && (counts[bin, dim] += 1)
         end
     end
-    for i in eachindex(mass, counts)
-        mass[i] /= max(1, counts[i])
+    if isnothing(training_weights)
+        for i in eachindex(mass, counts)
+            mass[i] /= max(1, counts[i])
+        end
+    else
+        expected_occupancy = length(values) / size(mass, 1)
+        mass ./= expected_occupancy
     end
     return nothing
 end
