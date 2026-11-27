@@ -34,6 +34,22 @@ res = vegas(x -> exp(-sum(abs2, x)), [0.0, 0.0], [1.0, 1.0])
 res.integral_estimate, res.standard_deviation
 ```
 
+## Adaptive grid
+
+With Plots.jl installed, pass the integration result to `plot` to draw the
+final VEGAS bin boundaries in the original integration coordinates.
+
+```julia
+using Plots
+plot(res)
+```
+
+For an integral with two or more dimensions, the first two dimensions appear
+on the horizontal and vertical axes by default. Use `plot(res; dims = (2, 1))`
+to reverse their order or `plot(res; dims = (2,))` to show a single dimension.
+For a one-dimensional integral, `plot(res)` shows the bin boundaries along its
+only dimension.
+
 ## API
 
 ```@docs
