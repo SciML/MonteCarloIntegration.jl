@@ -495,7 +495,7 @@ end
         calls = Ref(0)
         result = vegas(
             _ -> batches[calls[] += 1], [0.0], [1.0];
-            nbins = 1, ncalls = 4, maxiter = length(batches),
+            nbins = 1, ncalls = length(first(batches)), maxiter = length(batches),
             batch = :matrix, alpha = 0.0, rtol, atol,
         )
         return result, calls[]
@@ -504,8 +504,9 @@ end
     function reference_history(batches)
         moments = map(batches) do batch
             values = Rational{BigInt}.(batch)
-            mean = sum(values) / 4
-            return mean, sum(v -> abs2(v - mean), values) / 12
+            count = length(values)
+            mean = sum(values) / count
+            return mean, sum(v -> abs2(v - mean), values) / (count * (count - 1))
         end
         return map(eachindex(moments)) do n
             means = first.(moments[1:n])
@@ -518,6 +519,36 @@ end
             weights = inv.(variances)
             return sum(weights .* means) / sum(weights), inv(sum(weights))
         end
+    end
+
+    terms = [1.0, 2.0^-54, 2.0^-110, -1.0, -1.0, -2.0^-54, 1.0, 2.0^-111]
+    rng = Random.MersenneTwister(119)
+    wide = filter(isfinite, reinterpret(Float64, rand(rng, UInt64, 64)))
+    for samples in (wide, [floatmax(), -floatmax(), nextfloat(0.0)], [0.0, -1.25, 2.5, 3.75], zeros(4))
+        exact = Rational{BigInt}.(samples)
+        n = length(exact)
+        mean = sum(exact) / n
+        variance = sum(v -> abs2(v - mean), exact) / (n * (n - 1))
+        for ordered in (samples, reverse(samples))
+            @test MonteCarloIntegration._exact_binary64_moments(ordered, n) == (mean, variance)
+        end
+    end
+    for values in (terms, reverse(terms)), scale in (-1.0, 1.0, 2.0^500)
+        result, calls = integrate_batches((scale .* values,))
+        @test calls == 1
+        @test result.integral_estimate == scale * (3 * 2.0^-114)
+    end
+
+    a = 2.0^48
+    pairs = ([a - 4, a + 4], [-1.0, 3.0], [-9a - 12, -9a + 12])
+    triples = ([a - 2, a - 1, a + 3], [-1.0, 1.0, 3.0], [-9a - 6, -9a - 3, -9a + 9])
+    for rows in (pairs, triples), order in (rows, reverse(rows)), scale in (1.0, -1.0, 2.0^-600, 2.0^600)
+        batches = map(v -> scale .* v, order)
+        expected, variance = last(reference_history(batches))
+        result, calls = integrate_batches(batches)
+        @test calls == length(batches)
+        @test result.integral_estimate == Float64(expected)
+        @test result.standard_deviation ≈ Float64(sqrt(BigFloat(variance))) rtol = 2eps()
     end
 
     cancellation = (

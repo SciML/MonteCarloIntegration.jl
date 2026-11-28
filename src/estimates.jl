@@ -105,10 +105,12 @@ function _iteration_moments(values, preserve_mean = true)
     bounded = clamp(high, lo / scale, hi / scale)
     mean = scale * bounded
     tail = preserve_mean && bounded == high ? scale * low : 0.0
-    if preserve_mean && (abs(mean) <= floatmin(Float64) || (!iszero(low) && abs(tail) < floatmin(Float64)))
+    cancellation = mixed_signs && abs(offset) <= 8eps(Float64) * n
+    if cancellation || (preserve_mean && (abs(mean) <= floatmin(Float64) || (!iszero(low) && abs(tail) < floatmin(Float64))))
         total = _binary64_sum_units(values)
-        exact = total // (BigInt(n) << 1074)
         rounded = _round_binary64_units(total, n)
+        preserve_mean || return _IterationMean(rounded, 0.0), error, nothing, nothing
+        exact = total // (BigInt(n) << 1074)
         exact == Rational{BigInt}(rounded) && return _IterationMean(rounded, 0.0), error, nothing, nothing
         return _IterationMean(rounded, 0.0), error, exact, nothing
     end
@@ -128,18 +130,83 @@ end
 
 _binary64_sum_units(values) = sum(_binary64_units, values; init = big(0))
 
-function _exact_binary64_moments(values, n)
-    # Accumulate on the lattice of the smallest positive Float64.
-    total = squares = big(0)
-    for value in values
-        units = _binary64_units(value)
-        total += units
-        squares += abs2(units)
+function _binary64_sums(values)
+    index = findfirst(!iszero, values)
+    isnothing(index) && return big(0), big(0), 0
+    first_word = reinterpret(UInt64, values[index])
+    first_exponent = Int((first_word >> 52) & 0x07ff)
+    count_bits = 8sizeof(Int) - leading_zeros(length(values) - 1)
+    max_shift = min(10, fld(22 - count_bits, 2))
+    if max_shift >= 0 && first_exponent > 0
+        base = max(1, first_exponent - cld(max_shift, 2))
+        total, squares = Int128(0), UInt128(0)
+        fits = true
+        for value in values
+            iszero(value) && continue
+            word = reinterpret(UInt64, value)
+            offset = Int((word >> 52) & 0x07ff) - base
+            if !(0 <= offset <= max_shift)
+                fits = false
+                break
+            end
+            mantissa = ((word & 0x000fffffffffffff) | (UInt64(1) << 52)) << offset
+            total += signbit(value) ? -Int128(mantissa) : Int128(mantissa)
+            squares += widemul(mantissa, mantissa)
+        end
+        fits && return BigInt(total), BigInt(squares), base - 1075
     end
+
+    sums = zeros(Int128, 33)
+    squares = zeros(UInt128, 66)
+    minimum_bit = 2045
+    for value in values
+        iszero(value) && continue
+        word = reinterpret(UInt64, value)
+        exponent = Int((word >> 52) & 0x07ff)
+        frac = word & 0x000fffffffffffff
+        mantissa = iszero(exponent) ? frac : frac | (UInt64(1) << 52)
+        bit = max(0, exponent - 1)
+        minimum_bit = min(minimum_bit, bit)
+        i, shift = fldmod(bit, 64)
+        sign = signbit(value) ? -1 : 1
+        @inbounds begin
+            sums[i + 1] += sign * Int128(mantissa << shift)
+            sums[i + 2] += sign * Int128(mantissa >> (64 - shift))
+        end
+
+        square = widemul(mantissa, mantissa)
+        low, high = square % UInt64, UInt64(square >> 64)
+        j, shift = fldmod(2bit, 64)
+        @inbounds begin
+            squares[j + 1] += low << shift
+            squares[j + 2] += (high << shift) | (low >> (64 - shift))
+            squares[j + 3] += high >> (64 - shift)
+        end
+    end
+    return _binary_limb_sum(sums, minimum_bit), _binary_limb_sum(squares, 2minimum_bit), minimum_bit - 1074
+end
+
+function _exact_binary64_moments(values, n)
+    total, sum_squares, shift = _binary64_sums(values)
     count = BigInt(n)
-    mean = total // (count << 1074)
-    variance = (count * squares - abs2(total)) // ((count^2 * (n - 1)) << 2148)
+    mean = _scaled_rational(total, count, shift)
+    variance = _scaled_rational(count * sum_squares - abs2(total), count^2 * (n - 1), 2shift)
     return mean, variance
+end
+
+_scaled_rational(total, count, shift) = shift < 0 ? total // (count << -shift) : (total << shift) // count
+
+function _binary_limb_sum(limbs, unit)
+    # Each sample adds at most one 64-bit digit per limb, so an Int-sized
+    # batch fits in the 128-bit accumulators without a carry in the sample loop.
+    first = findfirst(!iszero, limbs)
+    isnothing(first) && return big(0)
+    last = findlast(!iszero, limbs)
+    total = BigInt(limbs[last])
+    for i in (last - 1):-1:first
+        total = (total << 64) + limbs[i]
+    end
+    return total << (64 * (first - 1) - unit)
 end
 
 function _round_binary64_units(total, count)
@@ -162,42 +229,10 @@ Base.IndexStyle(::Type{_RoundedIterationErrors}) = IndexLinear()
 Base.size(errors::_RoundedIterationErrors) = size(errors.values)
 Base.getindex(errors::_RoundedIterationErrors, i::Int) = _rounded_error(errors.values[i])
 
-function _record_iteration_mean!(estimates, exact_means, mean, exact_mean)
-    if exact_means === nothing && exact_mean !== nothing
-        exact_means = _ExactHistory(map(_exact_mean, estimates))
-    end
-    push!(estimates, mean)
-    if exact_means !== nothing
-        push!(exact_means.values, exact_mean === nothing ? _exact_mean(mean) : exact_mean)
-    end
-    return exact_means
-end
-
-function _record_iteration_variance!(errors, exact_variances, error, exact_variance)
-    if exact_variances === nothing && exact_variance !== nothing
-        exact_variances = _ExactHistory(map(_exact_error_variance, errors))
-    end
-    push!(errors, error)
-    if exact_variances !== nothing
-        push!(exact_variances.values, exact_variance === nothing ? _exact_error_variance(error) : exact_variance)
-    end
-    return exact_variances
-end
-
-function _combine_estimates(estimates, errors::Vector{_IterationError}, exact_means = nothing, exact_variances = nothing)
-    if exact_means === nothing && exact_variances === nothing && !any(_needs_extended_error, errors)
-        return _combine_estimates(estimates, _RoundedIterationErrors(errors))
-    end
-    means = exact_means === nothing ? _exact_counterparts!(_exact_mean, exact_variances, estimates) : exact_means.values
-    variances = exact_variances === nothing ? _exact_counterparts!(_exact_error_variance, exact_means, errors) : exact_variances.values
-    history = exact_means === nothing ? exact_variances : exact_means
-    return _combine_extended_estimates(means, variances, history)
-end
-
-function _exact_error_variance(error::_IterationError)
-    mantissa = Rational{BigInt}(error.mantissa)
-    power = big(1) << abs(error.exponent)
-    return abs2(error.exponent < 0 ? mantissa / power : mantissa * power)
+function _sample_moments(values, estimate, stderr, exact_mean, exact_variance)
+    exact_variance === nothing || return exact_mean, exact_variance
+    iszero(stderr) && return _exact_mean(estimate), zero(Rational{BigInt})
+    return _exact_binary64_moments(values, length(values))
 end
 
 function _combine_extended_estimates(means, variances, history = nothing)
@@ -304,22 +339,12 @@ struct _BoundedHistory
 end
 
 mutable struct _ExactHistory
-    values::Vector{Rational{BigInt}}
-    counterparts::Vector{Rational{BigInt}}
+    means::Vector{Rational{BigInt}}
+    variances::Vector{Rational{BigInt}}
     bounds::Union{Nothing, _BoundedHistory}
 end
 
-_ExactHistory(values) = _ExactHistory(values, Rational{BigInt}[], nothing)
-
-_exact_counterparts!(f, ::Nothing, values) = map(f, values)
-
-function _exact_counterparts!(f, history::_ExactHistory, values)
-    counterparts = history.counterparts
-    for i in (length(counterparts) + 1):length(values)
-        push!(counterparts, f(values[i]))
-    end
-    return counterparts
-end
+_ExactHistory() = _ExactHistory(Rational{BigInt}[], Rational{BigInt}[], nothing)
 
 function _accumulate_centered(bounds, means, variances, pivot, scale, bits, start)
     (; weights, offsets, squares) = bounds
