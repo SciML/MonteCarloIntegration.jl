@@ -176,12 +176,17 @@ function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)
     end
 end
 
-function _copy_vegas_grid(edges, widths)
+function _vegas_grid_size(edges, widths)
     edges isa AbstractMatrix{<:Real} && widths isa AbstractMatrix{<:Real} ||
         throw(ArgumentError("the previous grid must contain real matrices of edges and widths"))
     nbins, ndim = size(widths)
     nbins > 0 && ndim > 0 && size(edges) == (nbins + 1, ndim) ||
         throw(ArgumentError("the previous grid must have one more edge than width per dimension"))
+    return nbins, ndim
+end
+
+function _copy_vegas_grid(edges, widths)
+    nbins, ndim = _vegas_grid_size(edges, widths)
     T = _grid_coordinate_type(edges, widths)
     x, delx = Matrix{T}(edges), Matrix{T}(widths)
     all(isfinite, x) && all(isfinite, delx) ||
@@ -219,14 +224,23 @@ end
 
 function _sampling_grid(result)
     edges, widths = result.adaptive_grid, result.grid_spacing
+    nbins, ndim = _vegas_grid_size(edges, widths)
     T = eltype(edges)
     if _mixed_grid_storage(edges, widths) || T <: _GridStorageExact
         return _with_grid_rounding(() -> _copy_vegas_grid(edges, widths), _grid_coordinate_type(edges, widths))
     end
     if T === Float64
-        _float64_grid_spans_match(edges, widths) || return _copy_vegas_grid(edges, widths)
+        for dim in 1:ndim
+            a, b = edges[1, dim], edges[end, dim]
+            width = widths[1, dim]
+            if a != b &&
+                    _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width) &&
+                    any(i -> edges[i, dim] == edges[i + 1, dim], 1:nbins) &&
+                    _is_uniform_grid_axis(view(edges, :, dim), view(widths, :, dim))
+                return _copy_vegas_grid(edges, widths)
+            end
+        end
     elseif T in (Float16, Float32)
-        nbins = size(widths, 1)
         for dim in axes(edges, 2)
             a, b = edges[begin, dim], edges[end, dim]
             if a != b && abs((b - a) / nbins) <= 2eps(max(abs(a), abs(b))) &&
@@ -238,12 +252,26 @@ function _sampling_grid(result)
     return edges, widths
 end
 
-function _float64_grid_spans_match(edges, widths)
-    size(edges) == (size(widths, 1) + 1, size(widths, 2)) || return false
-    for dim in axes(widths, 2), i in axes(widths, 1)
-        edges[i + 1, dim] - edges[i, dim] == widths[i, dim] || return false
+function _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width)
+    return _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width, Float64) ||
+        _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width, Float32) ||
+        _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width, Float16)
+end
+
+function _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width, ::Type{T}) where {T}
+    lo, hi, step = T(a), T(b), T(width)
+    lo == a && hi == b && step == width || return false
+    spacing = eps(max(abs(lo), abs(hi)))
+    abs(step) <= 2spacing &&
+        isapprox(step, (hi - lo) / nbins; rtol = 2eps(T)) || return false
+    # In one spacing region, integer multiples of the spacing are exact throughout the axis.
+    if abs(step) in (spacing, 2spacing) && signbit(lo) == signbit(hi) && eps(min(abs(lo), abs(hi))) == spacing
+        count = T(nbins)
+        count == nbins && hi - lo == count * step && return false
     end
-    return true
+    T === Float64 && return true
+    left, right = edges[2, dim], edges[nbins, dim]
+    return T(left) == left && T(right) == right
 end
 
 function _canonicalize_grid_axis!(edges::AbstractVector{Float64}, widths, stored_edges, stored_widths, rtol)

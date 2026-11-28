@@ -1,6 +1,4 @@
 using Random: rand!
-using Distributions: Uniform
-import QuasiMonteCarlo
 
 struct VEGASResult{T1, T2, T3, T4, T5}
     integral_estimate::T1
@@ -247,37 +245,60 @@ end
 """
     sample_from_adaptive_grid(res, ncalls)
 
-Sample within the bounds stored in the adaptive grid. Coordinates use the
-stored coordinate type and BigFloat precision.
+Draw `ncalls` independent points inside the adaptive grid and return a vector
+of coordinate tuples. Each dimension uses equal bin probabilities. Samples
+use the stored coordinate type and BigFloat precision. For Float64 grids,
+each draw checks the stored width of the selected cell against its edges.
+Use `Random.seed!` to seed the default RNG. The sample count must be nonnegative.
 """
-function sample_from_adaptive_grid(res, ncalls)
+function sample_from_adaptive_grid(res, ncalls::Integer)
+    ncalls >= 0 || throw(ArgumentError("ncalls must be nonnegative"))
     return _with_vegas_precision(_stored_grid_precision(res.adaptive_grid, res.grid_spacing)) do
-        x, delx = _sampling_grid(res)
-        _with_vegas_mapping(x, delx) do working_widths, bits
-            _sample_adaptive_grid(x, working_widths, ncalls, _grid_coordinate_type(x, delx), bits)
+        edges, widths = _sampling_grid(res)
+        _with_vegas_mapping(edges, widths) do working_widths, bits
+            _draw_grid_samples(ncalls, edges, working_widths, _grid_coordinate_type(edges, widths), bits)
         end
     end
 end
 
-function _sample_adaptive_grid(x, delx, ncalls, ::Type{T}, bits = nothing) where {T}
-    nbins = size(delx, 1)
-    ndim = size(x, 2)
+function _draw_grid_samples(ncalls, edges, widths, ::Type{T}, bits) where {T}
+    ndim = size(edges, 2)
+    samples = Vector{NTuple{ndim, T}}(undef, ncalls)
+    return _sample_grid!(samples, edges, widths, T, bits)
+end
 
-    # Sample `ncalls` points from this grid
-    # Uniform sampling in `y` space
-    ymat = T === BigFloat ? rand(BigFloat, ndim, ncalls) : QuasiMonteCarlo.sample(ncalls, zeros(ndim), ones(ndim), Uniform())
+_sampling_cell(edges, widths, bin, dim, ::Nothing) = (edges[bin, dim], _grid_bin_width(edges, widths, bin, dim))
 
-    from_y_to_i(y) = min(nbins, floor(Int, nbins * y) + 1)
-    delta(y) = y * nbins + 1 - from_y_to_i(y)
-    function from_y_to_x(y, dim)
-        bin = from_y_to_i(y)
-        point = x[bin, dim] + _grid_bin_width(x, delx, bin, dim) * delta(y)
-        return _round_vegas_coordinate(_bound_grid_point(point, x, dim), bits)
+function _sampling_cell(edges, widths, bin, dim, canonical)
+    if isnothing(canonical[])
+        lower = edges[bin, dim]
+        span = edges[bin + 1, dim] - lower
+        isfinite(span) && span == widths[bin, dim] && return lower, span
+        canonical[] = _copy_vegas_grid(edges, widths)
     end
+    grid, spacing = canonical[]::Tuple{Matrix{Float64}, Matrix{Float64}}
+    return grid[bin, dim], spacing[bin, dim]
+end
 
-    xmat = similar(ymat, T)
-    for dim in 1:ndim
-        xmat[dim, :] .= map(y -> from_y_to_x(y, dim), ymat[dim, :])
+function _sample_grid!(samples::Vector{NTuple{N, T}}, edges, widths, ::Type{T}, bits) where {N, T}
+    nbins = size(widths, 1)
+    canonical = T === Float64 && eltype(edges) === Float64 ?
+        Ref{Union{Nothing, Tuple{Matrix{Float64}, Matrix{Float64}}}}(nothing) : nothing
+    for i in eachindex(samples)
+        samples[i] = ntuple(Val(N)) do dim
+            if T === BigFloat
+                scaled = nbins * rand(BigFloat)
+                bin = min(nbins, floor(Int, scaled) + 1)
+                fraction = scaled - (bin - 1)
+            else
+                scaled = nbins * rand()
+                bin = floor(Int, scaled) + 1
+                fraction = scaled + 1 - bin
+            end
+            lower, width = _sampling_cell(edges, widths, bin, dim, canonical)
+            point = lower + width * fraction
+            return convert(T, _round_vegas_coordinate(_bound_grid_point(point, edges, dim), bits))
+        end
     end
-    return map(x -> tuple(x...), eachcol(xmat))
+    return samples
 end
