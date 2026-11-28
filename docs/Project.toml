@@ -4,5 +4,5 @@ MonteCarloIntegration = "4886b29c-78c9-11e9-0a6e-41e1f4161f7b"
 
 [compat]
 Documenter = "1"
-MonteCarloIntegration = "0.3"
+MonteCarloIntegration = "0.4"
 julia = "1.10"
