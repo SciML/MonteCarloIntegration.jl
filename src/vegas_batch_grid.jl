@@ -285,6 +285,7 @@ function _grid_width_matches(actual, left::_GridStorageExact, right::_GridStorag
 end
 
 function _grid_width_matches(actual, left::_GridStorageFloat, right::_GridStorageFloat, width::_GridStorageExact, rtol)
+    iszero(actual) && return iszero(width)
     span = _exact_bound(width)
     lo_left, hi_left, close_lo_left, close_hi_left = _grid_rounding_interval(left)
     lo_right, hi_right, close_lo_right, close_hi_right = _grid_rounding_interval(right)
@@ -454,14 +455,18 @@ function _matches_uniform_grid(edges, width, ::Type{BigFloat}, check_last, ancho
 end
 
 function _matches_uniform_grid(edges, width, ::Type{T}, check_last, anchored) where {T}
-    a, b, w = T(first(edges)), T(last(edges)), T(width)
-    a == first(edges) && b == last(edges) && w == width || return false
+    a, w = T(first(edges)), T(width)
+    a == first(edges) && w == width || return false
     nbins = length(edges) - 1
-    nominal = (b - a) / nbins
-    if check_last
-        (anchored || w == nominal || b == fma(nbins, w, a) || b == a + nbins * w) || return false
-    else
-        isapprox(w, nominal; rtol = 2eps(T)) || return false
+    if !anchored
+        b = T(last(edges))
+        b == last(edges) || return false
+        nominal = (b - a) / nbins
+        if check_last
+            (w == nominal || b == fma(nbins, w, a) || b == a + nbins * w) || return false
+        else
+            isapprox(w, nominal; rtol = 2eps(T)) || return false
+        end
     end
     for i in 1:nbins
         point = edges[i]
