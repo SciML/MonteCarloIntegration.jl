@@ -147,3 +147,84 @@ end
         @test rand(UInt64) == next_draw
     end
 end
+
+@testset "Float64 mapping follows the stored edge spans" begin
+    for (a, steps, ncalls, seed, integrand, expected) in (
+            (2.0^53, [0, 2, 5, 7], 500_000, 41, x -> only(x) - 2.0^53, 98.0),
+            (2.0^53, [0, 4, 7, 11], 100_000, 92, x -> Float64(only(x) == 2.0^53 + 16), 2.0),
+            (1.0, [0, 3, 5, 8], 200_000, 12, x -> ((only(x) - 1.0) / eps(1.0) - 4)^3 / (8eps(1.0)), 0.0),
+            (2.0^52, [0, 4, 9, 14, 18], 100_000, 744, x -> Float64(only(x) == 2.0^52 + 4), 1.0),
+        )
+        nbins = length(steps) - 1
+        opts = (; ncalls, maxiter = 1, alpha = 0.0)
+        @testset "$a, $steps, reversed $reversed" for reversed in (false, true)
+            expected_edges = reshape(a .+ eps(a) .* (reversed ? reverse(steps) : steps), :, 1)
+            a0, b0 = first(expected_edges), last(expected_edges)
+            expected_widths = diff(expected_edges; dims = 1)
+            seed!(seed)
+            fresh = vegas(integrand, [a0], [b0]; nbins, opts...)
+            @test fresh.adaptive_grid == expected_edges
+            @test fresh.grid_spacing == expected_widths
+
+            unit = reshape([(i - fraction) / nbins for i in 1:nbins for fraction in (0.75, 0.25)], 1, :)
+            points = similar(unit)
+            bins, weights = zeros(Int, size(unit)), zeros(length(unit))
+            MonteCarloIntegration._map_vegas_points!(
+                points, unit, bins, weights, nothing, fresh.adaptive_grid, fresh.grid_spacing,
+            )
+            @test vec(bins) == repeat(1:nbins; inner = 2)
+            @test weights == repeat(vec(nbins .* expected_widths); inner = 2)
+            for j in eachindex(points)
+                bin = bins[j]
+                left, right = expected_edges[bin], expected_edges[bin + 1]
+                fraction = BigFloat(unit[j] * nbins - (bin - 1))
+                @test points[j] == Float64(BigFloat(left) + fraction * (BigFloat(right) - BigFloat(left)))
+                @test min(left, right) <= points[j] <= max(left, right)
+            end
+
+            nominal_widths = fill((b0 - a0) / nbins, nbins, 1)
+            legacy = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, copy(expected_edges), copy(nominal_widths))
+            physical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, expected_edges, expected_widths)
+            seed!(seed)
+            warm = vegas(integrand, legacy; opts...)
+            @test warm.grid_spacing == expected_widths
+            @test warm.adaptive_grid == expected_edges
+            @test warm.integral_estimate == fresh.integral_estimate
+            @test warm.standard_deviation == fresh.standard_deviation
+            target = reversed ? -expected : expected
+            for estimate in (fresh, warm)
+                @test abs(estimate.integral_estimate - target) <= 6estimate.standard_deviation
+            end
+
+            seed!(seed)
+            samples = MonteCarloIntegration.sample_from_adaptive_grid(legacy, 1024)
+            next_number = rand(UInt64)
+            seed!(seed)
+            @test samples == MonteCarloIntegration.sample_from_adaptive_grid(physical, 1024)
+            @test rand(UInt64) == next_number
+            @test samples isa Vector{Tuple{Float64}}
+            @test legacy.adaptive_grid == expected_edges
+            @test legacy.grid_spacing == nominal_widths
+        end
+    end
+end
+
+@testset "Physical bin spans determine multidimensional Float64 Jacobians" begin
+    a, b = 2.0^53, 2.0^53 + 14
+    ndim, nbins = 32, 3
+    lo, hi = fill(a, ndim), fill(b, ndim)
+    lo[1], hi[1] = b, a
+    result = vegas(Returns(0), lo, hi; nbins, ncalls = 4, maxiter = 1, alpha = 0.0)
+    units = repeat([1 / 6 0.66 5 / 6], ndim, 1)
+    points, bins = similar(units), zeros(Int, size(units))
+    expected = Float64.(-big.([12, 18, 12]) .^ ndim)
+    for exponents in (nothing, zeros(Int, nbins))
+        weights = zeros(nbins)
+        MonteCarloIntegration._map_vegas_points!(
+            points, units, bins, weights, exponents, result.adaptive_grid, result.grid_spacing,
+        )
+        jacobians = exponents === nothing ? weights : ldexp.(weights, exponents)
+        @test all(isapprox.(jacobians, expected; rtol = 8eps(Float64), atol = 0.0))
+        @test bins == repeat([1 2 3], ndim, 1)
+    end
+end
