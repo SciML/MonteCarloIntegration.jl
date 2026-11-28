@@ -6,12 +6,16 @@ function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
         lo, hi = lb[dim], ub[dim]
         a, b = Float64(lo), Float64(hi)
         isfinite(a) && isfinite(b) || throw(ArgumentError("bounds must be finite"))
-        span = b - a
-        spacing = eps(max(abs(a), abs(b)))
-        wide_coordinates |= !isfinite(span) || (lo != hi && abs(span / nbins) <= 2spacing) ||
+        wide_coordinates |= _needs_wide_grid_axis(a, b, nbins, lo != hi) ||
             _lossy_float64_bounds(lo, hi, a, b)
     end
     return _uniform_vegas_grid(wide_coordinates ? BigFloat : Float64, lb, ub, nbins)
+end
+
+function _needs_wide_grid_axis(a, b, nbins, nonflat = a != b)
+    span = b - a
+    spacing = eps(max(abs(a), abs(b)))
+    return !isfinite(span) || (nonflat && abs(span / nbins) <= max(2spacing, floatmin(Float64)))
 end
 
 function _lossy_float64_bounds(lo, hi, a, b)
@@ -30,7 +34,11 @@ function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
     grid = Matrix{T}(undef, nbins + 1, length(lb))
     widths = Matrix{T}(undef, nbins, length(lb))
     for dim in eachindex(lb, ub)
-        a, b = T(lb[dim]), T(ub[dim])
+        lo, hi = lb[dim], ub[dim]
+        a, b = T(lo), T(hi)
+        if T === BigFloat && a == b && lo != hi
+            throw(ArgumentError("active BigFloat precision cannot distinguish the grid bounds"))
+        end
         _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
     end
     return grid, widths
@@ -38,6 +46,12 @@ end
 
 _grid_coordinate_type(edges, widths) =
     eltype(edges) === BigFloat || eltype(widths) === BigFloat ? BigFloat : Float64
+
+_bound_grid_point(point, grid, dim) = point
+
+function _bound_grid_point(point::BigFloat, grid, dim)
+    return clamp(point, minmax(grid[1, dim], grid[end, dim])...)
+end
 
 _stored_grid_precision(grid) = 0
 _stored_grid_precision(grid::AbstractArray{BigFloat}) = maximum(precision, grid; init = 0)

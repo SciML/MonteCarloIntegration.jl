@@ -27,10 +27,10 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
 Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
-when bins approach the spacing between adjacent `Float64` values, a span
-overflows, an integer bound is rounded, or rounding the bounds materially
-changes the interval's span.
-Sample coordinates, edges, and widths then use the active `BigFloat` precision.
+when bin widths are subnormal or approach the spacing between adjacent `Float64`
+values, a span overflows, an integer bound is rounded, or rounding the bounds
+materially changes the interval's span. Sample coordinates, edges, and widths
+then use the active `BigFloat` precision, which must resolve the bins.
 Integral estimates and standard errors use `Float64`.
 
 With `stratified = true`, VEGAS+ partitions the transformed unit box into
@@ -146,7 +146,8 @@ function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid,
             bin = floor(Int, y) + 1
             bins[dim, j] = bin
             width = widths[bin, dim]
-            points[dim, j] = muladd(y - (bin - 1), width, grid[bin, dim])
+            point = muladd(y - (bin - 1), width, grid[bin, dim])
+            points[dim, j] = _bound_grid_point(point, grid, dim)
             if exponents === nothing
                 jacobian *= Float64(nbins * width)
             else
@@ -165,14 +166,14 @@ end
     sample_from_adaptive_grid(res, ncalls)
 
 Sample using a finetuned adaptive grid. Sample coordinates preserve the grid's
-floating-point precision. For a `BigFloat` grid, the active precision must be
-at least the largest precision stored in its edges or widths.
+floating-point precision. Uniform grids with bins too narrow for `Float64`
+are reconstructed at the active `BigFloat` precision. For a `BigFloat` grid,
+the active precision must be at least the largest precision stored in its
+edges or widths.
 """
 function sample_from_adaptive_grid(res, ncalls)
 
-    x = res.adaptive_grid
-    delx = res.grid_spacing
-    _check_grid_precision(x, delx)
+    x, delx = _sampling_grid(res)
 
     nbins = size(delx, 1)
     ndim = size(x, 2)
@@ -183,7 +184,7 @@ function sample_from_adaptive_grid(res, ncalls)
 
     from_y_to_i(y) = floor(Int, nbins * y) + 1
     delta(y) = y * nbins + 1 - from_y_to_i(y)
-    from_y_to_x(y, dim) = x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y)
+    from_y_to_x(y, dim) = _bound_grid_point(x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y), x, dim)
     J(y, dim) = nbins * delx[from_y_to_i(y), dim]
 
     xmat = similar(ymat, _grid_coordinate_type(x, delx))

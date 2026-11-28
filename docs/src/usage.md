@@ -15,11 +15,11 @@ trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
 trained.integral_estimate
 ```
 
-VEGAS uses `BigFloat` coordinates when integration bins approach the local
-spacing between representable `Float64` values, a span overflows, an integer
-bound is rounded, or rounding the bounds materially changes the interval's
-span. A matrix-batched integrand can accept both types by preserving the
-element type of its inputs.
+VEGAS uses `BigFloat` coordinates when bin widths are subnormal or approach the
+local spacing between representable `Float64` values, a span overflows, an
+integer bound is rounded, or rounding the bounds materially changes the
+interval's span. A matrix-batched integrand can accept both types by preserving
+the element type of its inputs.
 
 On boxes with extreme axis lengths, VEGAS scales its Jacobian to avoid
 intermediate overflow or underflow. This applies to scalar and batched

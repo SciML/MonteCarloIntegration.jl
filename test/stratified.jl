@@ -70,6 +70,40 @@ using Test
         @test abs(result.integral_estimate - 2.0) < 5 * result.standard_deviation
     end
 
+    @testset "Stratified warm start with rounded Float64 edges" begin
+        ub = -2.0^53
+        lb = prevfloat(ub)
+        nbins, ncalls, maxiter = 3, 64, 2
+        edges = reshape(collect(range(lb, ub; length = nbins + 1)), :, 1)
+        widths = fill((ub - lb) / nbins, nbins, 1)
+        @test any(iszero, diff(edges; dims = 1))
+        previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
+
+        for batch in (false, true, :matrix)
+            calls, outside = Ref(0), Ref(0)
+            function observe(point)
+                calls[] += 1
+                outside[] += !(lb <= only(point) <= ub)
+                return 1.0
+            end
+            f = if batch === false
+                observe
+            elseif batch === true
+                points -> map(observe, points)
+            else
+                points -> map(observe, eachcol(points))
+            end
+            seed!(2718)
+            result = vegas(f, previous; stratified = true, batch, ncalls, maxiter, alpha = 0)
+            @test calls[] == ncalls * maxiter
+            @test outside[] == 0
+            @test result.integral_estimate ≈ ub - lb rtol = 2eps(Float64)
+            @test iszero(result.standard_deviation)
+            @test result.adaptive_grid[1] == lb
+            @test result.adaptive_grid[end] == ub
+        end
+    end
+
     @testset "Stratified Jacobians for extreme boxes" begin
         offset = 10^16
         side_lengths = [1.0e-200, 1.0e-200, 1.0e200, 1.0e100]
