@@ -754,3 +754,98 @@ end
         end
     end
 end
+
+@testset "Collapsed cells accept only exact zero widths" begin
+    options = (; ncalls = 16, maxiter = 1, alpha = 0.0)
+    sample(grid) = MonteCarloIntegration.sample_from_adaptive_grid(grid, 8)
+    for (orient, direction) in ((identity, 1), (reverse, -1)), sign in (1, -1)
+        for (edges, widths) in (
+                (Float16[2048, 2048], [1]),
+                (Float16[2048, 2048], [-1]),
+                (Float16[2048, 2048], [typemax(Int) ÷ 2]),
+                (Float16[1, 1, 2], [1 // 4096, 1 // 1]),
+                (Float16[1, 1, 2], [-1 // 4096, 1 // 1]),
+                (Float16[1, 1, 2], [1 // 2^50, 1 // 1]),
+                (Float16[1, 1, 2], [big(1) // 4096, big(1) // 1]),
+            )
+            points = reshape(orient(sign .* edges), :, 1)
+            declared = reshape(sign * direction .* orient(widths), :, 1)
+            grid = VEGASResult(0.0, 0.0, 0.0, points, declared)
+            calls = Ref(0)
+            callback(_) = (calls[] += 1; 1.0)
+            seed!(7713)
+            suffix = rand(UInt64)
+            seed!(7713)
+            @test_throws ArgumentError vegas(callback, grid; options...)
+            @test calls[] == 0 && rand(UInt64) == suffix
+            seed!(7713)
+            @test_throws ArgumentError sample(grid)
+            @test rand(UInt64) == suffix
+        end
+        for (edges, widths) in ((Float16[2048, 2048], [0]), (Float16[1, 1, 2], [0 // 1, 1 // 1]))
+            points = reshape(orient(sign .* edges), :, 1)
+            declared = reshape(sign * direction .* orient(widths), :, 1)
+            raw = VEGASResult(0.0, 0.0, 0.0, points, declared)
+            accepted = vegas(Returns(1), raw; options...)
+            @test accepted.adaptive_grid == points
+            @test accepted.grid_spacing == diff(points; dims = 1)
+            seed!(732)
+            actual = sample(raw)
+            suffix = rand(UInt64)
+            seed!(732)
+            @test actual == sample(accepted)
+            @test rand(UInt64) == suffix
+        end
+    end
+end
+
+@testset "Anchored nominal grids recognize native-rounded interior edges" begin
+    options = (; ncalls = 16, maxiter = 1, alpha = 0.0)
+    sample(grid) = MonteCarloIntegration.sample_from_adaptive_grid(grid, 8)
+    setprecision(BigFloat, 192) do
+        for T in (Float16, Float32), sign in (1, -1), direction in (1, -1)
+            origin = sign * T(direction > 0 ? 1 : 2)
+            step = sign * direction * T(0.3)
+            lo, physical_step = BigFloat(origin), BigFloat(step)
+            hi = lo + 3 * (physical_step + copysign(ldexp(one(BigFloat), -80), step))
+            native = [BigFloat(origin + i * step) for i in 0:2]
+            promoted = [lo + i * physical_step for i in 0:2]
+            @test native != promoted
+            @test T(hi) != hi
+            for prefix in (native, promoted)
+                @testset "$T, sign=$sign, direction=$direction, native=$(prefix === native)" begin
+                    edges = reshape([prefix; hi], :, 1)
+                    widths = diff(edges; dims = 1)
+                    grid = VEGASResult(0.0, 0.0, 0.0, edges, fill(step, 3, 1))
+                    reference = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+                    seed!(7527)
+                    expected = vegas(Returns(1), reference; options...)
+                    seed!(7527)
+                    actual = vegas(Returns(1), grid; options...)
+                    @test actual.adaptive_grid == edges
+                    @test actual.grid_spacing == widths
+                    @test (actual.integral_estimate, actual.standard_deviation) == (expected.integral_estimate, expected.standard_deviation)
+                    seed!(6262)
+                    samples = sample(reference)
+                    suffix = rand(UInt64)
+                    seed!(6262)
+                    @test sample(grid) == samples
+                    @test rand(UInt64) == suffix
+                end
+            end
+            for points in ([native; hi + 12 * BigFloat(eps(abs(step))) * direction * sign], [lo, lo, native[3], hi])
+                grid = VEGASResult(0.0, 0.0, 0.0, reshape(points, :, 1), fill(step, 3, 1))
+                calls = Ref(0)
+                callback(_) = (calls[] += 1; 1.0)
+                seed!(168)
+                suffix = rand(UInt64)
+                seed!(168)
+                @test_throws ArgumentError vegas(callback, grid; options...)
+                @test calls[] == 0 && rand(UInt64) == suffix
+                seed!(168)
+                @test_throws ArgumentError sample(grid)
+                @test rand(UInt64) == suffix
+            end
+        end
+    end
+end

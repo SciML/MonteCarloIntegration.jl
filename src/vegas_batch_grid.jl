@@ -40,9 +40,19 @@ function _apply_exact_vegas_weight(weight, value, exponent)
 end
 
 _apply_vegas_weight(weight::Float64, value::_WideVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
-_apply_vegas_weight(weight::Float64, value::_WideVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
 _apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
 _apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
+
+function _apply_vegas_weight(weight::Float64, value::_BinaryOrExactVegasValue, exponents::AbstractVector{<:Integer}, j)
+    scale = exponents[j]
+    value isa Union{BigInt, Rational, BigFloat} && return _apply_exact_vegas_weight(weight, value, scale)
+    binary = Float64(value)
+    value isa Integer && value != binary && return _apply_exact_vegas_weight(weight, value, scale)
+    mantissa, exponent = frexp(binary)
+    product = ldexp(weight * mantissa, scale + exponent)
+    # The subnormal lattice can round an already rounded mantissa a second time.
+    return abs(product) <= floatmin(Float64) ? _apply_exact_vegas_weight(weight, value, scale) : product
+end
 
 function _apply_vegas_weight(weight::BigFloat, value::_BinaryVegasFloat, ::Nothing, _)
     # The binary product needs at most the sum of the two significand lengths.
@@ -303,6 +313,7 @@ function _grid_width_matches(actual, left::_GridStorageExact, right::_GridStorag
 end
 
 function _grid_width_matches(actual, left::_GridStorageFloat, right::_GridStorageFloat, width::_GridStorageExact, rtol)
+    iszero(actual) && return iszero(width)
     span = _exact_bound(width)
     lo_left, hi_left, close_lo_left, close_hi_left = _grid_rounding_interval(left)
     lo_right, hi_right, close_lo_right, close_hi_right = _grid_rounding_interval(right)
@@ -472,14 +483,18 @@ function _matches_uniform_grid(edges, width, ::Type{BigFloat}, check_last, ancho
 end
 
 function _matches_uniform_grid(edges, width, ::Type{T}, check_last, anchored) where {T}
-    a, b, w = T(first(edges)), T(last(edges)), T(width)
-    a == first(edges) && b == last(edges) && w == width || return false
+    a, w = T(first(edges)), T(width)
+    a == first(edges) && w == width || return false
     nbins = length(edges) - 1
-    nominal = (b - a) / nbins
-    if check_last
-        (anchored || w == nominal || b == fma(nbins, w, a) || b == a + nbins * w) || return false
-    else
-        isapprox(w, nominal; rtol = 2eps(T)) || return false
+    if !anchored
+        b = T(last(edges))
+        b == last(edges) || return false
+        nominal = (b - a) / nbins
+        if check_last
+            (w == nominal || b == fma(nbins, w, a) || b == a + nbins * w) || return false
+        else
+            isapprox(w, nominal; rtol = 2eps(T)) || return false
+        end
     end
     for i in 1:nbins
         point = edges[i]
