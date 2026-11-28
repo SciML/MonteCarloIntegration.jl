@@ -3,6 +3,27 @@ function _check_vegas_batch(batch)
     throw(ArgumentError("batch must be false, true, or :matrix"))
 end
 
+function _vegas_callback_type(grid, requested)
+    if requested === BigFloat
+        (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat
+        throw(ArgumentError("active BigFloat precision cannot preserve the callback bounds; increase it with setprecision"))
+    end
+    (requested === nothing || requested === Float64) ||
+        throw(ArgumentError("callback_type must be nothing, Float64, or BigFloat"))
+    (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64
+    requested === nothing && return BigFloat
+    throw(ArgumentError("callback_type = Float64 requires the grid bounds to be exactly representable in Float64"))
+end
+
+function _callback_bounds_fit(::Type{T}, grid) where {T}
+    for dim in axes(grid, 2), row in (firstindex(grid, 1), lastindex(grid, 1))
+        bound = grid[row, dim]
+        converted = T(bound)
+        isfinite(converted) && bound == converted || return false
+    end
+    return true
+end
+
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
 
 function _apply_vegas_weight(weight, value, exponents, j)
@@ -63,7 +84,8 @@ call. The number of bins comes from the grid. If supplied, `nbins` must match
 that number. Uniform grids with bins too narrow for `Float64` are reconstructed
 at the active `BigFloat` precision. Reusing a `BigFloat` grid requires active
 precision at least as high as the largest precision stored in its edges or
-widths. Other keywords have the same meaning as in [`vegas`](@ref).
+widths. The `callback_type` option uses the stored bounds for its default.
+Other keywords have the same meaning as in [`vegas`](@ref).
 """
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)
     x, delx = _copy_vegas_grid(previous)
