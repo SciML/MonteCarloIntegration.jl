@@ -654,8 +654,19 @@ end
     expected_error = setprecision(BigFloat, 256) do
         Float64(sqrt(BigFloat(variance)))
     end
+    visits = zeros(Int, length(widths))
     Random.seed!(22)
-    reused = vegas(Returns(1), historical; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
+    reused = vegas(historical; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0) do x
+        cell = min(searchsortedlast(vec(edges), only(x)), length(visits))
+        visits[cell] += 1
+        return 1
+    end
+    # Float32-rounded edges give each visited bin its own sampling Jacobian.
+    spans = vec(physical)
+    @test sum(spans) == 1.0
+    @test all(>(0), visits) && sum(visits) == options.ncalls
+    @test reused.integral_estimate == length(visits) * sum(visits .* spans) / options.ncalls
+    @test visits == [count(==(i), bins) for i in eachindex(visits)]
     @test reused.integral_estimate === Float64(expected)
     @test reused.standard_deviation === expected_error
     @test edges[2] == Float64(width)
