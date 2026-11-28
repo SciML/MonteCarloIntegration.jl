@@ -347,3 +347,97 @@ end
         end
     end
 end
+
+@testset "Weighted callback values round once at binary64 boundaries" begin
+    power(n) = n < 0 ? big(1) // (big(1) << -n) : (big(1) << n) // 1
+    near_overflow = BigFloat((1 + power(-54)) * power(1024); precision = 55)
+    near_subnormal = BigFloat(3 * (1 + power(-53)) * power(-1075); precision = 55)
+    integer_midpoint = (big(1) << 53) + 1
+    overflow_midpoint = ((big(1) << 54) - 1) << 970
+    cases = (
+        ([1 - power(-53)], near_overflow, BigFloat, (0, 1100)),
+        ([1 - power(-53)], near_subnormal, BigFloat, (0, 1100)),
+        ([1 - power(-53)], near_overflow, Float64, (0,)),
+        ([1 - power(-53)], near_subnormal, Float64, (0,)),
+        ([1 + power(-60)], integer_midpoint, BigFloat, (0, 1100)),
+        ([1 - power(-60)], overflow_midpoint, BigFloat, (0, 1100)),
+        ([1 - power(-60)], overflow_midpoint // 1, BigFloat, (0, 1100)),
+        ([1 + power(-60)], Int64(integer_midpoint), BigFloat, (0,)),
+        ([1 + power(-53)], 3 // 2, BigFloat, (0,)),
+        ([(1 + power(-60)) * power(-1075)], 1.0, BigFloat, (0,)),
+        ([(1 - power(-60)) * power(-1075)], 1.0, BigFloat, (0,)),
+        ([1 + power(-30), 1 - power(-30)], overflow_midpoint, BigFloat, (0, 1100)),
+        ([1 + power(-30), 1 - power(-30), 1 + power(-58)], integer_midpoint, BigFloat, (0, 1100)),
+        ([1 + power(-100), 1 - power(-100)], overflow_midpoint, BigFloat, (0, 1100)),
+        ([1 + power(-100), 1 - power(-100)], integer_midpoint + 2, BigFloat, (0, 1100)),
+    )
+    setprecision(BigFloat, 128) do
+        for (widths, value, coordinate_type, shifts) in cases, shift in shifts, direction in (-1, 1)
+            physical_widths = copy(widths)
+            physical_widths[1] *= power(-shift)
+            lo, hi = zeros(coordinate_type, length(widths)), coordinate_type.(physical_widths)
+            direction < 0 && ((lo[1], hi[1]) = (hi[1], lo[1]))
+            scaled_value = if shift == 0
+                value
+            elseif value isa BigFloat
+                BigFloat(Rational{BigInt}(value) * power(shift); precision = precision(value))
+            else
+                value * (big(1) << shift)
+            end
+            product = direction * prod(physical_widths) * Rational{BigInt}(scaled_value)
+            expected = setprecision(BigFloat, 4096) do
+                Float64(BigFloat(product), RoundNearest)
+            end
+            for mode in (RoundNearest, RoundUp, RoundDown), batch in (false, true, :matrix)
+                setrounding(BigFloat, mode) do
+                    observed = Ref(true)
+                    function evaluate(_)
+                        observed[] &= rounding(BigFloat) === mode
+                        return scaled_value
+                    end
+                    integrand = batch === false ? evaluate : (points -> map(evaluate, batch === true ? points : eachcol(points)))
+                    @test begin
+                        result = vegas(integrand, lo, hi; batch, ncalls = 4, nbins = 1, maxiter = 1, alpha = 0.0)
+                        (result.integral_estimate, result.standard_deviation) === (expected, 0.0)
+                    end
+                    @test observed[]
+                end
+            end
+        end
+    end
+end
+
+@testset "Warm starts use the stored precision of mixed grid matrices" begin
+    setprecision(BigFloat, 128) do
+        for T in (Float16, Float32, Float64), reverse_axis in (false, true)
+            for (points, spacing) in ((BigFloat[0, BigFloat("0.1"), 1], T[0.1, 0.9]), (T[0, 0.1, 1], [BigFloat("0.1"), BigFloat("0.9")]))
+                edges = reshape(reverse_axis ? reverse(points) : points, :, 1)
+                widths = reshape(reverse_axis ? -reverse(spacing) : spacing, :, 1)
+                start = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+                saved_edges, saved_widths = copy(edges), copy(widths)
+                normalized = BigFloat.(edges)
+                physical = diff(normalized; dims = 1)
+                reference = VEGASResult(0.0, 0.0, 0.0, normalized, physical)
+                solve(grid) = vegas(only, grid; ncalls = 16, maxiter = 1, alpha = 0.0)
+                seed!(114)
+                target = solve(reference)
+                seed!(114)
+                result = solve(start)
+                @test result.adaptive_grid == normalized && result.grid_spacing == physical
+                @test (result.integral_estimate, result.standard_deviation) == (target.integral_estimate, target.standard_deviation)
+                @test (edges, widths) == (saved_edges, saved_widths)
+                wrong = copy(widths)
+                wrong[1] /= 2
+                @test_throws ArgumentError solve(VEGASResult(0.0, 0.0, 0.0, edges, wrong))
+            end
+        end
+        step = ldexp(BigFloat(1), -1075)
+        edges = reshape(BigFloat[0, step, 2step], :, 1)
+        for sign in (-1, 1)
+            box = VEGASResult(0.0, 0.0, 0.0, sign .* edges, zeros(2, 1))
+            result = vegas(Returns(1), box; ncalls = 4, maxiter = 1, alpha = 0.0)
+            @test result.grid_spacing == fill(sign * step, 2, 1)
+            @test result.integral_estimate === sign * nextfloat(0.0)
+        end
+    end
+end

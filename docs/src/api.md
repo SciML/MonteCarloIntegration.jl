@@ -34,9 +34,13 @@ BigFloat grid construction, adaptation, warm-start validation, and sampling
 round coordinates to nearest. When the requested precision is below 64 bits,
 unit sampling and bin calculations use extra precision. Callback coordinates
 and stored grid values retain the requested precision. Integrand evaluation
-uses the caller's BigFloat rounding mode. BigInt and Rational{BigInt} results
-retain their exact values through Jacobian weighting before rounding to Float64.
+uses the caller's BigFloat rounding mode. BigFloat grids preserve binary
+Jacobian factors and their products through weighting. BigInt,
+Rational{BigInt}, and BigFloat callback values round to Float64 after weighting.
 Direct grid sampling promotes the coordinate type from both grid matrices.
+On Julia versions with process-wide BigFloat precision or rounding, serialize
+VEGAS integration and grid sampling with other BigFloat work that depends on or
+changes those settings.
 
 ```@example matrix_batch
 start = BigFloat(2)^53
@@ -61,9 +65,7 @@ evaluations in both sampling modes.
 ### Reuse the adaptive grid
 
 Pass a previous result to start a fresh estimate on its stored bounds and grid.
-The stored grid also determines the point type and BigFloat precision. On Julia
-versions with process-wide BigFloat precision, coordinate concurrent BigFloat
-work that changes or depends on the ambient precision.
+The stored grid also determines the point type and BigFloat precision.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))

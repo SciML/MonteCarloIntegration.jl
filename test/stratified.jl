@@ -665,3 +665,44 @@ end
         end
     end
 end
+
+@testset "Stratified VEGAS preserves native geometry and rounds weights once" begin
+    options = (; stratified = true, ncalls = 4, maxiter = 1, alpha = 0.0)
+    @testset "Weighted midpoint across callback layouts" begin
+        setprecision(BigFloat, 128) do
+            extent = 1 + ldexp(one(BigFloat), -60)
+            value = (big(1) << 53) + 1
+            expected = Float64(value + 1)
+            for batch in (false, true, :matrix), orientation in (identity, reverse)
+                lo, hi = orientation((BigFloat(0), extent))
+                f = batch === false ? Returns(value) : Returns(fill(value, options.ncalls))
+                result = vegas(f, [lo], [hi]; options..., nbins = 1, batch)
+                @test result.integral_estimate === (lo < hi ? expected : -expected)
+                @test iszero(result.standard_deviation)
+            end
+        end
+    end
+    @testset "Narrow interval with an irrational endpoint" begin
+        setprecision(BigFloat, 512) do
+            inward = BigFloat(π, RoundUp)
+            hi = inward + ldexp(one(BigFloat), -302)
+            result = vegas(Returns(1.0), [π], [hi]; options..., nbins = 1)
+            @test vec(result.adaptive_grid) == [inward, hi]
+            @test result.integral_estimate === Float64(hi - inward)
+        end
+    end
+    @testset "Rounded mixed warm-start widths" begin
+        setprecision(BigFloat, 128) do
+            edges = reshape(BigFloat[0, BigFloat("0.1"), 1], :, 1)
+            mixed = VEGASResult(0.0, 0.0, 0.0, edges, reshape([0.1, 0.9], :, 1))
+            physical = VEGASResult(0.0, 0.0, 0.0, edges, diff(edges; dims = 1))
+            seed!(6731)
+            expected = vegas(only, physical; options...)
+            seed!(6731)
+            result = vegas(only, mixed; options...)
+            @test result.grid_spacing == expected.grid_spacing
+            @test (result.integral_estimate, result.standard_deviation) ==
+                (expected.integral_estimate, expected.standard_deviation)
+        end
+    end
+end
