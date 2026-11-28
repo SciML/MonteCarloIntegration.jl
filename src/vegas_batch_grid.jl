@@ -7,48 +7,51 @@ _vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points))
 
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
 
-const _ExactVegasValue = Union{BigInt, Rational{BigInt}}
+const _WideVegasValue = Union{BigInt, Rational{BigInt}, BigFloat}
+const _BinaryOrExactVegasValue = Union{Integer, Rational, Float16, Float32, Float64, BigFloat}
+
+_vegas_weight_significand(value::Union{Integer, Rational}) = value, 0
+_vegas_weight_significand(value::Union{Float16, Float32, Float64}) = Rational{BigInt}(value), 0
+
+function _vegas_weight_significand(value::BigFloat)
+    return _with_vegas_precision(precision(value)) do
+        mantissa, exponent = frexp(value)
+        Rational{BigInt}(mantissa), exponent
+    end
+end
 
 function _apply_exact_vegas_weight(weight, value, exponent)
     isfinite(weight) && isfinite(value) || return weight * Float64(value)
     if iszero(weight) || iszero(value)
         return xor(signbit(weight), signbit(value)) ? -0.0 : 0.0
     end
-    weighted = Rational{BigInt}(weight) * value
+    weight_mantissa, weight_exponent = _vegas_weight_significand(weight)
+    value_mantissa, value_exponent = _vegas_weight_significand(value)
+    weighted = weight_mantissa * value_mantissa
+    exponent = Int128(exponent) + weight_exponent + value_exponent
     num, den = numerator(weighted), denominator(weighted)
-    order = Int128(exponent) + ndigits(num; base = 2) - ndigits(den; base = 2)
+    order = exponent + ndigits(num; base = 2) - ndigits(den; base = 2)
     # Bit lengths bound the magnitude above and below by adjacent powers of two.
     order <= -1076 && return num < 0 ? -0.0 : 0.0
     order >= 1025 && return num < 0 ? -Inf : Inf
-    shift = Int128(exponent) + 1074
+    shift = exponent + 1074
     return shift >= 0 ? _round_binary64_units(num << shift, den) : _round_binary64_units(num, den << -shift)
 end
 
-_apply_vegas_weight(weight, value::_ExactVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
-_apply_vegas_weight(weight, value::_ExactVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
-
-function _apply_vegas_weight(weight, value::BigFloat, ::Nothing, _)
-    return _with_vegas_precision(max(64, precision(value))) do
-        Float64(weight * value, RoundNearest)
-    end
-end
+_apply_vegas_weight(weight::Float64, value::_WideVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
+_apply_vegas_weight(weight::Float64, value::_WideVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
+_apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
+_apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
 
 function _apply_vegas_weight(weight, value, exponents, j)
     mantissa, exponent = frexp(float(value))
     return ldexp(weight * mantissa, exponents[j] + exponent)
 end
 
-function _apply_vegas_weight(weight, value::BigFloat, exponents, j)
-    return _with_vegas_precision(max(64, precision(value))) do
-        mantissa, exponent = frexp(value)
-        Float64(ldexp(weight * mantissa, exponents[j] + exponent), RoundNearest)
-    end
-end
-
-function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
+function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing, weights = weighted_values)
     if batch === false
         for (j, point) in enumerate(eachcol(xmat))
-            weighted_values[j] = _apply_vegas_weight(weighted_values[j], func(point), exponents, j)
+            weighted_values[j] = _apply_vegas_weight(weights[j], func(point), exponents, j)
         end
         return weighted_values
     end
@@ -59,7 +62,7 @@ function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
     ncalls = length(weighted_values)
     length(values) == ncalls || throw(DimensionMismatch("the integrand must return $ncalls values per batch"))
     for (j, value) in enumerate(values)
-        weighted_values[j] = _apply_vegas_weight(weighted_values[j], value, exponents, j)
+        weighted_values[j] = _apply_vegas_weight(weights[j], value, exponents, j)
     end
     return weighted_values
 end
