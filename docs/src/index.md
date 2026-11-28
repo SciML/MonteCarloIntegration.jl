@@ -30,14 +30,15 @@ Integrate a Gaussian over a two-dimensional box:
 
 ```@example vegas
 using MonteCarloIntegration
-res = vegas(x -> exp(-sum(abs2, x)), [0.0, 0.0], [1.0, 1.0])
+res = vegas(x -> exp(-sum(abs2, x)), [0.0, 0.0], [1.0, 1.0]; nbins = 25)
 res.integral_estimate, res.standard_deviation
 ```
 
 ## Adaptive grid
 
 With Plots.jl installed, pass the [`VEGASResult`](@ref) from `vegas` to `plot`
-to draw the final bin boundaries in the original integration coordinates.
+to draw the final bin boundaries in the original integration coordinates. The
+example uses 25 bins per axis so the grid lines are visible.
 
 ```julia
 using Plots
