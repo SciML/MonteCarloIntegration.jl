@@ -73,10 +73,8 @@ end
     @test points != fresh_points
     @test reused.integral_estimate ≈ fresh.integral_estimate rtol = 0.15
     weighted_values = [
-        points[2, j] * prod(
-                nbins * widths[searchsortedlast(view(edges, :, dim), points[dim, j]), dim]
-                for dim in eachindex(lb)
-            )
+        points[2, j] *
+            prod(nbins * widths[searchsortedlast(view(edges, :, dim), points[dim, j]), dim] for dim in eachindex(lb))
             for j in 1:ncalls
     ]
     expected_mean = sum(weighted_values) / ncalls
