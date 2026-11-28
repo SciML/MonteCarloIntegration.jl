@@ -849,3 +849,87 @@ end
         end
     end
 end
+
+@testset "Exact widths fit one set of rounded edges" begin
+    options = (; ncalls = 16, maxiter = 1, alpha = 0.0)
+    sample(grid) = MonteCarloIntegration.sample_from_adaptive_grid(grid, 16)
+    signed(x, s) = s * x
+    signed(x::BigFloat, s) = BigFloat(s * x; precision = precision(x))
+
+    function rejects(grid)
+        calls = Ref(0)
+        observe(_) = (calls[] += 1; 1.0)
+        seed!(133)
+        suffix = rand(UInt64)
+        seed!(133)
+        @test_throws ArgumentError vegas(observe, grid; options...)
+        @test calls[] == 0 && rand(UInt64) == suffix
+        seed!(133)
+        @test_throws ArgumentError sample(grid)
+        @test rand(UInt64) == suffix
+    end
+
+    function accepts(grid)
+        result = vegas(Returns(1), grid; options...)
+        @test result.adaptive_grid == grid.adaptive_grid
+        @test result.grid_spacing == diff(result.adaptive_grid; dims = 1)
+        seed!(133)
+        points = sample(grid)
+        suffix = rand(UInt64)
+        seed!(133)
+        @test points == sample(result)
+        @test rand(UInt64) == suffix
+    end
+
+    setprecision(BigFloat, 128) do
+        incompatible = [1 + 1 // 4096, 1 + 1 // 1024, 1 - 5 // 4096]
+        compatible = [1 + 1 // 8192, 1 - 1 // 8192, 1 // 1]
+        mixed_big = Union{Int, BigFloat}[0, BigFloat(1; precision = 11), BigFloat(2; precision = 11), BigFloat(3)]
+        for (orient, direction) in ((identity, 1), (reverse, -1)), sign in (1, -1)
+            function stored(edges::AbstractVector{E}, widths::AbstractVector{W}) where {E, W}
+                x = reshape(E[signed(edge, sign) for edge in orient(edges)], :, 1)
+                w = reshape(W[sign * direction * width for width in orient(widths)], :, 1)
+                return VEGASResult(0.0, 0.0, 0.0, x, w)
+            end
+
+            for edges in (Float16[0, 1, 2, 3], mixed_big), I in (Int, BigInt)
+                rejects(stored(edges, Rational{I}.(incompatible)))
+                accepts(stored(edges, Rational{I}.(compatible)))
+            end
+
+            exact_float_edges = Union{Int, Float64}[0, 1.0]
+            rejects(stored(exact_float_edges, [1 + 1 // 2^52]))
+            accepts(stored(exact_float_edges, [1 + 1 // 2^53]))
+            open_float_edges = Union{Int, Float64}[0, nextfloat(1.0)]
+            rejects(stored(open_float_edges, [1 + 3 // 2^53]))
+
+            accepts(stored(Float16[1, 2, 3], [1 // 1, 1 + 5 // 4096]))
+            rejects(stored(Float16[1, 2, nextfloat(Float16(3))], [1 // 1, 1 + 13 // 4096]))
+
+            mixed_edges = Real[0, Float16(1), Float16(2), Float16(3), 4]
+            rejects(stored(mixed_edges, Real[incompatible; Float16(1)]))
+            accepts(stored(mixed_edges, Real[compatible; Float16(1)]))
+            accepts(stored(Union{Int, Float16}[0, Float16(1), 2], compatible[1:2]))
+            accepts(stored(Float16[0, 1, 2], Union{Float16, Rational{Int}}[1 // 1, Float16(1)]))
+
+            for T in (Float64, BigFloat)
+                bridge = Union{T, Rational{Int}}[incompatible[1], T(incompatible[2]), incompatible[3]]
+                rejects(stored(Float16[0, 1, 2, 3], bridge))
+                bridge = Union{T, Rational{Int}}[compatible[1], T(compatible[2]), compatible[3]]
+                accepts(stored(Float16[0, 1, 2, 3], bridge))
+            end
+
+            for exponent in (-10_000_000, 10_000_000)
+                edge = ldexp(one(BigFloat), exponent)
+                rejects(stored(BigFloat[0, edge, 2edge], Union{Int, BigFloat}[edge, 1]))
+                repeated = stored(BigFloat[0, edge, edge], Union{Int, BigFloat}[edge, 0])
+                result = vegas(Returns(0), repeated; options...)
+                @test result.grid_spacing == diff(repeated.adaptive_grid; dims = 1)
+                seed!(133)
+                points = sample(repeated)
+                seed!(133)
+                @test points == sample(result)
+            end
+        end
+    end
+end

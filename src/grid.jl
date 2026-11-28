@@ -186,7 +186,16 @@ function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
     end
 end
 
-_grid_coordinate_type(edges, widths) = float(promote_type(eltype(edges), eltype(widths)))
+_grid_value_type(grid) = eltype(grid)
+
+function _grid_value_type(grid::AbstractArray{T}) where {T}
+    return isconcretetype(T) ? T : mapreduce(typeof, promote_type, grid; init = Union{})
+end
+
+function _grid_coordinate_type(edges, widths)
+    T = promote_type(_grid_value_type(edges), _grid_value_type(widths))
+    return T === Union{} ? Float64 : float(T)
+end
 
 const _LowPrecisionGridFloat = Union{Float16, Float32}
 
@@ -205,6 +214,10 @@ function _bound_grid_point(point, grid, dim)
 end
 
 _stored_grid_precision(grid) = 0
+
+function _stored_grid_precision(grid::AbstractArray{T}) where {T}
+    return isconcretetype(T) ? 0 : maximum(x -> x isa BigFloat ? precision(x) : 0, grid; init = 0)
+end
 _stored_grid_precision(grid::AbstractArray{BigFloat}) = maximum(precision, grid; init = 0)
 _stored_grid_precision(edges, widths) = max(_stored_grid_precision(edges), _stored_grid_precision(widths))
 
