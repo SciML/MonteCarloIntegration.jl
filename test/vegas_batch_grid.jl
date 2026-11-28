@@ -257,6 +257,123 @@ end
     end
 end
 
+@testset "VEGAS positive subnormal iteration errors" begin
+    function scripted_estimate(batches, lower = 0.0, upper = 1.0)
+        next_batch = Ref(0)
+        return vegas(
+            _ -> batches[next_batch[] += 1], [lower], [upper];
+            nbins = 1, ncalls = length(first(batches)), maxiter = length(batches),
+            alpha = 0.0, batch = :matrix, rtol = 0.0, atol = 0.0,
+        )
+    end
+
+    q = nextfloat(0.0)
+    tiny = [0.0, q, q, q]
+    regular = [1.0, 3.0, 3.0, 3.0]
+    for batches in ((tiny, regular), (regular, tiny)), (lower, upper) in ((0.0, 1.0), (1.0, 0.0))
+        result = scripted_estimate(batches, lower, upper)
+        # The two standard errors are q/4 and 1/2, both strictly positive.
+        @test result.integral_estimate == (upper - lower) * q
+        @test result.standard_deviation == 0.0
+        @test result.chi_squared_average ≈ 25.0
+    end
+
+    # Both positive errors round to zero. Their squared ratio is 1/4, giving 1.4q.
+    a = q .* [0, 1, 1, 1, 1, 1, 1, 2]
+    b = q .* [2, 2, 2, 2, 4, 4, 4, 4]
+    for batches in ((a, b), (b, a))
+        result = scripted_estimate(batches)
+        @test result.integral_estimate == q
+        @test result.standard_deviation == 0.0
+        @test result.chi_squared_average ≈ 22.4
+    end
+
+    # The exact variance ratio 4/9 differs from the rounded error ratio squared, 1/4.
+    a = q .* [0, 0, 4, 4]
+    b = q .* [6, 6, 12, 12]
+    for bits in (8, 256), batches in ((a, b), (b, a))
+        result = setprecision(BigFloat, bits) do
+            scripted_estimate(batches)
+        end
+        @test result.integral_estimate == 4q
+        @test result.standard_deviation == q
+        @test result.chi_squared_average ≈ 147 / 13
+    end
+
+    largest = floatmax(Float64)
+    result = scripted_estimate(([-largest, -largest, largest, largest], tiny))
+    @test result.integral_estimate == q
+    @test iszero(result.standard_deviation)
+    @test iszero(result.chi_squared_average)
+
+    for batches in ((fill(1.0, 4), tiny, regular), (regular, tiny, fill(1.0, 4)))
+        result = scripted_estimate(batches)
+        @test result.integral_estimate ≈ 7 / 6
+        @test result.standard_deviation ≈ sqrt(19 / 36)
+        @test result.chi_squared_average ≈ 25.0
+    end
+
+    calls = Ref(0)
+    result = vegas(
+        _ -> (calls[] += 1; tiny), [0.0], [1.0];
+        nbins = 1, ncalls = 4, maxiter = 2, batch = :matrix, rtol = 0.4, atol = q,
+    )
+    @test calls[] == 1
+    @test result.integral_estimate == q
+    @test iszero(result.standard_deviation)
+
+    Random.seed!(13)
+    adapted = vegas(
+        x -> only(x) > 0.5 ? q : 0.0, [0.0], [1.0];
+        nbins = 2, ncalls = 64, maxiter = 1, rtol = 0.0, atol = 0.0,
+    )
+    @test adapted.adaptive_grid[2, 1] > 0.5
+    @test iszero(adapted.standard_deviation)
+
+    cases = (
+        ((q .* [-3, -3, 1, 1], q .* [0, 2, 2, 2]), 75 / 19),
+        ((tiny, -regular, q .* [-1, 1, 1, 1]), 12.6),
+    )
+    for (sample, chi_squared) in cases, batches in (sample, reverse(sample))
+        result = scripted_estimate(batches)
+        @test result.integral_estimate == q
+        @test iszero(result.standard_deviation)
+        @test result.chi_squared_average ≈ chi_squared
+    end
+
+    ties = (
+        ((q .* [2, -2, 1, 4], q .* [-5, -4, -2, -3]), -2q, 57 / 5),
+        ((q .* [-3, 2, -2, -3], q .* [-1, 2, -2, 2]), 0.0, 21 / 17),
+    )
+    for (sample, estimate, chi_squared) in ties, batches in (sample, reverse(sample))
+        result = scripted_estimate(batches)
+        @test result.integral_estimate == estimate
+        @test result.standard_deviation == q
+        @test result.chi_squared_average ≈ chi_squared
+    end
+
+    for a in (1.0, 1.0e100), steps in (1, 130, 258, 1025)
+        b = nextfloat(a, steps)
+        midpoint_floor = nextfloat(a, steps ÷ 2)
+        rounded_midpoint = isodd(steps) && isodd(reinterpret(UInt64, midpoint_floor)) ?
+            nextfloat(midpoint_floor) : midpoint_floor
+        samples = ([a, b, b, b], [a, a, a, b])
+        for batches in (samples, reverse(samples))
+            result = scripted_estimate(batches)
+            @test result.integral_estimate == rounded_midpoint
+            @test result.standard_deviation ≈ (b - a) / sqrt(32)
+            @test result.chi_squared_average ≈ 2.0
+        end
+    end
+
+    for a in (q, floatmax(Float64))
+        result = scripted_estimate((fill(a, 4), fill(a, 4)))
+        @test result.integral_estimate == a
+        @test iszero(result.standard_deviation)
+        @test iszero(result.chi_squared_average)
+    end
+end
+
 @testset "VEGAS zero-variance batches retain information" begin
     options = (; nbins = 2, ncalls = 2, alpha = 0.0, batch = :matrix)
     for a in (1.0e-200, 1.0, 1.0e200)

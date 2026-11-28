@@ -20,7 +20,7 @@ using Test: @test, @testset, @test_throws
     b = nextfloat(a)
     f(x) = 1 + (x[1] - a)
     Random.seed!(1905)
-    result = vegas(f, [a], [b]; options..., alpha = 0.0)
+    result = vegas(f, [a], [b]; options..., alpha = 0.0, callback_type = BigFloat)
     @test result.integral_estimate ≈ 4.0 atol = 0.04
     @test result.standard_deviation > 0
     @test a < result.adaptive_grid[2] < b
@@ -32,7 +32,7 @@ using Test: @test, @testset, @test_throws
     grid = copy(result.adaptive_grid)
     f_batch(points) = map(f, eachcol(points))
     Random.seed!(1906)
-    warmed = vegas(f_batch, result; ncalls = options.ncalls, maxiter = options.maxiter, batch = :matrix)
+    warmed = vegas(f_batch, result; ncalls = options.ncalls, maxiter = options.maxiter, batch = :matrix, callback_type = BigFloat)
     @test warmed.integral_estimate ≈ 4.0 atol = 0.06
     @test result.adaptive_grid == grid
     @test a < warmed.adaptive_grid[2] < b
@@ -92,7 +92,7 @@ end
     for alpha in (0.0, 1.5)
         previous = setprecision(BigFloat, 64) do
             Random.seed!(42)
-            vegas(x -> only(x) - a, [a], [b]; nbins = 3, ncalls = 128, maxiter = 2, alpha)
+            vegas(x -> only(x) - a, [a], [b]; nbins = 3, ncalls = 128, maxiter = 2, alpha, callback_type = BigFloat)
         end
         setprecision(BigFloat, 256) do
             edges, widths = copy(previous.adaptive_grid), copy(previous.grid_spacing)
@@ -188,7 +188,7 @@ end
         a = b - 7eps(abs(b))
         for (lo, hi) in ((a, b), (b, a))
             Random.seed!(2780)
-            result = vegas(x -> sqrt(b - only(x)), [lo], [hi]; nbins = 3, ncalls = 1000, maxiter = 1, alpha = 0.0)
+            result = vegas(x -> sqrt(b - only(x)), [lo], [hi]; nbins = 3, ncalls = 1000, maxiter = 1, alpha = 0.0, callback_type = BigFloat)
             @test isfinite(result.integral_estimate)
             Random.seed!(2781)
             points = MonteCarloIntegration.sample_from_adaptive_grid(result, 1000)
