@@ -1,6 +1,6 @@
 using MonteCarloIntegration: MonteCarloIntegration, vegas
 using Random: seed!
-using Test: @test, @test_logs, @testset, @test_throws
+using Test: @test, @test_logs, @testset, @test_throws, collect_test_logs
 
 @testset "VEGAS preserves integer bounds above binary64 precision" begin
     offset = 2^53
@@ -65,7 +65,7 @@ end
     end
     wrapper(points) = narrow(points)
     seed!(440)
-    sampled = @test_logs (:warn, r"at most four distinct Float64 coordinates.*callback_type = BigFloat") vegas(wrapper, [lo], [hi]; options...)
+    sampled = @test_logs (:warn, r"standard error excludes coordinate-rounding bias.*callback_type = BigFloat") vegas(wrapper, [lo], [hi]; options...)
     @test sampled.integral_estimate == 7.75
     @test calls[] == 1
     @test length(seen) == options.ncalls
@@ -82,6 +82,64 @@ end
     fine = BigFloat(2)^20 + BigFloat(2)^-34
     @test_logs vegas(wrapper, [fine], [fine + 1]; options...)
     @test_logs vegas(wrapper, [0.0], [1.0]; options...)
+end
+
+@testset "VEGAS warns on each coarse Float64 integration" begin
+    offset = 2.0^53
+    lo = BigFloat(offset) + 1 // 8
+    options = (; nbins = 4, ncalls = 16_384, maxiter = 1, alpha = 0.0)
+    seen = Set{Float64}()
+    function periodic(x)
+        point = only(x)
+        point isa Float64 && push!(seen, point)
+        return abs2(sinpi((point - offset) / 2))
+    end
+    wide_periodic(x::AbstractVector{BigFloat}) = periodic(x)
+
+    logs, _ = collect_test_logs(; respect_maxlog = true) do
+        for (width, coordinates) in ((10, 5), (6, 3))
+            hi = lo + width
+            empty!(seen)
+            seed!(440)
+            fresh = vegas(periodic, [lo], [hi]; options...)
+            seed!(440)
+            reused = vegas(periodic, fresh; options...)
+            @test length(seen) == coordinates
+            @test all(p -> lo <= p <= hi, seen)
+            for result in (fresh, reused)
+                @test result.integral_estimate == result.standard_deviation == 0.0
+            end
+
+            seed!(440)
+            explicit = vegas(periodic, [lo], [hi]; options..., callback_type = BigFloat)
+            seed!(440)
+            warm_explicit = vegas(periodic, fresh; options..., callback_type = BigFloat)
+            seed!(440)
+            typed = vegas(wide_periodic, [lo], [hi]; options...)
+            seed!(440)
+            warm_typed = vegas(wide_periodic, fresh; options...)
+            target = width / 2
+            population_se = width / sqrt(8 * options.ncalls)
+            for result in (explicit, warm_explicit, typed, warm_typed)
+                @test result.standard_deviation > 0
+                @test abs(result.integral_estimate - target) < 6 * population_se
+            end
+        end
+    end
+    @test length(logs) == 4
+    @test all(log -> occursin("standard error excludes coordinate-rounding bias", log.message), logs)
+    @test all(log -> log.kwargs[:axis] == 1, logs)
+
+    @test_logs (:warn, r"standard error excludes coordinate-rounding bias") vegas(Returns(1.0), [lo, lo], [lo + 10, lo + 6]; options..., ncalls = 32)
+end
+
+@testset "VEGAS warns when inward rounding removes a tail" begin
+    hi = BigFloat(floatmax(Float64)) * (1 + BigFloat(2)^-12)
+    scale = ldexp(1.0, -1022)
+    result = @test_logs (:warn, r"standard error excludes coordinate-rounding bias") vegas(
+        Returns(scale), [BigFloat(0)], [hi]; nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0
+    )
+    @test result.integral_estimate ≈ Float64(hi * scale)
 end
 
 @testset "VEGAS dispatches on the callback argument shape" begin

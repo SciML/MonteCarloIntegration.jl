@@ -57,12 +57,17 @@ function _inward_float64_callback_bounds(grid)
 end
 
 function _warn_sparse_float64_callbacks(grid, bounds)
+    budget = sqrt(eps(Float64))
+    nbins = size(grid, 1) - 1
     for dim in axes(grid, 2)
         a, b = minmax(grid[begin, dim], grid[end, dim])
         a == b && continue
         lo, hi = bounds === nothing ? (Float64(a), Float64(b)) : (bounds[1][dim], bounds[2][dim])
-        if hi <= nextfloat(lo, 3)
-            @warn "VEGAS callbacks can receive at most four distinct Float64 coordinates on this axis. Use callback_type = BigFloat for higher-precision samples." axis = dim maxlog = 1
+        span = b - a
+        spacing = max(nextfloat(lo) - lo, hi - prevfloat(hi))
+        inward_loss = (BigFloat(lo) - a) + (b - BigFloat(hi))
+        if spacing > budget * (span / nbins) || inward_loss > budget * span
+            @warn "VEGAS default Float64 callback coordinates are coarse on this grid axis. The estimated standard error excludes coordinate-rounding bias. Use callback_type = BigFloat for higher-precision samples." axis = dim
             return nothing
         end
     end

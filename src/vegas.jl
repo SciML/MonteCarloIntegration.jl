@@ -43,10 +43,13 @@ Float64 coordinates are clamped inward, while grid edges and weights retain thei
 precision. Narrow intervals can produce repeated coordinates, including a single
 representable value. Use `callback_type = BigFloat` to receive interior coordinates
 from a widened grid. On a `Float64` grid, this converts existing coordinates at
-the active `BigFloat` precision, which must preserve the bounds. The default
-warns when a nonzero axis of a widened grid has at most four distinct `Float64`
-coordinates. An explicit `callback_type = Float64` selects those coordinates
-without the warning and requires a finite `Float64` value inside every axis.
+the active `BigFloat` precision, which must preserve the bounds. With default
+`Float64` coordinates on widened grids, VEGAS warns once per call if coordinate
+spacing exceeds `sqrt(eps(Float64))` of a nominal bin width or inward rounding
+removes more than that fraction of an axis's span. The standard error estimates
+sampling uncertainty and excludes coordinate-rounding bias. An explicit
+`callback_type = Float64` selects those coordinates without the warning and
+requires a finite `Float64` value inside every axis.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the

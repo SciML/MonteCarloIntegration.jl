@@ -82,11 +82,13 @@ Scalar, vector-batch, and matrix-batch callbacks receive inward-clamped `Float64
 coordinates by default when they accept that type and each axis contains a
 finite `Float64` value. VEGAS supplies `BigFloat` coordinates when the Float64
 path is unavailable and the callback accepts `BigFloat`. Narrow intervals can
-produce repeated points or a single representable value. The default warns when
-a nonzero axis of a widened grid has at most four distinct `Float64` coordinates.
-Use `callback_type = BigFloat` when the integrand needs interior coordinates from
-a widened grid. Reusing a `BigFloat` grid requires active precision at least as
-high as the precision stored in its edges or widths.
+produce repeated points or a single representable value. With default `Float64`
+coordinates on widened grids, VEGAS warns once per call when coordinate spacing
+exceeds `sqrt(eps(Float64))` of a nominal bin width or inward rounding removes
+more than that fraction of an axis's span. The reported standard error excludes
+coordinate-rounding bias. Use `callback_type = BigFloat` when the integrand needs
+interior coordinates from a widened grid. Reusing a `BigFloat` grid requires
+active precision at least as high as the precision stored in its edges or widths.
 
 ### Roadmap 
 - Supporting vector valued functions
