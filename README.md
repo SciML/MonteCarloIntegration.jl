@@ -70,16 +70,17 @@ trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
 second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 ```
 
-`vegas(f, trained)` starts a new estimate over the same bounds using a copy of
-the adaptive grid in `trained`.
+`vegas(f, trained)` starts a new estimate using a copy of the adaptive grid and
+the bounds stored in `trained`.
 
-When the integration bounds or bin widths require extra precision, VEGAS uses
-`BigFloat` coordinates. The active precision must preserve binary-exact bounds
-and the signed span to `Float64` accuracy, and it must resolve the bins. Increase
-it with `setprecision(BigFloat, bits)` if needed. A batch callback can accept both
-coordinate types by preserving the type of its inputs. Reusing a `BigFloat` grid
-requires active precision at least as high as the precision stored in its edges
-or widths.
+VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
+for intervals of nonzero width. When the bounds or bin widths require extra
+precision, it uses `BigFloat` coordinates. The active precision must preserve
+binary-exact bounds and the signed span to `Float64` accuracy and resolve the
+bins. Set it around the call with `setprecision(BigFloat, bits)` if needed. A
+batch callback can accept both coordinate types by preserving the type of its
+inputs. Reusing a `BigFloat` grid requires active precision at least as high as
+the precision stored in its edges or widths.
 
 ### Roadmap 
 - Supporting vector valued functions

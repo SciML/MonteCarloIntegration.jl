@@ -45,8 +45,13 @@ using Test: @test, @testset, @test_throws
                         for result in (fresh, reused)
                             @test result.integral_estimate == Float64(expected)
                             @test result.standard_deviation == 0.0
-                            @test first(result.adaptive_grid) == BigFloat(a)
-                            @test last(result.adaptive_grid) == BigFloat(b)
+                            for (bound, edge) in ((a, first(result.adaptive_grid)), (b, last(result.adaptive_grid)))
+                                if bound isa Rational && !ispow2(denominator(bound))
+                                    @test lo <= Rational{BigInt}(edge) <= hi
+                                else
+                                    @test edge == BigFloat(bound)
+                                end
+                            end
                         end
                         @test eltype(fresh.adaptive_grid) === BigFloat
                         samples = MonteCarloIntegration.sample_from_adaptive_grid(reused, 32)
@@ -81,7 +86,111 @@ end
                 result = vegas(Returns(1.0), [x], [y]; nbins = 2, ncalls = 16, maxiter = 1)
                 @test eltype(result.adaptive_grid) === Float64
                 @test result.integral_estimate ≈ width rtol = 2eps(Float64)
+                @test all(p -> lo <= Rational{BigInt}(p) <= hi, result.adaptive_grid)
+                samples = MonteCarloIntegration.sample_from_adaptive_grid(result, 32)
+                @test all(p -> lo <= Rational{BigInt}(only(p)) <= hi, samples)
             end
+        end
+    end
+end
+
+@testset "VEGAS keeps a wide rational grid inside the requested interval" begin
+    lo = big(2)^64 + 1 // 3
+    hi = lo + 102
+    options = (; nbins = 2, ncalls = 4096, maxiter = 1, alpha = 0.0)
+    inside(x) = lo <= Rational{BigInt}(x) <= hi
+
+    for (a, b, width) in ((lo, hi, 102.0), (hi, lo, -102.0))
+        @testset "$a → $b" begin
+            calls, outside = Ref(0), Ref(0)
+            function integrand(point)
+                calls[] += 1
+                outside[] += !inside(only(point))
+                return 1.0
+            end
+
+            setprecision(BigFloat, 64) do
+                seed!(13)
+                next_draw = rand(UInt64)
+                seed!(13)
+                @test_throws ArgumentError vegas(integrand, [a], [b]; options...)
+                @test calls[] == 0
+                @test rand(UInt64) == next_draw
+            end
+
+            calls[] = outside[] = 0
+            fresh = setprecision(BigFloat, 128) do
+                seed!(13)
+                result = vegas(integrand, [a], [b]; options...)
+                @test calls[] == options.ncalls
+                @test outside[] == 0
+                @test all(inside, result.adaptive_grid)
+                @test result.integral_estimate == width
+                @test result.standard_deviation == 0.0
+                @test all(point -> inside(only(point)), MonteCarloIntegration.sample_from_adaptive_grid(result, options.ncalls))
+                result
+            end
+
+            setprecision(BigFloat, 64) do
+                calls[] = 0
+                seed!(13)
+                next_draw = rand(UInt64)
+                seed!(13)
+                @test_throws ArgumentError vegas(integrand, fresh; options...)
+                @test_throws ArgumentError MonteCarloIntegration.sample_from_adaptive_grid(fresh, options.ncalls)
+                @test calls[] == 0
+                @test rand(UInt64) == next_draw
+            end
+
+            for bits in (128, 256)
+                setprecision(BigFloat, bits) do
+                    calls[] = outside[] = 0
+                    seed!(13)
+                    reused = vegas(integrand, fresh; options...)
+                    @test calls[] == options.ncalls
+                    @test outside[] == 0
+                    @test all(inside, reused.adaptive_grid)
+                    @test reused.integral_estimate == width
+                    @test reused.standard_deviation == 0.0
+                    for result in (fresh, reused)
+                        @test all(point -> inside(only(point)), MonteCarloIntegration.sample_from_adaptive_grid(result, options.ncalls))
+                    end
+                end
+            end
+        end
+    end
+end
+
+@testset "VEGAS bounds the final floating-point interpolation" begin
+    lo, hi = 2 // 107, 3 // 1
+    for (a, b) in ((lo, hi), (hi, lo))
+        grid, widths = MonteCarloIntegration._initialize_vegas_grid([a], [b], 7, nothing)
+        @test eltype(grid) === Float64
+        points, unit_points = zeros(1, 2), reshape([0.0, prevfloat(1.0)], 1, 2)
+        MonteCarloIntegration._map_vegas_points!(points, unit_points, zeros(Int, 1, 2), zeros(2), nothing, grid, widths)
+        @test all(p -> lo <= Rational{BigInt}(p) <= hi, points)
+    end
+end
+
+@testset "VEGAS rounds signed rationals with large denominators inward" begin
+    q = 1 // (big(2)^1100 + 1)
+    lo, hi = -102q, -q
+    options = (; nbins = 2, ncalls = 32, maxiter = 1, alpha = 0.0)
+    inside(p) = lo <= Rational{BigInt}(p) <= hi
+    setprecision(BigFloat, 128) do
+        for (a, b, width) in ((lo, hi, 101.0), (hi, lo, -101.0))
+            outside = Ref(0)
+            function integrand(p)
+                outside[] += !inside(only(p))
+                return ldexp(BigFloat(1), 1100)
+            end
+            fresh = vegas(integrand, [a], [b]; options...)
+            for result in (fresh, vegas(integrand, fresh; options...))
+                @test result.integral_estimate == width
+                @test all(inside, result.adaptive_grid)
+                @test all(p -> inside(only(p)), MonteCarloIntegration.sample_from_adaptive_grid(result, 32))
+            end
+            @test outside[] == 0
         end
     end
 end
