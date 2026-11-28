@@ -204,8 +204,8 @@ end
 function _sampling_grid(result)
     edges, widths = result.adaptive_grid, result.grid_spacing
     T = eltype(edges)
-    if T !== eltype(widths) && _grid_coordinate_type(edges, widths) === BigFloat
-        return _with_grid_rounding(() -> _copy_vegas_grid(edges, widths), BigFloat)
+    if _mixed_grid_storage(edges, widths) || T <: _GridStorageExact
+        return _with_grid_rounding(() -> _copy_vegas_grid(edges, widths), _grid_coordinate_type(edges, widths))
     end
     if T === Float64
         _float64_grid_spans_match(edges, widths) || return _copy_vegas_grid(edges, widths)
@@ -248,6 +248,7 @@ function _canonicalize_grid_axis!(edges::AbstractVector{Float64}, widths, stored
 end
 
 const _GridStorageFloat = Union{Float16, Float32, Float64, BigFloat}
+const _GridStorageExact = Union{Integer, Rational}
 
 _grid_width_matches(actual, left, right, width, rtol) = isapprox(actual, width; rtol)
 
@@ -261,6 +262,28 @@ function _grid_width_matches(actual, left, right, width::_GridStorageFloat, rtol
     return _round_grid_storage(actual, width) == width || isapprox(actual, width; rtol = _grid_width_rtol(width, rtol))
 end
 
+function _grid_width_matches(actual, left::_GridStorageExact, right::_GridStorageExact, width::_GridStorageExact, rtol)
+    return _exact_bound(right) - _exact_bound(left) == width
+end
+
+function _grid_width_matches(actual, left::_GridStorageExact, right::_GridStorageExact, width::_GridStorageFloat, rtol)
+    span = _exact_bound(right) - _exact_bound(left)
+    cmp(span, width) == 0 && return true
+    lo, hi, closed_lo, closed_hi = _grid_rounding_interval(width)
+    lower, upper = cmp(span, lo), cmp(span, hi)
+    return (lower > 0 || (lower == 0 && closed_lo)) && (upper < 0 || (upper == 0 && closed_hi))
+end
+
+function _grid_width_matches(actual, left::_GridStorageFloat, right::_GridStorageFloat, width::_GridStorageExact, rtol)
+    span = _exact_bound(width)
+    lo_left, hi_left, close_lo_left, close_hi_left = _grid_rounding_interval(left)
+    lo_right, hi_right, close_lo_right, close_hi_right = _grid_rounding_interval(right)
+    lower = _compare_grid_span(lo_right, hi_left, span)
+    (lower < 0 || (lower == 0 && close_lo_right && close_hi_left)) || return false
+    upper = _compare_grid_span(hi_right, lo_left, span)
+    return upper > 0 || (upper == 0 && close_hi_right && close_lo_left)
+end
+
 function _grid_width_matches(actual, left::_GridStorageFloat, right::_GridStorageFloat, width::_GridStorageFloat, rtol)
     (actual == width || _round_grid_storage(actual, width) == width) && return true
     if typeof(left) === typeof(right) === typeof(width) && precision(left) == precision(right) == precision(width)
@@ -269,13 +292,10 @@ function _grid_width_matches(actual, left::_GridStorageFloat, right::_GridStorag
     lo_left, hi_left, close_lo_left, close_hi_left = _grid_rounding_interval(left)
     lo_right, hi_right, close_lo_right, close_hi_right = _grid_rounding_interval(right)
     lo_width, hi_width, close_lo_width, close_hi_width = _grid_rounding_interval(width)
-    # A directed subtraction compares with the exact endpoint without expanding wide exponents.
     close_low_span = close_lo_right && close_hi_left && close_hi_width
-    low_span = _subtract_for_grid_limit(lo_right, hi_left, hi_width, close_low_span ? RoundUp : RoundDown)
-    (close_low_span ? low_span <= hi_width : low_span < hi_width) || return false
     close_high_span = close_hi_right && close_lo_left && close_lo_width
-    high_span = _subtract_for_grid_limit(hi_right, lo_left, lo_width, close_high_span ? RoundDown : RoundUp)
-    return close_high_span ? high_span >= lo_width : high_span > lo_width
+    return _grid_span_below(lo_right, hi_left, hi_width, close_low_span) &&
+        _grid_span_above(hi_right, lo_left, lo_width, close_high_span)
 end
 
 function _grid_rounding_interval(value)
@@ -290,23 +310,49 @@ function _grid_rounding_interval(value)
     return lo, hi, _round_grid_storage(lo, value) == value, _round_grid_storage(hi, value) == value
 end
 
-function _subtract_for_grid_limit(right, left, limit, rounding)
-    return _with_vegas_precision(precision(limit)) do
+function _subtract_grid_span(right, left, bits, rounding)
+    return _with_vegas_precision(bits) do
         setrounding(() -> right - left, BigFloat, rounding)
     end
 end
 
+function _grid_span_below(right, left, limit, closed)
+    difference = _subtract_grid_span(right, left, precision(limit), closed ? RoundUp : RoundDown)
+    return closed ? difference <= limit : difference < limit
+end
+
+function _grid_span_above(right, left, limit, closed)
+    difference = _subtract_grid_span(right, left, precision(limit), closed ? RoundDown : RoundUp)
+    return closed ? difference >= limit : difference > limit
+end
+
+function _compare_grid_span(right, left, exact)
+    # Directed bounds and exact comparisons avoid expanding widely separated exponents.
+    bits = max(precision(right), precision(left))
+    while true
+        lo = _subtract_grid_span(right, left, bits, RoundDown)
+        hi = _subtract_grid_span(right, left, bits, RoundUp)
+        lower = cmp(lo, exact)
+        lo == hi && return lower
+        lower >= 0 && return 1
+        cmp(hi, exact) <= 0 && return -1
+        bits *= 2
+    end
+    return
+end
+
 function _canonicalize_grid_axis!(edges, widths, stored_edges, stored_widths, rtol)
     a, b = first(edges), last(edges)
-    if length(widths) > 1 && _is_uniform_grid_axis(edges, widths, (stored_edges, stored_widths))
+    nominal = length(widths) > 1 && _is_uniform_grid_axis(edges, widths, (stored_edges, stored_widths))
+    if nominal && _needs_nominal_grid_rebuild(edges, widths, stored_edges, stored_widths)
         _set_uniform_grid_axis!(edges, widths, a, b)
         return true
     end
     direction = cmp(b, a)
     for i in eachindex(widths)
         actual = edges[i + 1] - edges[i]
-        isfinite(actual) && (iszero(actual) || sign(actual) == direction) &&
-            _grid_width_matches(actual, stored_edges[i], stored_edges[i + 1], stored_widths[i], rtol) || return false
+        isfinite(actual) && (iszero(actual) || sign(actual) == direction) || return false
+        (nominal || _grid_width_matches(actual, stored_edges[i], stored_edges[i + 1], stored_widths[i], rtol)) || return false
         widths[i] = actual
     end
     return true
@@ -320,29 +366,58 @@ function _canonicalize_grid_axis!(edges::AbstractVector{T}, widths, stored_edges
         return isfinite(actual) && (iszero(actual) || sign(actual) == direction) &&
             _grid_width_matches(actual, stored_edges[i], stored_edges[i + 1], stored_widths[i], rtol)
     end
-    if valid
-        for i in eachindex(widths)
-            widths[i] = edges[i + 1] - edges[i]
+    if !valid
+        length(widths) > 1 && _is_uniform_grid_axis(edges, widths, (stored_edges, stored_widths)) || return false
+        if _needs_nominal_grid_rebuild(edges, widths, stored_edges, stored_widths)
+            _set_uniform_grid_axis!(edges, widths, a, b)
+            return true
         end
-    elseif length(widths) > 1 && _is_uniform_grid_axis(edges, widths, (stored_edges, stored_widths))
-        _set_uniform_grid_axis!(edges, widths, a, b)
-    else
-        return false
+    end
+    for i in eachindex(widths)
+        actual = edges[i + 1] - edges[i]
+        isfinite(actual) && (iszero(actual) || sign(actual) == direction) || return false
+        widths[i] = actual
     end
     return true
+end
+
+function _needs_nominal_grid_rebuild(edges, widths, stored_edges, stored_widths)
+    return !_mixed_grid_storage(stored_edges, stored_widths) ||
+        (first(edges) != last(edges) && any(i -> edges[i] == edges[i + 1], eachindex(widths)))
 end
 
 function _is_uniform_grid_axis(edges, widths, stored = nothing)
     width = first(widths)
     all(==(width), widths) || return false
+    if stored !== nothing
+        original_edges, original_widths = stored
+        (eltype(original_edges) <: _GridStorageExact || eltype(original_widths) <: _GridStorageExact) && return false
+        all(==(first(original_widths)), original_widths) || return false
+    end
     check_last = stored !== nothing && _mixed_grid_storage(stored...)
     types = check_last ? (eltype(edges), Float64, Float32, Float16) : (eltype(edges), Float32, Float16)
-    return any(T -> _matches_uniform_grid(edges, width, T, check_last), types)
+    anchored = check_last && _matches_anchored_grid_width(stored...)
+    return any(T -> _matches_uniform_grid(edges, width, T, check_last, anchored), types)
+end
+
+function _matches_anchored_grid_width(edges, widths)
+    a, b = first(edges), last(edges)
+    declared = eltype(widths) === BigFloat ? argmax(precision, widths) : first(widths)
+    a isa _GridStorageFloat && b isa _GridStorageFloat && declared isa _GridStorageFloat || return false
+    nbins = length(widths)
+    lo, hi, closed_lo, closed_hi = _grid_rounding_interval(declared)
+    bits = max(precision(lo), precision(hi)) + ndigits(nbins; base = 2)
+    lo, hi = _with_vegas_precision(bits) do
+        nbins * lo, nbins * hi
+    end
+    left, right = BigFloat(a; precision = precision(a)), BigFloat(b; precision = precision(b))
+    return _grid_span_below(right, left, hi, closed_hi) && _grid_span_above(right, left, lo, closed_lo)
 end
 
 function _mixed_grid_storage(edges, widths)
     eltype(edges) === eltype(widths) || return true
     eltype(edges) === BigFloat || return false
+    isempty(edges) && return false
     bits = precision(first(edges))
     return any(x -> precision(x) != bits, edges) || any(x -> precision(x) != bits, widths)
 end
@@ -356,25 +431,25 @@ function _matches_historical_grid_edge(point::BigFloat, index, width, origin)
     return point == BigFloat(origin + offset; precision = bits)
 end
 
-function _matches_uniform_grid(edges, width, ::Type{BigFloat}, check_last)
+function _matches_uniform_grid(edges, width, ::Type{BigFloat}, check_last, anchored)
     a, b = first(edges), last(edges)
     nbins = length(edges) - 1
     nominal = (b - a) / nbins
     if check_last
-        (width == nominal || _matches_historical_grid_edge(b, nbins, width, a)) || return false
+        (anchored || width == nominal || _matches_historical_grid_edge(b, nbins, width, a)) || return false
     else
         isapprox(width, nominal; rtol = _bigfloat_width_rtol(width)) || return false
     end
     return all(i -> _matches_historical_grid_edge(edges[i], i - 1, width, a), 1:nbins)
 end
 
-function _matches_uniform_grid(edges, width, ::Type{T}, check_last) where {T}
+function _matches_uniform_grid(edges, width, ::Type{T}, check_last, anchored) where {T}
     a, b, w = T(first(edges)), T(last(edges)), T(width)
     a == first(edges) && b == last(edges) && w == width || return false
     nbins = length(edges) - 1
     nominal = (b - a) / nbins
     if check_last
-        (w == nominal || b == fma(nbins, w, a) || b == a + nbins * w) || return false
+        (anchored || w == nominal || b == fma(nbins, w, a) || b == a + nbins * w) || return false
     else
         isapprox(w, nominal; rtol = 2eps(T)) || return false
     end
