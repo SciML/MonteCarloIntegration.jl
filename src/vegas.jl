@@ -24,10 +24,10 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
 Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
-when bins approach the spacing between adjacent `Float64` values, a span
-overflows, an integer bound is rounded, or rounding the bounds materially
-changes the interval's span.
-Sample coordinates, edges, and widths then use the active `BigFloat` precision.
+when bin widths are subnormal or approach the spacing between adjacent `Float64`
+values, a span overflows, an integer bound is rounded, or rounding the bounds
+materially changes the interval's span. Sample coordinates, edges, and widths
+then use the active `BigFloat` precision, which must resolve the bins.
 Integral estimates and standard errors use `Float64`.
 
 The result contains `integral_estimate`, its estimated standard error
@@ -127,7 +127,8 @@ function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid,
             bin = floor(Int, y) + 1
             bins[dim, j] = bin
             width = widths[bin, dim]
-            points[dim, j] = muladd(y - (bin - 1), width, grid[bin, dim])
+            point = muladd(y - (bin - 1), width, grid[bin, dim])
+            points[dim, j] = _bound_grid_point(point, grid, dim)
             if exponents === nothing
                 jacobian *= Float64(nbins * width)
             else
@@ -148,14 +149,23 @@ end
 Draw `ncalls` independent points from the adaptive grid in `res` as a vector
 of coordinate tuples. Each coordinate picks a bin with equal probability
 and samples uniformly within it. The coordinates preserve the grid's
-floating-point precision. For a `BigFloat` grid, the active precision must be
-at least the largest precision stored in its edges or widths. Use `Random.seed!`
-to seed the default RNG. The sample count must be nonnegative.
+floating-point precision. Uniform grids with bins too narrow for `Float64`
+are reconstructed at the active `BigFloat` precision. For a `BigFloat` grid,
+the active precision must be at least the largest precision stored in its edges
+or widths. Use `Random.seed!` to seed the default RNG. The sample count must be
+nonnegative.
 """
 function sample_from_adaptive_grid(res, ncalls::Integer)
     ncalls >= 0 || throw(ArgumentError("ncalls must be nonnegative"))
     edges, widths = res.adaptive_grid, res.grid_spacing
     _check_grid_precision(edges, widths)
+    if _unresolved_uniform_grid(edges, widths)
+        return _draw_grid_samples(ncalls, _sampling_grid(res)...)
+    end
+    return _draw_grid_samples(ncalls, edges, widths)
+end
+
+function _draw_grid_samples(ncalls, edges, widths)
     ndim = size(edges, 2)
     T = _grid_coordinate_type(edges, widths)
     samples = Vector{NTuple{ndim, T}}(undef, ncalls)
@@ -169,7 +179,8 @@ function _sample_grid!(samples::Vector{NTuple{N, T}}, edges, widths, ::Type{T}) 
             scaled = nbins * rand()
             bin = floor(Int, scaled) + 1
             fraction = scaled + 1 - bin
-            return convert(T, edges[bin, dim] + widths[bin, dim] * fraction)
+            point = convert(T, edges[bin, dim] + widths[bin, dim] * fraction)
+            return _bound_grid_point(point, edges, dim)
         end
     end
     return samples
