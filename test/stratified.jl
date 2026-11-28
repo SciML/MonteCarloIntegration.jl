@@ -1,6 +1,44 @@
 using MonteCarloIntegration
-using Random: seed!
+using Random: MersenneTwister, seed!
 using Test
+
+function recorded_strata(f; nstrata, ncalls, batch = false, kwargs...)
+    history = Vector{Vector{Float64}}[]
+    calls = Ref(0)
+    function observe(point)
+        calls[] % ncalls == 0 && push!(history, [Float64[] for _ in 1:nstrata])
+        calls[] += 1
+        value = f(only(point))
+        push!(last(history)[floor(Int, nstrata * only(point)) + 1], value)
+        return value
+    end
+    integrand = batch === false ? observe : batch === true ? xs -> map(observe, xs) : xs -> map(observe, eachcol(xs))
+    result = vegas(integrand, [0.0], [1.0]; stratified = true, batch, ncalls, nbins = 1, alpha = 0.0, kwargs...)
+    return result, history
+end
+
+function equal_weight_reference(history)
+    moments = map(history) do cells
+        centers = map(cell -> sum(Rational{BigInt}, cell) / length(cell), cells)
+        spreads = map(cells, centers) do cell, center
+            sum(v -> abs2(Rational{BigInt}(v) - center), cell) / (length(cell) * (length(cell) - 1))
+        end
+        return sum(centers) / length(cells), sum(spreads) / length(cells)^2
+    end
+    means, variances = first.(moments), last.(moments)
+    positive = findall(!iszero, variances)
+    chi_squared = big(0) // 1
+    if length(positive) > 1
+        weights = inv.(variances[positive])
+        center = sum(weights .* means[positive]) / sum(weights)
+        chi_squared = sum(weights .* abs2.(means[positive] .- center)) / (length(positive) - 1)
+    end
+    n = length(history)
+    return (; mean = sum(means) / n, variance = sum(variances) / n^2, chi_squared)
+end
+
+rounded(x) = setprecision(() -> Float64(BigFloat(x), RoundNearest), BigFloat, 4096)
+rounded_sqrt(x) = setprecision(() -> Float64(sqrt(BigFloat(x)), RoundNearest), BigFloat, 4096)
 
 @testset "Adaptive stratified sampling" begin
     @testset "Public scalar and batch integration" begin
@@ -375,6 +413,245 @@ using Test
         @test vec(mass) ≈ [13 / 27, 2 / 27]
     end
 
+    @testset "Equal iteration weights for captured stratum samples" begin
+        exponential(x) = exp(10x)
+        centered(x) = exp(10x) - expm1(10) / 10
+        for f in (exponential, centered), scale in (2.0^-1060, 1.0e-250, 1.0, 1.0e250), batch in (false, true, :matrix)
+            seed!(2718)
+            result, history = recorded_strata(
+                x -> scale * f(x); nstrata = 2, ncalls = 8, batch, maxiter = 12, rtol = 0.0, atol = 0.0
+            )
+            @test length(history) == 12
+            @test length(unique(map(cells -> length.(cells), history))) > 1
+            expected = equal_weight_reference(history)
+            @test result.integral_estimate ≈ rounded(expected.mean) rtol = 8eps(Float64)
+            @test result.standard_deviation ≈ rounded_sqrt(expected.variance) rtol = 8eps(Float64)
+            @test result.chi_squared_average ≈ rounded(expected.chi_squared) rtol = 32eps(Float64)
+        end
+    end
+
+    @testset "Exponential integral over fixed seeds" begin
+        exact = expm1(10) / 10
+        results = map(1:256) do seed
+            seed!(seed)
+            vegas(
+                x -> exp(10x[1]), [0.0], [1.0]; stratified = true, nbins = 1, ncalls = 8,
+                maxiter = 50, alpha = 0.0, rtol = 0.0, atol = 0.0,
+            )
+        end
+        runs = length(results)
+        estimates = map(r -> r.integral_estimate, results)
+        variances = map(r -> abs2(r.standard_deviation), results)
+        center = sum(estimates) / runs
+        scatter = sum(abs2, estimates .- center) / (runs - 1)
+        @test abs(center - exact) < 4sqrt(scatter / runs)
+
+        # The mean reported variance agrees with the variance observed between runs.
+        reported = sum(variances) / runs
+        reported_error = sqrt(sum(abs2, variances .- reported) / (runs - 1) / runs)
+        fourth_moment = sum(x -> abs2(abs2(x - center)), estimates) / runs
+        scatter_error = sqrt((fourth_moment - abs2(scatter)) / runs)
+        @test abs(reported - scatter) < 4hypot(reported_error, scatter_error)
+    end
+
+    @testset "Stopping tests the equal-weight standard error" begin
+        # Standard errors of 3δ and 4δ combine to exactly 5δ/2.
+        for δ in (2.0^46 * nextfloat(0.0), 2.0^-600, 1.0, 2.0^600), batch in (false, true, :matrix)
+            c = 64δ
+            values = [c - 3δ, c + 3δ, c - 4δ, c + 4δ, c - 20δ, c + 20δ]
+            for (above, evaluated, stderr) in ((false, 6, sqrt(425) / 3), (true, 4, 2.5)), relative in (false, true)
+                tolerance = relative ? 2.5 / 64 : 2.5δ
+                above && (tolerance = nextfloat(tolerance))
+                rtol, atol = relative ? (tolerance, Inf) : (Inf, tolerance)
+                call = Ref(0)
+                result, history = recorded_strata(
+                    _ -> values[call[] += 1]; nstrata = 1, ncalls = 2, batch, maxiter = 3, rtol, atol
+                )
+                @test call[] == evaluated
+                @test result.integral_estimate == c
+                @test result.standard_deviation ≈ stderr * δ rtol = 8eps(Float64)
+            end
+        end
+    end
+
+    @testset "Certified stopping next to the tolerance" begin
+        draws = nextfloat(0.0) .* rand(MersenneTwister(2027), (10^11):(10^12), 64)
+        function integrate_draws(; kwargs...)
+            call = Ref(0)
+            return recorded_strata(_ -> draws[call[] += 1]; nstrata = 2, ncalls = 8, maxiter = 8, kwargs...)
+        end
+        _, history = integrate_draws(; rtol = 0.0, atol = 0.0)
+        references = [equal_weight_reference(history[1:n]) for n in eachindex(history)]
+        for relative in (false, true)
+            stops = map((-1, 1)) do side
+                tolerance, expected = setprecision(BigFloat, 1024) do
+                    target = sqrt(BigFloat(references[6].variance))
+                    relative && (target /= abs(BigFloat(references[6].mean)))
+                    tolerance = target * (1 + side * ldexp(BigFloat(1), -200))
+                    index = findfirst(references) do r
+                        r.variance < abs2(Rational{BigInt}(tolerance) * (relative ? r.mean : 1))
+                    end
+                    return tolerance, something(index, length(references))
+                end
+                result, evaluated = integrate_draws(;
+                    rtol = relative ? tolerance : Inf, atol = relative ? Inf : tolerance
+                )
+                @test length(evaluated) == expected
+                @test result.integral_estimate == rounded(references[expected].mean)
+                @test result.standard_deviation == rounded_sqrt(references[expected].variance)
+                return expected
+            end
+            @test stops == (7, 6)
+        end
+    end
+
+    @testset "Normal-scale stopping follows the exact standard error" begin
+        function sampled_stop(values, tolerance; relative, ncalls = 2, maxiter = 3)
+            calls = Ref(0)
+            result = vegas(
+                _ -> values[calls[] += 1], [0.0], [1.0]; stratified = true, nbins = 1, ncalls, maxiter,
+                rtol = relative ? tolerance : Inf, atol = relative ? Inf : tolerance
+            )
+            return calls[], result
+        end
+        near(square, side) = setprecision(BigFloat, 1024) do
+            return sqrt(BigFloat(square)) * (1 + side * ldexp(BigFloat(1), -100))
+        end
+
+        for δ in (1.0, 2.0^-600, 2.0^600), relative in (false, true)
+            # Standard errors 3δ and 2δ combine to sqrt(13)δ/2 about a mean of 10δ.
+            values = δ .* [7.0, 13.0, 8.0, 12.0, 4.0, 16.0]
+            square = relative ? big(13) // 400 : big(13) // 4 * Rational{BigInt}(δ)^2
+            below = rounded_sqrt(square)
+            Rational{BigInt}(below)^2 < square || (below = prevfloat(below))
+            for (tolerance, evaluated) in ((below, 6), (nextfloat(below), 4), (near(square, -1), 6), (near(square, 1), 4))
+                @test first(sampled_stop(values, tolerance; relative)) == evaluated
+            end
+
+            # Standard errors 6δ and δ combine to sqrt(37)δ/2 about a mean of 1024δ.
+            values = δ .* [1018.0, 1030.0, 1023.0, 1025.0, 512.0, 1536.0]
+            atol = 3.0413812651491097δ
+            @test Rational{BigInt}(atol)^2 < big(37) // 4 * Rational{BigInt}(δ)^2
+            calls, result = sampled_stop(values, relative ? atol / (1024δ) : atol; relative)
+            @test calls == 6
+            @test result.integral_estimate == 1024δ
+            @test result.standard_deviation == rounded_sqrt(big(262181) // 9 * Rational{BigInt}(δ)^2)
+        end
+
+        # The samples (0, 1, 1) have mean 2/3 and standard error 1/3.
+        values = [0.0, 1.0, 1.0, 10.0, 20.0, 30.0]
+        for relative in (false, true), (side, evaluated) in ((-1, 6), (1, 3))
+            tolerance = near(relative ? big(1) // 4 : big(1) // 9, side)
+            @test first(sampled_stop(values, tolerance; relative, ncalls = 3, maxiter = 2)) == evaluated
+        end
+
+        # A first standard error of exactly 3 meets only tolerances above 3.
+        values = [7.0, 13.0, 8.0, 12.0, 4.0, 16.0]
+        @test first(sampled_stop(values, 3.0; relative = false)) == 4
+        @test first(sampled_stop(values, nextfloat(3.0); relative = false)) == 2
+    end
+
+    @testset "Normal-scale stopping keeps one record of each iteration" begin
+        ncalls = 8192
+        # Every stratum draws 9 and 11 twice, so `n` iterations have variance 1/(6144n).
+        variance(n) = big(1) // (6144n)
+        for n in (3, 14), side in (-1, 1)
+            tolerance = setprecision(BigFloat, 1024) do
+                return sqrt(BigFloat(variance(n))) * (1 + side * ldexp(BigFloat(1), -100))
+            end
+            calls = Ref(0)
+            result = vegas(
+                _ -> isodd(calls[] += 1) ? 9.0 : 11.0, [0.0], [1.0];
+                stratified = true, nbins = 1, ncalls, maxiter = n + 1, rtol = Inf, atol = tolerance
+            )
+            evaluated = side < 0 ? n + 1 : n
+            @test calls[] == evaluated * ncalls
+            @test result.integral_estimate == 10.0
+            @test result.standard_deviation == rounded_sqrt(variance(evaluated))
+        end
+    end
+
+    @testset "Stopping at small ambient BigFloat precision" begin
+        q = nextfloat(0.0)
+        # The Float64 standard error rounds above the exact one for 1.24 and below it for 1.25.
+        for z in (1.24, 1.25)
+            samples = [-q, z, z, z, z, z]
+            mean = sum(Rational{BigInt}, samples) / 6
+            variance = sum(v -> abs2(Rational{BigInt}(v) - mean), samples) / 30
+            ratio = (Rational{BigInt}(z) + Rational{BigInt}(q)) // (5Rational{BigInt}(z) - Rational{BigInt}(q))
+            @test variance == abs2(ratio * mean)
+            gap = ratio / big(2)^100
+            tolerances = (big(1) // 5, ratio - gap, ratio, ratio + gap, prevfloat(0.2), 0.2)
+            for rtol in tolerances, sign in (-1.0, 1.0), maxiter in (1, 2), bits in (2, 3, 8, 256)
+                calls = Ref(0)
+                output = mktemp() do path, io
+                    setprecision(BigFloat, bits) do
+                        redirect_stdout(io) do
+                            vegas(
+                                _ -> sign * samples[mod1(calls[] += 1, 6)], [0.0], [1.0];
+                                stratified = true, nbins = 1, ncalls = 6, maxiter, rtol, atol = Inf
+                            )
+                        end
+                    end
+                    flush(io)
+                    return read(path, String)
+                end
+                # A second equal batch halves the variance of the same mean.
+                met = variance < abs2(Rational{BigInt}(rtol) * mean)
+                @test output == (met ? "Converged in 6 evaluations\n" : maxiter == 1 ? "" : "Converged in 12 evaluations\n")
+            end
+        end
+    end
+
+    @testset "Flat stratified iterations contribute no variance" begin
+        for scale in (1.0e-200, 1.0, 1.0e200), first_value in (-1.0, 1.0)
+            values = scale .* [first_value, first_value, 3.0, 5.0]
+            call = Ref(0)
+            result, _ = recorded_strata(
+                _ -> values[call[] += 1]; nstrata = 1, ncalls = 2, maxiter = 2, rtol = 0.0, atol = 0.0
+            )
+            @test result.integral_estimate / scale ≈ (first_value + 4) / 2
+            @test result.standard_deviation / scale ≈ 0.5
+            @test iszero(result.chi_squared_average)
+
+            values = scale .* [first_value, first_value, 3.0, 3.0]
+            call[] = 0
+            flat, _ = recorded_strata(
+                _ -> values[call[] += 1]; nstrata = 1, ncalls = 2, maxiter = 2, rtol = Inf, atol = Inf
+            )
+            @test call[] == 4
+            @test flat.integral_estimate / scale ≈ (first_value + 3) / 2
+            @test iszero(flat.standard_deviation)
+        end
+    end
+
+    @testset "Cancellation between iterations with unequal variances" begin
+        magnitude, tail = 2.0^60, 2.0^-100
+        centers = [magnitude, -magnitude, tail, magnitude, -magnitude, tail]
+        rng = MersenneTwister(411)
+        spreads = [2.0^8 .* (2 .* rand(rng, (2^38):(2^39), 2) .+ 1) for _ in centers]
+        for direction in (-1, 1)
+            history = Vector{Vector{Float64}}[]
+            result = vegas([0.0], [1.0]; stratified = true, batch = :matrix, ncalls = 8, nbins = 1, maxiter = 6, rtol = 0.0, atol = 0.0) do points
+                n = length(history) + 1
+                cells = [findall(<(0.5), vec(points)), findall(>=(0.5), vec(points))]
+                values = fill(direction * centers[n], size(points, 2))
+                for (cell, spread) in zip(cells, spreads[n])
+                    offset = centers[n] == tail ? tail * 2.0^-20 : spread
+                    values[cell[1]] += offset
+                    values[cell[2]] -= offset
+                end
+                push!(history, map(cell -> values[cell], cells))
+                return values
+            end
+            expected = equal_weight_reference(history)
+            @test expected.mean == direction * Rational{BigInt}(tail) / 3
+            @test result.integral_estimate == rounded(expected.mean)
+            @test result.standard_deviation ≈ rounded_sqrt(expected.variance) rtol = 8eps(Float64)
+            @test result.chi_squared_average ≈ rounded(expected.chi_squared) rtol = 32eps(Float64)
+        end
+    end
+
     @testset "Cancellation between strata" begin
         for values in ((1.0e16, 1.0, -1.0e16, 0.0), (1.0e16, 1.0, -1.0e16 + 2.0, -2.0))
             seed!(2718)
@@ -447,18 +724,18 @@ using Test
         q = nextfloat(0.0)
         edge = floatmin(Float64)
         tiny_cases = (
-            ([0.0, q, q, q], [0.0, q, q, q], nothing, 2, [4, 4], q, 0.0, 50.0),
-            ([0.0, 0.0, 2q, 2q], fill(q, 4), nothing, 2, [6, 2], q, 0.0, 98 / 5),
-            ([0.0, q, q, q], fill(q, 4), nothing, 2, [6, 2], q, 0.0, 98 / 5),
+            ([0.0, q, q, q], [0.0, q, q, q], nothing, 2, [4, 4], 1.25, sqrt(1 / 32), 50.0),
+            ([0.0, 0.0, 2q, 2q], fill(q, 4), nothing, 2, [6, 2], 7 / 6, sqrt(5 / 72), 98 / 5),
+            ([0.0, q, q, q], fill(q, 4), nothing, 2, [6, 2], 7 / 6, sqrt(5 / 72), 98 / 5),
             ([-q, q, q, q], [0.0, q, q, q], nothing, 1, [4, 4], q, 0.0, 0.0),
             ([1.0, -1.0, 0.0, 2q], [0.0, q, q, q], nothing, 1, [4, 4], q, sqrt(1 / 24), 0.0),
             ([nextfloat(edge, 2), edge, -edge, -edge], [0.0, q, q, q], nothing, 1, [4, 4], q, edge / sqrt(12), 0.0),
             ([0.0, 0.0, 0.0, 3q], [0.0, 0.0, 0.0, 3q], [0.0, 0.0, q, q], 2, [4, 4], q, 0.0, 6 / 31),
             (zeros(4), fill(q, 4), fill(q, 4), 2, [4, 4], q, 0.0, 0.0),
-            ([-4q, -4q, -4q, -3q], [-4q, -4q, -4q, -3q], [-2q, q, q, 3q], 2, [4, 4], -4q, 0.0, 36.0),
+            ([-4q, -4q, -4q, -3q], [-4q, -4q, -4q, -3q], [-2q, q, q, 3q], 2, [4, 4], -2q, 0.0, 36.0),
             ([-4q, -4q, -q, 5q], [-4q, -3q, 2q, 5q], nothing, 1, [4, 4], -0.0, 2q, 0.0),
-            ([2q, -2q, q, 4q], [2q, -2q, q, 4q], [-5q, -4q, -2q, -3q], 2, [4, 4], -2q, 0.0, 114 / 5),
-            ([-3q, 2q, -2q, -3q], [-3q, 2q, -2q, -3q], [-q, 2q, -2q, 2q], 2, [4, 4], -0.0, q, 42 / 17),
+            ([2q, -2q, q, 4q], [2q, -2q, q, 4q], [-5q, -4q, -2q, -3q], 2, [4, 4], -q, 0.0, 114 / 5),
+            ([-3q, 2q, -2q, -3q], [-3q, 2q, -2q, -3q], [-q, 2q, -2q, 2q], 2, [4, 4], -q, q, 42 / 17),
         )
         translated_cases = map(((1.0, 1), (1.0e100, 1), (1.0, 1025))) do (a, steps)
             b = nextfloat(a, steps)
@@ -513,8 +790,8 @@ using Test
             second = ([-1.5magnitude, 0.0, 0.0, 0.0, 0.0, 0.0], fill(tail, 2))
             mean1, variance1 = moments(first)
             mean2, variance2 = moments(second)
-            expected_mean = Float64(direction * (mean1 * variance2 + mean2 * variance1) / (variance1 + variance2))
-            expected_stderr = sqrt(Float64(variance1 * variance2 / (variance1 + variance2)))
+            expected_mean = Float64(direction * (mean1 + mean2) / 2)
+            expected_stderr = sqrt(Float64(variance1 + variance2)) / 2
             expected_chi = Float64(abs2(mean1 - mean2) / (variance1 + variance2))
             counts = zeros(Int, 2, 2)
             calls = Ref(0)
@@ -564,7 +841,7 @@ using Test
         end
         @test batches[] == positive_batches + 1
         @test result.integral_estimate === tail / (strata * (positive_batches + 1))
-        @test result.standard_deviation ≈ magnitude * (1 - 1 / strata)
+        @test iszero(result.standard_deviation)
         @test iszero(result.chi_squared_average)
     end
 

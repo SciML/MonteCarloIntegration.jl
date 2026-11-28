@@ -76,15 +76,20 @@ reused.integral_estimate, reused.standard_deviation
 ### Interpreting the uncertainty
 
 `result.standard_deviation` estimates the standard error of the integral. For a
-single iteration with independent Jacobian-weighted samples, it is their sample
-standard deviation divided by the square root of the sample count. VEGAS uses
-inverse-variance weights when all iteration variances are positive. If any iteration
-has zero variance, it keeps every estimate with equal weight and also accounts
-for the scatter between iterations. Early stopping requires a positive standard
+single unstratified iteration with independent Jacobian-weighted samples, it is
+their sample standard deviation divided by the square root of the sample count.
+Unstratified VEGAS uses inverse-variance weights when all iteration variances are
+positive. If any iteration has zero variance, it keeps every estimate with equal
+weight and also accounts for the scatter between iterations. Stratified VEGAS
+follows the equal-weight rule described under
+[Adaptive stratification](@ref). Early stopping requires a positive standard
 error below both tolerances. While the error stays zero, VEGAS continues drawing
 samples up to the iteration limit. A rare peak can escape every sample. Increase
 the budget and compare independent runs when the integral is dominated by a small
 region.
+
+`result.chi_squared_average` is the reduced chi-squared of the positive-variance
+iterations about their inverse-variance weighted mean in both sampling modes.
 
 ### Adaptive stratification
 
@@ -92,7 +97,7 @@ Enable VEGAS+ with `stratified = true`. VEGAS+ divides the transformed unit box
 into equal-volume strata and allocates more evaluations to strata with larger
 estimated variation. Each iteration uses exactly `ncalls` evaluations and
 reserves at least two per stratum to estimate its variance. Stratum errors
-retain their scale for allocation and iteration weighting. Stratification can
+retain their scale for allocation and error propagation. Stratification can
 help with narrow ridges and peaks aligned along a diagonal.
 
 ```@example matrix_batch
@@ -104,6 +109,30 @@ result.integral_estimate, result.standard_deviation
 Each iteration uses a volume-weighted sum of the stratum means and adds the
 estimated variances of the individual stratum contributions. Each iteration
 after the first uses the grid and allocation learned from earlier iterations.
+
+The final estimate is the plain average of the `n` iteration estimates, and its
+standard error is `sqrt(sum(v)) / n` for iteration variances `v`. Weights based
+on observed variance would favor iterations whose samples miss part of the
+variation, which biases skewed and peaked integrands. The standard error is zero
+when every iteration variance is zero, even if the iteration estimates differ.
+
+At a fixed iteration count, the equal weights do not depend on the sampled
+values. Tolerance-based early stopping chooses that count from the observations,
+so the result of a run that stops early depends on them through `n`. Set
+`rtol = 0` and `atol = 0` to run all `maxiter` iterations. Stopping decisions
+agree with the exact standard error and mean of the stored weighted samples,
+including for tolerances within rounding error of them.
+
+Every iteration counts equally, including those drawn before the grid has
+adapted. For a sharply peaked integrand, train a grid with one call and pass the
+result to a second call to leave the training iterations out of the average.
+
+```@example matrix_batch
+peak(x) = exp(-200 * sum(abs2, x .- 0.5))
+training = vegas(peak, [0.0, 0.0], [1.0, 1.0]; stratified = true, maxiter = 5)
+estimate = vegas(peak, training; stratified = true, maxiter = 5)
+estimate.integral_estimate, estimate.standard_deviation
+```
 
 ## Functions and types
 

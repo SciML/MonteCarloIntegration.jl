@@ -51,12 +51,24 @@ requires a positive standard error below both `atol` and
 and the budget allows.
 Use `debug = true` to print the relative standard error each iteration.
 
-Iterations use inverse-variance weights when every sample variance is positive.
-If a batch has zero sample variance, all iteration estimates receive equal weight
-and the reported error is the larger of the propagated within-iteration error and
-the standard error across iterations. Reduced chi-squared uses the positive-variance
-iterations and is zero with fewer than two. A sample that misses a narrow peak can have
-zero estimated error.
+- With `stratified = false`, iterations use inverse-variance weights when every
+  sample variance is positive. If a batch has zero sample variance, all iteration
+  estimates receive equal weight and the reported error is the larger of the
+  propagated within-iteration error and the standard error across iterations.
+- With `stratified = true`, all iterations receive equal weight. For `n` iteration
+  variances `v`, the reported error is `sqrt(sum(v)) / n`. Iterations whose samples
+  miss part of the variation can report both a poor estimate and a small variance,
+  so weights based on observed variance would bias the result toward them. The
+  error uses within-iteration variation only and is zero when every iteration
+  variance is zero, even if the iteration estimates differ. The weights are
+  independent of the samples at a fixed iteration count, but tolerance-based early
+  stopping chooses that count from the observations. Stopping decisions agree with
+  the exact standard error and mean of the stored weighted samples.
+
+In both modes, reduced chi-squared measures the inverse-variance weighted scatter
+of the positive-variance iterations about their inverse-variance weighted mean,
+divided by one less than their number. It is zero with fewer than two such
+iterations. A sample that misses a narrow peak can have zero estimated error.
 
 See G. P. Lepage, *Adaptive multidimensional integration: VEGAS enhanced*,
 [Journal of Computational Physics 439 (2021) 110386](https://doi.org/10.1016/j.jcp.2021.110386).
@@ -105,13 +117,18 @@ function _integrate_vegas(
     estimates = _IterationMean[]
     errors = _IterationError[]
     history = _ExactHistory()
-    pending = maxiter > 1 && strata !== nothing ? _deferred_stratum_history(strata.counts, values) : nothing
+    pending = strata === nothing ? nothing : _deferred_stratum_history(strata.counts, values)
     extended = false
     lowest = highest = 0.0
     mean = error = chi_squared = 0.0
+    # Stratum allocation follows earlier samples, so weighting by observed variance would favor
+    # the iterations that missed the variation.
+    equal_weights = strata !== nothing
+    largest = 0.0
     for iter in 1:maxiter
         _sample_vegas_iteration!(points, unit_points, bins, jacobians, exponents, grid, widths, strata)
         _evaluate!(values, func, points, batch, exponents, jacobians)
+        equal_weights && (largest = max(largest, maximum(abs, values)))
         estimate, stderr, exact_mean, exact_variance = isnothing(strata) ? _iteration_moments(values) : _stratified_estimate!(strata, values)
         if maxiter > 1
             push!(estimates, estimate)
@@ -137,9 +154,16 @@ function _integrate_vegas(
             mean = exact_mean === nothing ? _rounded_mean(estimate) : exact_mean
             error = exact_variance === nothing ? _rounded_error(stderr) : exact_variance
         elseif extended
-            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history)
+            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history; equal_weights)
         else
-            mean, error, chi_squared = _combine_estimates(estimates, _RoundedIterationErrors(errors))
+            mean, error, chi_squared = _combine_estimates(estimates, _RoundedIterationErrors(errors); equal_weights)
+        end
+        if equal_weights && !extended && error isa Float64 &&
+                _ambiguous_stop(error, mean, largest, ncalls + iter + 8, rtol, atol)
+            # The rounded values cannot decide the stop, so switch to the exact history.
+            _record_stratified_moments!(history, pending, strata.counts, values, iszero(stderr), exact_mean, exact_variance, true)
+            extended = true
+            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history; equal_weights)
         end
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(_rounded_error(error) / _rounded_mean(mean)))")
         if _meets_error_tolerances(error, mean, rtol, atol)
