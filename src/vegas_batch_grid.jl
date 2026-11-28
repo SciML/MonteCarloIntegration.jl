@@ -40,9 +40,19 @@ function _apply_exact_vegas_weight(weight, value, exponent)
 end
 
 _apply_vegas_weight(weight::Float64, value::_WideVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
-_apply_vegas_weight(weight::Float64, value::_WideVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
 _apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
 _apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
+
+function _apply_vegas_weight(weight::Float64, value::_BinaryOrExactVegasValue, exponents::AbstractVector{<:Integer}, j)
+    scale = exponents[j]
+    value isa Union{BigInt, Rational, BigFloat} && return _apply_exact_vegas_weight(weight, value, scale)
+    binary = Float64(value)
+    value isa Integer && value != binary && return _apply_exact_vegas_weight(weight, value, scale)
+    mantissa, exponent = frexp(binary)
+    product = ldexp(weight * mantissa, scale + exponent)
+    # The subnormal lattice can round an already rounded mantissa a second time.
+    return abs(product) <= floatmin(Float64) ? _apply_exact_vegas_weight(weight, value, scale) : product
+end
 
 function _apply_vegas_weight(weight::BigFloat, value::_BinaryVegasFloat, ::Nothing, _)
     # The binary product needs at most the sum of the two significand lengths.

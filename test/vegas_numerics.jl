@@ -74,6 +74,62 @@ end
     end
 end
 
+@testset "Scaled Float64 Jacobians round callback products once" begin
+    q = nextfloat(0.0)
+    normal = floatmin(Float64)
+    large_integer = (Int64(1) << 53) + 1
+    denominator = Int64(1) << 62
+    above_halfway = (denominator ÷ 6 + 1) // denominator
+    cases = Tuple{Float64, Int, Real}[
+        (width, nbins, value)
+            for T in (Float16, Float32, Float64)
+            for (width, nbins, center) in (
+                (3q, 1, T(1 // 6)),
+                (6q, 2, T(1 // 12)),
+                (normal - 3073q, 1, T(prevfloat(Float16(1)))),
+                (prevfloat(normal), 1, one(T)),
+            )
+            for value in (prevfloat(center), center, nextfloat(center))
+    ]
+    append!(cases, [(3q, 1, T(large_integer)) for T in (Int64, UInt64, Int128, UInt128)])
+    append!(cases, [(3q, 1, value) for value in (-large_integer, 1 // 6, above_halfway, -above_halfway, large_integer // 1)])
+
+    for (width, nbins, value) in cases, orientation in (-1, 1), batch in (false, true, :matrix)
+        a, b = orientation > 0 ? (0.0, width) : (width, 0.0)
+        exact = Rational{BigInt}(b - a) * Rational{BigInt}(value)
+        expected = Float64(BigFloat(exact; precision = 256), RoundNearest)
+        ncalls = 4
+        callback = batch === false ? Returns(value) : Returns(fill(value, ncalls))
+        res = vegas(callback, [a], [b]; batch, ncalls, nbins, maxiter = 1, alpha = 0.0)
+        @test res.integral_estimate == expected
+        @test iszero(res.standard_deviation)
+    end
+end
+
+@testset "Scaled binary weighting matches exact products" begin
+    rng = MersenneTwister(845)
+    measure(weight, value, exponents) = MonteCarloIntegration._apply_vegas_weight(weight, value, exponents, 1)
+    for T in (Float16, Float32, Float64), direction in (-1, 1), sign in (-1, 1)
+        values = (zero(T), one(T), nextfloat(zero(T)), floatmax(T), T(Inf), T(NaN))
+        for value in values, exponent in (-1200, -1074, -1022, 1024, 1200)
+            weight = direction * 0.75
+            value = copysign(value, T(sign))
+            expected = setprecision(BigFloat, 256) do
+                Float64(ldexp(BigFloat(weight) * BigFloat(value), exponent), RoundNearest)
+            end
+            @test isequal(measure(weight, value, [exponent]), expected)
+        end
+
+        for _ in 1:16, exponent in ((-1075:-1070)..., (-1024:-1019)..., 0, (1024:1026)...)
+            weight = direction * (0.5 + 0.5rand(rng))
+            value = sign * T(0.5 + 0.5rand(rng, T))
+            exact = Rational{BigInt}(weight) * Rational{BigInt}(value)
+            expected = Float64(ldexp(BigFloat(exact; precision = 256), exponent), RoundNearest)
+            @test measure(weight, value, [exponent]) === expected
+        end
+    end
+end
+
 @testset "Variance of the integral estimate" begin
     for scale in (1.0, 1.0e-240, 1.0e240)
         samples = scale .* [1, 2, 3, 4]
