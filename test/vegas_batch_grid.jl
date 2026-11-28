@@ -153,6 +153,72 @@ end
     @test accepted.integral_estimate ≈ nextfloat(lb) - lb rtol = 0.2
 end
 
+@testset "VEGAS adaptation of rounded edges" begin
+    lower = 1.0e16
+    upper = nextfloat(lower, 6)
+    nbins = 9
+    peak(x) = x[1] == lower + 4.0 ? 1.0e6 : 1.0
+    for (lb, ub) in ((lower, upper), (upper, lower))
+        edges = reshape(collect(range(lb, ub; length = nbins + 1)), :, 1)
+        widths = fill((ub - lb) / nbins, nbins, 1)
+        previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        for domain in (([lb], [ub]), (previous,))
+            @testset "Reversed: $(lb > ub), reused: $(length(domain) == 1)" begin
+                Random.seed!(1)
+                trained = vegas(peak, domain...; nbins, ncalls = 128, maxiter = 1)
+                @test issorted(vec(trained.adaptive_grid); rev = lb > ub)
+                @test all(w -> sign(ub - lb) * w >= 0, trained.grid_spacing)
+                Random.seed!(2)
+                reused = vegas(Returns(1), trained; ncalls = 2048, maxiter = 2)
+                @test reused.integral_estimate ≈ ub - lb rtol = 0.05
+            end
+        end
+    end
+end
+
+@testset "VEGAS sampling stays within rounded bounds" begin
+    lower, upper = prevfloat(-2.0^53), -2.0^53
+    for (lb, ub) in ((lower, upper), (upper, lower))
+        @testset "Reversed: $(lb > ub)" begin
+            fresh = vegas(Returns(0.0), [lb], [ub]; nbins = 3, ncalls = 16, maxiter = 1)
+            width = (ub - lb) / 3
+            edges = reshape([fma(i, width, lb) for i in 0:3], :, 1)
+            historical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, fill(width, 3, 1))
+            function bounded(p)
+                x = only(p)
+                return sqrt(x - lower) + sqrt(upper - x)
+            end
+            for (name, previous) in (("fresh", fresh), ("historical", historical))
+                @testset "$name grid" begin
+                    Random.seed!(1)
+                    points = MonteCarloIntegration.sample_from_adaptive_grid(previous, 1000)
+                    @test all(p -> lower <= only(p) <= upper, points)
+                    Random.seed!(1)
+                    reused = vegas(bounded, previous; ncalls = 1000, maxiter = 1, alpha = 0.0)
+                    @test isfinite(reused.integral_estimate)
+                end
+            end
+        end
+    end
+end
+
+@testset "VEGAS warm starts at extreme integrand scales" begin
+    Random.seed!(1)
+    trained = vegas(Returns(1.0), [0.0], [1.0]; nbins = 4, ncalls = 32, maxiter = 1, alpha = 0.0)
+    for scale in (1.0e-200, 1.0e200)
+        @testset "Scale: $scale" begin
+            Random.seed!(1)
+            result = vegas(Returns(scale), trained; ncalls = 128, maxiter = 2, rtol = 0.0, atol = 0.0)
+            # With adaptation, even a constant integrand has random Jacobian weights.
+            @test result.integral_estimate / scale ≈ 1.0 rtol = 0.02
+            @test isfinite(result.standard_deviation)
+            @test isfinite(result.chi_squared_average)
+            @test all(isfinite, result.adaptive_grid)
+            @test all(isfinite, result.grid_spacing)
+        end
+    end
+end
+
 @testset "VEGAS warm starts with low-precision bounds" begin
     options = (; nbins = 3, ncalls = 32, maxiter = 1)
     previous = vegas(Returns(0), Float32[0], Float32[1]; options...)
