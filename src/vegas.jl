@@ -89,23 +89,24 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     values = Vector{Float64}(undef, ncalls)
     proposed = similar(widths, nbins)
     exponents = _requires_scaled_jacobian(widths) ? Vector{Int}(undef, ncalls) : nothing
-    estimates = Float64[]
-    errors = Float64[]
+    estimates = _IterationMean[]
+    errors = _IterationError[]
+    exact_means = exact_variances = nothing
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
         rand!(unit_points)
         _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
         _evaluate!(values, func, points, batch, exponents)
-        estimate, stderr = _iteration_estimate(values)
-        push!(estimates, estimate)
-        push!(errors, stderr)
+        estimate, stderr, exact_mean, exact_variance = _iteration_moments(values)
+        exact_means = _record_iteration_mean!(estimates, exact_means, estimate, exact_mean)
+        exact_variances = _record_iteration_variance!(errors, exact_variances, stderr, exact_variance)
         if !iszero(stderr) && !iszero(alpha) && nbins > 1
             weights = calculate_d(values, bins, nbins, alpha)
             _adapt_grid!(grid, widths, weights, proposed)
         end
-        mean, error, chi_squared = _combine_estimates(estimates, errors)
-        debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
-        if 0.0 < error < atol && error < rtol * abs(mean)
+        mean, error, chi_squared = _combine_estimates(estimates, errors, exact_means, exact_variances)
+        debug && println("Iteration $iter, abs(sd/Itot) = $(abs(_rounded_error(error) / _rounded_mean(mean)))")
+        if _meets_error_tolerances(error, mean, rtol, atol)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
@@ -115,7 +116,7 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
             end
         end
     end
-    return VEGASResult(mean, error, chi_squared, grid, widths)
+    return VEGASResult(_rounded_mean(mean), _rounded_error(error), chi_squared, grid, widths)
 end
 
 function _requires_scaled_jacobian(widths)
