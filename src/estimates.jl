@@ -22,7 +22,27 @@ function _iteration_estimate(values)
     offset = (mixed_signs ? _compensated_sum(shifted, values) : sum(shifted, values)) / n
     residual = sum(v -> abs2(shifted(v) - offset), values)
     mean = scale * clamp(origin + offset, lo / scale, hi / scale)
+    if mixed_signs && any(v -> !iszero(v) && abs(v / scale) < floatmin(Float64), values)
+        mean = _exact_binary64_mean(values)
+    end
     return mean, scale * sqrt(residual / n / (n - 1))
+end
+
+function _exact_binary64_mean(values)
+    total = big(0)
+    for value in values
+        mantissa, exponent = frexp(value)
+        # Accumulate integer multiples of the smallest positive Float64.
+        total += BigInt(Int64(ldexp(mantissa, 53))) << (exponent + 1074 - 53)
+    end
+    magnitude = abs(total)
+    n = length(values)
+    shift = max(0, ndigits(div(magnitude, n); base = 2) - 53)
+    divisor = BigInt(n) << shift
+    significand, remainder = divrem(magnitude, divisor)
+    round_up = 2remainder > divisor || (2remainder == divisor && isodd(significand))
+    rounded = ldexp(Float64(significand + round_up), shift - 1074)
+    return total < 0 ? -rounded : rounded
 end
 
 function _combine_estimates(estimates, errors)

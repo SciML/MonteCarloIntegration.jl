@@ -24,15 +24,18 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
 Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
-when bins approach the spacing between adjacent `Float64` values or an integer
-bound cannot be represented as `Float64`. Sample coordinates, edges, and widths
-then use the active `BigFloat` precision. Integral estimates and standard errors
-use `Float64`.
+when bins approach the spacing between adjacent `Float64` values, a span
+overflows, an integer bound is rounded, or rounding the bounds materially
+changes the interval's span.
+Sample coordinates, edges, and widths then use the active `BigFloat` precision.
+Integral estimates and standard errors use `Float64`.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
-bin edges and widths in `adaptive_grid` and `grid_spacing`. The standard error
-must satisfy both `atol` and `rtol * abs(integral_estimate)` for early stopping.
+bin edges and widths in `adaptive_grid` and `grid_spacing`. Early stopping
+requires a positive standard error below both `atol` and
+`rtol * abs(integral_estimate)`. VEGAS keeps sampling while the error stays zero
+and the budget allows.
 Use `debug = true` to print the relative standard error each iteration.
 
 Iterations use inverse-variance weights when every sample variance is positive.
@@ -72,24 +75,14 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     mass = similar(widths)
     counts = similar(bins, nbins, ndim)
     scratch = zeros(nbins)
+    exponents = _requires_scaled_jacobian(widths) ? Vector{Int}(undef, ncalls) : nothing
     estimates = Float64[]
     errors = Float64[]
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
         rand!(unit_points)
-        for j in axes(points, 2)
-            jacobian = 1.0
-            for dim in axes(points, 1)
-                y = unit_points[dim, j] * nbins
-                bin = floor(Int, y) + 1
-                bins[dim, j] = bin
-                width = widths[bin, dim]
-                points[dim, j] = muladd(y - (bin - 1), width, grid[bin, dim])
-                jacobian *= Float64(nbins * width)
-            end
-            values[j] = jacobian
-        end
-        _evaluate!(values, func, points, batch)
+        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
+        _evaluate!(values, func, points, batch, exponents)
         estimate, stderr = _iteration_estimate(values)
         push!(estimates, estimate)
         push!(errors, stderr)
@@ -98,12 +91,55 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
         end
         mean, error, chi_squared = _combine_estimates(estimates, errors)
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
-        if error < atol && error < rtol * abs(mean)
+        if 0.0 < error < atol && error < rtol * abs(mean)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
+        if exponents === nothing && !iszero(stderr) && !iszero(alpha) && nbins > 1 && iter < maxiter
+            if _requires_scaled_jacobian(widths)
+                exponents = Vector{Int}(undef, ncalls)
+            end
+        end
     end
     return VEGASResult(mean, error, chi_squared, grid, widths)
+end
+
+function _requires_scaled_jacobian(widths)
+    nbins = size(widths, 1)
+    lower = upper = 1.0
+    for axis in eachcol(widths)
+        smallest, largest = extrema(abs, axis)
+        small_factor = Float64(nbins * smallest)
+        large_factor = Float64(nbins * largest)
+        lower *= small_factor
+        upper *= large_factor
+        min(small_factor, lower) >= floatmin(Float64) && isfinite(max(large_factor, upper)) || return true
+    end
+    return false
+end
+
+function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths)
+    nbins = size(widths, 1)
+    for j in axes(points, 2)
+        jacobian, exponent = 1.0, 0
+        for dim in axes(points, 1)
+            y = unit_points[dim, j] * nbins
+            bin = floor(Int, y) + 1
+            bins[dim, j] = bin
+            width = widths[bin, dim]
+            points[dim, j] = muladd(y - (bin - 1), width, grid[bin, dim])
+            if exponents === nothing
+                jacobian *= Float64(nbins * width)
+            else
+                mantissa, shift = frexp(width)
+                jacobian, step = frexp(jacobian * (Float64(mantissa) * nbins))
+                exponent += shift + step
+            end
+        end
+        weights[j] = jacobian
+        exponents === nothing || (exponents[j] = exponent)
+    end
+    return nothing
 end
 
 """
@@ -112,12 +148,14 @@ end
 Draw `ncalls` independent points from the adaptive grid in `res` as a vector
 of coordinate tuples. Each coordinate picks a bin with equal probability
 and samples uniformly within it. The coordinates preserve the grid's
-floating-point precision. Use `Random.seed!` to seed the default RNG.
-The sample count must be nonnegative.
+floating-point precision. For a `BigFloat` grid, the active precision must be
+at least the largest precision stored in its edges or widths. Use `Random.seed!`
+to seed the default RNG. The sample count must be nonnegative.
 """
 function sample_from_adaptive_grid(res, ncalls::Integer)
     ncalls >= 0 || throw(ArgumentError("ncalls must be nonnegative"))
     edges, widths = res.adaptive_grid, res.grid_spacing
+    _check_grid_precision(edges, widths)
     ndim = size(edges, 2)
     T = _grid_coordinate_type(edges, widths)
     samples = Vector{NTuple{ndim, T}}(undef, ncalls)

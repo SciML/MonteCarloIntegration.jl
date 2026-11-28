@@ -43,3 +43,20 @@ using Test: @test, @testset, @test_throws
     @test rand() == next_number
     @test_throws ArgumentError sample_from_adaptive_grid(result, -1)
 end
+
+@testset "Adaptive-grid sampling checks precision before drawing" begin
+    result = setprecision(BigFloat, 256) do
+        edges = reshape(BigFloat[1, 1 + BigFloat(2)^-80], :, 1)
+        VEGASResult(0.0, 0.0, 0.0, edges, diff(edges; dims = 1))
+    end
+
+    setprecision(BigFloat, 64) do
+        for ncalls in (0, 16)
+            seed!(2196)
+            next_number = rand()
+            seed!(2196)
+            @test_throws ArgumentError sample_from_adaptive_grid(result, ncalls)
+            @test rand() == next_number
+        end
+    end
+end
