@@ -73,6 +73,11 @@ second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 `vegas(f, trained)` starts a new estimate over the same bounds using a copy of
 the adaptive grid in `trained`.
 
+When the integration bounds or bin widths require extra precision, VEGAS uses
+`BigFloat` coordinates. A batch callback can accept both coordinate types by
+preserving the type of its inputs. Reusing a `BigFloat` grid requires an active
+precision at least as high as the precision stored in its edges or widths.
+
 ### Roadmap 
 - Supporting vector valued functions
 - Other integration algorithms

@@ -2,235 +2,175 @@ using Random: rand!
 using Distributions: Uniform
 import QuasiMonteCarlo
 
-abstract type MonteCarloIntegrationResult end
-
-struct VEGASResult{T1,T2,T3,T4,T5}
-	integral_estimate::T1
-	standard_deviation::T2
-	chi_squared_average::T3
-	adaptive_grid::T4
-	grid_spacing::T5
+struct VEGASResult{T1, T2, T3, T4, T5}
+    integral_estimate::T1
+    standard_deviation::T2
+    chi_squared_average::T3
+    adaptive_grid::T4
+    grid_spacing::T5
 end
 
 include("estimates.jl")
+include("grid.jl")
+
 """
-    vegas(f, lb = [0.0, 0.0], ub = [1.0, 1.0]; kwargs...)
+    vegas(f, lb = zeros(2), ub = ones(2); maxiter = 10, nbins = 1000,
+          ncalls = 10000, rtol = 1e-4, atol = 1e-4, debug = false, batch = false,
+          alpha = 1.5)
 
-VEGAS is a Monte Carlo algorithm for 
-multidimensional integration based on 
-adaptive importance sampling. It divides
-each dimension into bins and adaptively adjusts
-bin widths so the points sampled from the
-region where the function has highest magnitude. 
+Estimate the integral of a real scalar function over the box from `lb` to `ub`
+using adaptive importance sampling. Each of up to `maxiter` iterations draws
+`ncalls` points. The map has `nbins` intervals per axis. `alpha` controls how
+strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`,
+`f` receives a vector of `ncalls` coordinate vectors. With `batch = :matrix`, it
+receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
-Arguments:
-----------
-- st: Array of starting values in each dimension. 
-Defaults to zeros(2)
-- end: Array of ending values in each dimension. 
-Defaults to ones(2)
+Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
+when bin widths are subnormal or approach the spacing between adjacent `Float64`
+values, a span overflows, an integer bound is rounded, or rounding the bounds
+materially changes the interval's span. Sample coordinates, edges, and widths
+then use the active `BigFloat` precision, which must resolve the bins.
+Integral estimates and standard errors use `Float64`.
 
-Kwargs:
-------
-- nbins: Number of bins in each dimension. 
-Defaults to 1000. 
-- ncalls: Number of function calls per iteration. 
-Defaults to 10000.
-- maxiter: Maximum number of iterations. 
-Defaults to 10.
-- rtol: Relative tolerance required. 
-Defaults to 1e-4.
-- atol: Absolute tolerance required. 
-Defaults to 1e-2.
-- debug: Prints `abs(sd/I)` every 100 iterations. 
-Defaults to false.
-- `batch = false`: Call `f(point)` for each sample and return a scalar per point.
-- `batch = true`: Call `f(points)` once per iteration with a vector of column views.
-- `batch = :matrix`: Call `f(points)` once per iteration with a matrix of size
-  `length(lb) × ncalls`. Each column contains one sample. The matrix is reused
-  across iterations.
-
-For batched evaluation, return one scalar per sample in the input order. With
-`batch = :matrix`, return a vector of length `ncalls`.
-
-Output:
-------
-A VEGASResult object with the following fields:
-- Estimate for the integral 
-- Estimated standard error of the integral
-- Reduced chi-squared among iterations with positive standard error
-- final adapted map
-
-Early stopping requires a positive standard error below both `atol` and
+The result contains `integral_estimate`, its estimated standard error
+`standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
+bin edges and widths in `adaptive_grid` and `grid_spacing`. Early stopping
+requires a positive standard error below both `atol` and
 `rtol * abs(integral_estimate)`. VEGAS keeps sampling while the error stays zero
-and the budget allows. It weights iteration estimates by inverse variance
-when all iteration variances are positive. With any zero-variance iteration,
-the estimates receive equal weight and the error accounts for their scatter.
+and the budget allows.
+Use `debug = true` to print the relative standard error each iteration.
 
-References:
------------
-- Lepage, G. Peter. "A new algorithm for adaptive 
-multidimensional integration." Journal of 
-Computational Physics 27.2 (1978): 192-203.
-- Lepage, G. Peter. "Adaptive multidimensional 
-integration: VEGAS enhanced." Journal of 
-Computational Physics 439 (2021): 110386.
+Iterations use inverse-variance weights when every sample variance is positive.
+If a batch has zero sample variance, all iteration estimates receive equal weight
+and the reported error is the larger of the propagated within-iteration error and
+the standard error across iterations. Reduced chi-squared uses the positive-variance
+iterations and is zero with fewer than two. A sample that misses a narrow peak can have
+zero estimated error.
+
+See G. P. Lepage, *Adaptive multidimensional integration: VEGAS enhanced*,
+[Journal of Computational Physics 439 (2021) 110386](https://doi.org/10.1016/j.jcp.2021.110386).
 """
 function vegas(func, lb = [0.0, 0.0], ub = [1.0, 1.0]; kwargs...)
     return _vegas(func, lb, ub, nothing; kwargs...)
 end
 
 function _vegas(
-        func, lb, ub, initial_grid;
-        maxiter = 10, nbins = 1000, ncalls = 10000,
-        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5,
+        func, lb, ub, initial_grid; maxiter = 10, nbins = 1000, ncalls = 10000,
+        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5
     )
-    @assert length(lb) == length(ub)
     _check_vegas_batch(batch)
+    maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
+    nbins >= 1 || throw(ArgumentError("nbins must be positive"))
+    ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
+    isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
+    grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+end
 
-    ndim = length(lb)
-    x, delx = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    estimates, errors = Float64[], Float64[]
+function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+    nbins = size(widths, 1)
+    ndim = size(grid, 2)
+    points = Matrix{eltype(grid)}(undef, ndim, ncalls)
+    unit_points = eltype(points) === Float64 ? points : similar(points, Float64)
+    bins = Matrix{Int}(undef, ndim, ncalls)
+    values = Vector{Float64}(undef, ncalls)
+    proposed = similar(widths, nbins)
+    exponents = _requires_scaled_jacobian(widths) ? Vector{Int}(undef, ncalls) : nothing
+    estimates = Float64[]
+    errors = Float64[]
     mean = error = chi_squared = 0.0
-
-    ymat = zeros(ndim, ncalls)
-    xmat = similar(ymat)
-    imat = Matrix{Int}(undef, ndim, ncalls)
-    Jsf = Vector{Float64}(undef, ncalls)
     for iter in 1:maxiter
-        rand!(ymat)
-        for dim in 1:ndim
-            lo, hi = minmax(x[1, dim], x[end, dim])
-            for j in 1:ncalls
-                y = nbins * ymat[dim, j]
-                i = floor(Int, y) + 1
-                imat[dim, j] = i
-                xmat[dim, j] = _bounded_grid_coordinate(x[i, dim], delx[i, dim], y + 1 - i, lo, hi)
-            end
-        end
-        for i in 1:ncalls
-            Jsf[i] = prod(nbins * delx[imat[dim, i], dim] for dim in 1:ndim)
-        end
-        _evaluate!(Jsf, func, xmat, batch)
-
-        estimate, stderr = _iteration_estimate(Jsf)
+        rand!(unit_points)
+        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
+        _evaluate!(values, func, points, batch, exponents)
+        estimate, stderr = _iteration_estimate(values)
         push!(estimates, estimate)
         push!(errors, stderr)
-
         if !iszero(stderr) && !iszero(alpha) && nbins > 1
-            d = calculate_d(Jsf, imat, nbins, alpha)
-            xnew, delxnew = update_grid(x, delx, d)
-            x .= xnew
-            delx .= delxnew
+            weights = calculate_d(values, bins, nbins, alpha)
+            _adapt_grid!(grid, widths, weights, proposed)
         end
-
         mean, error, chi_squared = _combine_estimates(estimates, errors)
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
         if 0.0 < error < atol && error < rtol * abs(mean)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
+        if exponents === nothing && !iszero(stderr) && !iszero(alpha) && nbins > 1 && iter < maxiter
+            if _requires_scaled_jacobian(widths)
+                exponents = Vector{Int}(undef, ncalls)
+            end
+        end
     end
-
-    return VEGASResult(mean, error, chi_squared, x, delx)
+    return VEGASResult(mean, error, chi_squared, grid, widths)
 end
 
-_bounded_grid_coordinate(edge, width, fraction, lo, hi) = clamp(edge + width * fraction, lo, hi)
-
-"""
-	calculate_d(Jsf, imat, nbins) -> d
-
-Calculate d matrix given J*f product and
-locations of the sampled points.
-"""
-function calculate_d(Jsf, imat, nbins, alpha = 1.5, scale = maximum(abs, Jsf))
-    ndim = size(imat, 1)
-    d = zeros(nbins, ndim)
-    (!isfinite(scale) || iszero(scale)) && return d
-    values = 1.0e-100 <= scale <= 1.0e100 ? Jsf : Jsf ./ scale
-    ni = length(values) / nbins
-    for i in eachindex(values)
-        squared = abs2(values[i]) / ni
-        for dim in 1:ndim
-            d[imat[dim, i], dim] += squared
-        end
+function _requires_scaled_jacobian(widths)
+    nbins = size(widths, 1)
+    lower = upper = 1.0
+    for axis in eachcol(widths)
+        smallest, largest = extrema(abs, axis)
+        small_factor = Float64(nbins * smallest)
+        large_factor = Float64(nbins * largest)
+        lower *= small_factor
+        upper *= large_factor
+        min(small_factor, lower) >= floatmin(Float64) && isfinite(max(large_factor, upper)) || return true
     end
+    return false
+end
 
-    weights = similar(d)
-    for dim in 1:ndim
-        mass = view(d, :, dim)
-        total = sum(mass)
-        if !isfinite(total) || iszero(total)
-            weights[:, dim] .= 0
-            continue
-        end
-        for i in 1:nbins
-            left, right = max(1, i - 1), min(nbins, i + 1)
-            smoothed = if i == 1
-                (7mass[i] + mass[right]) / 8
-            elseif i == nbins
-                (mass[left] + 7mass[i]) / 8
+function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths)
+    nbins = size(widths, 1)
+    for j in axes(points, 2)
+        jacobian, exponent = 1.0, 0
+        for dim in axes(points, 1)
+            y = unit_points[dim, j] * nbins
+            bin = floor(Int, y) + 1
+            bins[dim, j] = bin
+            width = widths[bin, dim]
+            point = muladd(y - (bin - 1), width, grid[bin, dim])
+            points[dim, j] = _bound_grid_point(point, grid, dim)
+            if exponents === nothing
+                jacobian *= Float64(nbins * width)
             else
-                (mass[left] + 6mass[i] + mass[right]) / 8
+                mantissa, shift = frexp(width)
+                jacobian, step = frexp(jacobian * (Float64(mantissa) * nbins))
+                exponent += shift + step
             end
-            p = clamp(smoothed / total, 0.0, 1.0)
-            weights[i, dim] = iszero(alpha) || isone(p) ? 1.0 : iszero(p) ? 0.0 : ((1 - p) / log(1 / p))^alpha
         end
+        weights[j] = jacobian
+        exponents === nothing || (exponents[j] = exponent)
     end
-    return weights
+    return nothing
 end
 
 """
-	update_grid(x, delx, d) -> newx, newdelx
+    sample_from_adaptive_grid(res, ncalls)
 
-Function used to update the adaptive grid
-given values of the d matrix. The intervals
-are adjusted so that the `d` values are equal
-in each interval.
-"""
-function update_grid(x, delx, d)
-    nbins, ndims = size(d)
-    newx, newdelx = copy(x), copy(delx)
-    for dim in 1:ndims
-        weights = view(d, :, dim)
-        step = sum(weights) / nbins
-        isfinite(step) && step > 0 || continue
-        bin, mass = 1, weights[1]
-        for i in 2:nbins
-            while mass < step && bin < nbins
-                bin += 1
-                mass += weights[bin]
-            end
-            mass -= step
-            left, right = x[bin, dim], x[bin + 1, dim]
-            candidate = iszero(weights[bin]) ? right : right - (mass * (right - left)) / weights[bin]
-            lo, hi = minmax(newx[i - 1, dim], x[end, dim])
-            newx[i, dim] = clamp(candidate, lo, hi)
-        end
-        for i in 1:nbins
-            newdelx[i, dim] = newx[i + 1, dim] - newx[i, dim]
-        end
-    end
-    return newx, newdelx
-end
-
-"""
-	sample_from_adaptive_grid(res, ncalls)
-
-Sample using a finetuned adaptive grid.  
+Sample using a finetuned adaptive grid. Sample coordinates preserve the grid's
+floating-point precision. Uniform grids with bins too narrow for `Float64`
+are reconstructed at the active `BigFloat` precision. For a `BigFloat` grid,
+the active precision must be at least the largest precision stored in its
+edges or widths.
 """
 function sample_from_adaptive_grid(res, ncalls)
-    x, delx = res.adaptive_grid, res.grid_spacing
-    nbins, ndim = size(delx, 1), size(x, 2)
+
+    x, delx = _sampling_grid(res)
+
+    nbins = size(delx, 1)
+    ndim = size(x, 2)
+
+    # Sample `ncalls` points from this grid
+    # Uniform sampling in `y` space
     ymat = QuasiMonteCarlo.sample(ncalls, zeros(ndim), ones(ndim), Uniform())
-    xmat = similar(ymat)
+
+    from_y_to_i(y) = floor(Int, nbins * y) + 1
+    delta(y) = y * nbins + 1 - from_y_to_i(y)
+    from_y_to_x(y, dim) = _bound_grid_point(x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y), x, dim)
+
+    xmat = similar(ymat, _grid_coordinate_type(x, delx))
     for dim in 1:ndim
-        lo, hi = minmax(x[1, dim], x[end, dim])
-        for j in 1:ncalls
-            y = nbins * ymat[dim, j]
-            bin = floor(Int, y) + 1
-            xmat[dim, j] = _bounded_grid_coordinate(x[bin, dim], delx[bin, dim], y + 1 - bin, lo, hi)
-        end
+        xmat[dim, :] .= map(y -> from_y_to_x(y, dim), ymat[dim, :])
     end
     return map(x -> tuple(x...), eachcol(xmat))
 end
