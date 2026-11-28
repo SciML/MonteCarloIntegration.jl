@@ -29,6 +29,127 @@ using Test: @test, @testset, @test_throws
     end
 end
 
+@testset "VEGAS preserves Float64 callbacks on resolvable inexact bounds" begin
+    offset = BigFloat(2)^-60
+    q = BigFloat(nextfloat(0.0))
+    largest = floatmax(Float64)
+    cases = (
+        (BigFloat(0), BigFloat(1) + offset),
+        (BigFloat(1) + offset, BigFloat(2) - offset),
+        (-109 // 3, -97 // 3),
+        (q / 4, 256q + q / 4),
+        (BigFloat(1.0e16) + 1 // 4, BigFloat(1.0e16) + 32 + 1 // 4),
+        (BigFloat(prevfloat(largest, 8)) + (largest - prevfloat(largest)) / 4, BigFloat(largest)),
+    )
+    for (lo, hi) in cases, (a, b) in ((lo, hi), (hi, lo)), batch in (false, true, :matrix)
+        @testset "$batch, $a → $b" begin
+            seen = Float64[]
+            point(x::AbstractVector{Float64}) = (push!(seen, only(x)); 1.0)
+            views(x::Vector{<:AbstractVector{Float64}}) = map(point, x)
+            matrix(x::AbstractMatrix{Float64}) = map(point, eachcol(x))
+            integrand = batch === false ? point : (batch === true ? views : matrix)
+            options = (; batch, nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0)
+            expected = Float64(BigFloat(b) - BigFloat(a))
+            seed!(701)
+            result = vegas(integrand, [a], [b]; options...)
+            @test eltype(result.adaptive_grid) === BigFloat
+            @test result.integral_estimate == expected
+            @test vegas(integrand, result; options...).integral_estimate == expected
+            @test vegas(integrand, result; options..., callback_type = Float64).integral_estimate == expected
+            @test length(seen) == 3 * options.ncalls
+            @test all(p -> Rational{BigInt}(lo) <= Rational{BigInt}(p) <= Rational{BigInt}(hi), seen)
+        end
+    end
+end
+
+@testset "VEGAS keeps callback dispatch on nonuniform warm grids" begin
+    lo, hi = BigFloat(1) + BigFloat(2)^-60, BigFloat(2) - BigFloat(2)^-60
+    edges = reshape(BigFloat[lo, lo + BigFloat(2)^-100, 1.5, 1.75, hi], :, 1)
+    previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, diff(edges; dims = 1))
+    calls = Ref(0)
+    inside = Ref(true)
+    function f(x::AbstractVector{Float64})
+        calls[] += 1
+        inside[] &= lo <= only(x) <= hi
+        return 1.0
+    end
+    seed!(702)
+    reused = vegas(f, previous; ncalls = 64, maxiter = 1, alpha = 0.0)
+    @test calls[] == 64
+    @test inside[]
+    @test eltype(reused.adaptive_grid) === BigFloat
+    @test reused.adaptive_grid == previous.adaptive_grid
+
+    top = 2.0
+    gap = top - prevfloat(top)
+    lower = BigFloat(prevfloat(top, 2)) - gap / 4
+    for (a, b) in ((lower, BigFloat(top)), (BigFloat(top), lower))
+        typed(::AbstractVector{Float64}) = 1.0
+        result = vegas(typed, [a], [b]; nbins = 2, ncalls = 32, maxiter = 1, alpha = 0.0)
+        @test result.integral_estimate == Float64(b - a)
+    end
+end
+
+@testset "VEGAS keeps Float64 conversions inside mixed callback domains" begin
+    offset = BigFloat(2)^-60
+    a, b = BigFloat[1 + offset, 1.0e16 + 2], BigFloat[1.5 - offset, 1.0e16]
+    settings = (; nbins = 4, ncalls = 128, maxiter = 1, alpha = 0.0)
+    seen = NTuple{2, Float64}[]
+    function f(x::AbstractVector{Float64})
+        push!(seen, Tuple(x))
+        return 1.0
+    end
+    seed!(703)
+    fresh = vegas(f, a, b; settings...)
+    @test fresh.integral_estimate == -1.0
+    @test vegas(f, fresh; settings...).integral_estimate == -1.0
+    @test length(seen) == 2 * settings.ncalls
+    @test all(p -> a[1] <= p[1] <= b[1] && b[2] <= p[2] <= a[2], seen)
+
+    for (lo, hi, expected) in ((a, b, [nextfloat(1.0), prevfloat(1.5)]), (b, a, [prevfloat(1.5), nextfloat(1.0)]))
+        grid, widths = MonteCarloIntegration._initialize_vegas_grid(lo, hi, settings.nbins, nothing)
+        coordinate_type, bounds = MonteCarloIntegration._vegas_callback_coordinates(grid, nothing)
+        @test coordinate_type === Float64
+        points = zeros(2, 2)
+        unit_points = [0.0 prevfloat(1.0); 0.0 prevfloat(1.0)]
+        weights = zeros(2)
+        MonteCarloIntegration._map_vegas_points!(points, unit_points, zeros(Int, 2, 2), weights, nothing, grid, widths, bounds)
+        @test points[1, :] == expected
+        @test weights == fill(Float64(prod(hi .- lo)), 2)
+    end
+end
+
+@testset "VEGAS requires useful inward Float64 coverage" begin
+    a = BigFloat(2)^53
+    q = BigFloat(nextfloat(0.0))
+    largest = BigFloat(floatmax(Float64))
+    cases = (
+        (a + 1 // 8, a + 23 // 4, 1),
+        (a + 1 // 8, a + 8 + 1 // 8, 4),
+        (q / 4, q / 2, 1),
+        (2largest, 2largest + largest / 8, 4),
+    )
+    for (lo, hi, nbins) in cases, (first, last) in ((lo, hi), (hi, lo))
+        seen = BigFloat[]
+        function inspect(x::AbstractVector{BigFloat})
+            push!(seen, only(x))
+            return 1.0
+        end
+        settings = (; nbins, ncalls = 32, maxiter = 1, alpha = 0.0)
+        seed!(706)
+        stored = vegas(inspect, [first], [last]; settings...)
+        @test stored.integral_estimate == Float64(last - first)
+        @test all(p -> lo <= p <= hi, seen)
+
+        seed!(707)
+        next_draw = rand(UInt64)
+        seed!(707)
+        @test_throws ArgumentError vegas(inspect, [first], [last]; settings..., callback_type = Float64)
+        @test_throws ArgumentError vegas(inspect, stored; settings..., callback_type = Float64)
+        @test rand(UInt64) == next_draw
+    end
+end
+
 @testset "VEGAS preserves legacy callback coordinates when its grid widens" begin
     typed_point(::AbstractVector{Float64}) = 1.0
     typed_batch(points::Vector{<:AbstractVector{Float64}}) = ones(length(points))

@@ -3,16 +3,18 @@ function _check_vegas_batch(batch)
     throw(ArgumentError("batch must be false, true, or :matrix"))
 end
 
-function _vegas_callback_type(grid, requested)
+function _vegas_callback_coordinates(grid, requested)
     if requested === BigFloat
-        (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat
+        (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat, nothing
         throw(ArgumentError("active BigFloat precision cannot preserve the callback bounds; increase it with setprecision"))
     end
     (requested === nothing || requested === Float64) ||
         throw(ArgumentError("callback_type must be nothing, Float64, or BigFloat"))
-    (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64
-    requested === nothing && return BigFloat
-    throw(ArgumentError("callback_type = Float64 requires the grid bounds to be exactly representable in Float64"))
+    (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64, nothing
+    bounds = _inward_float64_callback_bounds(grid)
+    bounds !== nothing && return Float64, bounds
+    requested === nothing && return BigFloat, nothing
+    throw(ArgumentError("callback_type = Float64 requires a finite Float64 interval that resolves the grid bins"))
 end
 
 function _callback_bounds_fit(::Type{T}, grid) where {T}
@@ -22,6 +24,33 @@ function _callback_bounds_fit(::Type{T}, grid) where {T}
         isfinite(converted) && bound == converted || return false
     end
     return true
+end
+
+function _inward_float64_callback_bounds(grid)
+    nbins = size(grid, 1) - 1
+    lower = Vector{Float64}(undef, size(grid, 2))
+    upper = similar(lower)
+    for dim in axes(grid, 2)
+        a, b = minmax(grid[begin, dim], grid[end, dim])
+        lo, hi = Float64(a, RoundUp), Float64(b, RoundDown)
+        isfinite(lo) && isfinite(hi) || return nothing
+        if lo != a || hi != b
+            isfinite(Float64(a)) && isfinite(Float64(b)) && lo < hi || return nothing
+            bin_width = (BigFloat(hi) - BigFloat(lo)) / nbins
+            spacing = max(nextfloat(lo) - lo, hi - prevfloat(hi))
+            removed = (BigFloat(lo) - a) + (b - BigFloat(hi))
+            spacing <= bin_width && removed < bin_width || return nothing
+        end
+        lower[dim], upper[dim] = lo, hi
+    end
+    return lower, upper
+end
+
+_callback_grid_point(point, grid, dim, ::Nothing) = _bound_grid_point(point, grid, dim)
+
+function _callback_grid_point(point, grid, dim, bounds::Tuple)
+    lower, upper = bounds
+    return clamp(Float64(point), lower[dim], upper[dim])
 end
 
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
@@ -84,7 +113,7 @@ call. The number of bins comes from the grid. If supplied, `nbins` must match
 that number. Uniform grids with bins too narrow for `Float64` are reconstructed
 at the active `BigFloat` precision. Reusing a `BigFloat` grid requires active
 precision at least as high as the largest precision stored in its edges or
-widths. The `callback_type` option uses the stored bounds for its default.
+widths. The default `callback_type` uses the stored bounds and bin count.
 Other keywords have the same meaning as in [`vegas`](@ref).
 """
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)

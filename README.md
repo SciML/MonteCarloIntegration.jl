@@ -74,16 +74,16 @@ second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 the bounds stored in `trained`.
 
 VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
-for intervals of nonzero width. When the bounds or bin widths require extra
-precision, it uses `BigFloat` coordinates. The active precision must preserve
+for intervals of nonzero width. VEGAS stores the grid in `BigFloat` when its bounds
+or bin widths require extra precision. The active precision must preserve
 binary-exact bounds and the signed span to `Float64` accuracy and resolve the
 bins. Set it around the call with `setprecision(BigFloat, bits)` if needed.
-Scalar and batch callbacks receive `Float64` coordinates when all grid bounds
-are exactly representable as finite `Float64` values and `BigFloat` coordinates
-otherwise. Pass `callback_type = BigFloat` to observe distinct coordinates
-between adjacent `Float64` values on a widened grid. Reusing a `BigFloat` grid
-requires active precision at least as high as the precision stored in its edges
-or widths.
+Scalar and batch callbacks receive `Float64` coordinates by default when each
+axis has exact finite `Float64` bounds or inward `Float64` bounds that resolve
+the nominal bins. Float64 callbacks can receive repeated coordinates or only
+endpoints on narrow intervals. Use `callback_type = BigFloat` when the integrand
+needs interior samples. Reusing a `BigFloat` grid requires active precision at
+least as high as the precision stored in its edges or widths.
 
 ### Roadmap 
 - Supporting vector valued functions

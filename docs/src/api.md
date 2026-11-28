@@ -18,22 +18,27 @@ trained.integral_estimate
 ```
 
 VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
-for intervals of nonzero width. It uses `BigFloat` when bin widths are subnormal
-or approach the local spacing between representable `Float64` values, a bound
-or span overflows, a binary-exact bound is rounded, or rounding materially changes
-the signed span. The active precision must preserve binary-exact bounds and the
-signed span to `Float64` accuracy and resolve the bins. If needed, use
+for intervals of nonzero width. It stores the grid in `BigFloat` when bin widths
+are subnormal or approach the local spacing between representable `Float64` values,
+a bound or span overflows, a binary-exact bound is rounded, or rounding materially
+changes the signed span. The active precision must preserve binary-exact bounds
+and the signed span to `Float64` accuracy and resolve the bins. If needed, use
 `setprecision(BigFloat, bits)` around the integration call. A matrix-batched
 integrand can accept both coordinate types by preserving the element type of
 its inputs.
 
-The default `callback_type = nothing` passes `Float64` coordinates to the
-integrand when all grid bounds are exactly representable as finite `Float64`
-values and `BigFloat` coordinates otherwise. This applies to scalar and batch
-calls. Use `callback_type = BigFloat` to observe distinct coordinates between
-adjacent `Float64` values on a widened grid. On a `Float64` grid this converts the
-existing coordinates at the active `BigFloat` precision. An explicit callback
-type must represent all grid bounds exactly.
+The default `callback_type = nothing` passes `Float64` coordinates to scalar and
+batch integrands when each axis has exact finite `Float64` bounds or its inward
+`Float64` bounds resolve the nominal bins. Each inexact axis must have a finite
+inward interval whose nominal bins are at least as wide as the largest inward
+`Float64` spacing at its two bounds. Inward rounding must exclude less than one
+nominal bin in total. A box that needs finer coordinates uses `BigFloat` for the
+callback. The grid and its weights retain their precision. Float64 callbacks can
+receive repeated coordinates or only endpoints on narrow intervals. Use `callback_type = BigFloat`
+when the integrand needs interior samples. On a `Float64` grid this converts the
+existing coordinates at the active `BigFloat` precision, which must preserve the
+bounds. Explicit `callback_type = Float64` requires the same resolution as the
+default Float64 mode.
 
 The function below ranges from 1 to 3 between its bounds and integrates to 4.
 The widened callback coordinates let it evaluate at points between those bounds.
@@ -51,7 +56,7 @@ Pass a previous result to start a fresh estimate on its stored bounds and grid.
 For example, reuse the Gaussian's grid to compute its second radial moment.
 When reusing or sampling a `BigFloat` grid, set the active precision to at
 least the largest precision stored in the grid's edges or widths. The default
-`callback_type` is selected from the stored bounds when reusing a grid.
+`callback_type` is selected from the stored bounds and bin count when reusing a grid.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))

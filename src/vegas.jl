@@ -35,13 +35,18 @@ span to `Float64` accuracy and resolve the bins. Increase it around the call
 with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
 errors use `Float64`.
 
-With `callback_type = nothing`, the integrand receives `Float64` coordinates
-when all grid bounds are exactly representable as finite `Float64` values and
-`BigFloat` coordinates otherwise. This applies to all batch modes. Use
-`callback_type = BigFloat` to receive distinct coordinates between adjacent
-`Float64` values on widened grids. On a `Float64` grid, this converts the existing
-coordinates at the active `BigFloat` precision. An explicit callback type must
-represent the grid bounds exactly.
+With `callback_type = nothing`, the integrand receives `Float64` coordinates when
+every axis has exact finite `Float64` bounds or a usable inward `Float64` interval.
+On each inexact axis, the nominal inward bins must be at least as wide as the
+largest inward `Float64` spacing at its two bounds. Inward rounding must exclude
+less than one nominal bin in total. A box that needs finer coordinates uses
+`BigFloat` for the callback. This applies to all batch modes. Float64 callbacks
+can receive repeated coordinates or only endpoints on narrow intervals. Use
+`callback_type = BigFloat` when the integrand needs interior samples from a
+widened grid. On a `Float64` grid this converts the existing coordinates at the
+active `BigFloat` precision, which must preserve the bounds. An explicit
+`callback_type = Float64` requires the same finite, resolvable domain as the
+default Float64 mode.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
@@ -76,11 +81,11 @@ function _vegas(
     ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
     grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    coordinates = _vegas_callback_type(grid, callback_type)
-    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, coordinates)
+    coordinates, callback_bounds = _vegas_callback_coordinates(grid, callback_type)
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, coordinates, callback_bounds)
 end
 
-function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, ::Type{T}) where {T}
+function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, ::Type{T}, callback_bounds) where {T}
     nbins = size(widths, 1)
     ndim = size(grid, 2)
     points = Matrix{T}(undef, ndim, ncalls)
@@ -95,7 +100,7 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
         rand!(unit_points)
-        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
+        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths, callback_bounds)
         _evaluate!(values, func, points, batch, exponents)
         estimate, stderr, exact_mean, exact_variance = _iteration_moments(values)
         exact_means = _record_iteration_mean!(estimates, exact_means, estimate, exact_mean)
@@ -133,7 +138,7 @@ function _requires_scaled_jacobian(widths)
     return false
 end
 
-function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths)
+function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths, callback_bounds = nothing)
     nbins = size(widths, 1)
     for j in axes(points, 2)
         jacobian, exponent = 1.0, 0
@@ -143,7 +148,7 @@ function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid,
             bins[dim, j] = bin
             width = widths[bin, dim]
             point = muladd(y - (bin - 1), width, grid[bin, dim])
-            points[dim, j] = _bound_grid_point(point, grid, dim)
+            points[dim, j] = _callback_grid_point(point, grid, dim, callback_bounds)
             if exponents === nothing
                 jacobian *= Float64(nbins * width)
             else
