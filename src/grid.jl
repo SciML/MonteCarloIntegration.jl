@@ -61,6 +61,12 @@ function _with_vegas_precision(f, bits)
     return iszero(bits) || precision(BigFloat) == bits ? f() : setprecision(f, BigFloat, bits)
 end
 
+_with_grid_rounding(f, ::Type) = f()
+
+function _with_grid_rounding(f, ::Type{BigFloat})
+    return rounding(BigFloat) === RoundNearest ? f() : setrounding(f, BigFloat, RoundNearest)
+end
+
 _grid_bound(::Type{T}, bound) where {T} = T(bound)
 
 function _grid_bound(::Type{T}, bound::Rational) where {T <: Union{Float16, Float32, Float64}}
@@ -115,18 +121,28 @@ function _grid_bounds_fit(lo, hi, a, b)
 end
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
-    grid = Matrix{T}(undef, nbins + 1, length(lb))
-    widths = Matrix{T}(undef, nbins, length(lb))
-    for (dim, (lo, hi)) in enumerate(zip(lb, ub))
-        a, b = _grid_bounds(T, lo, hi)
-        isfinite(a) && isfinite(b) && _grid_bounds_fit(lo, hi, a, b) ||
-            throw(ArgumentError("the promoted coordinate precision cannot preserve the bounds in dimension $dim"))
-        _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
+    return _with_grid_rounding(T) do
+        grid = Matrix{T}(undef, nbins + 1, length(lb))
+        widths = Matrix{T}(undef, nbins, length(lb))
+        for (dim, (lo, hi)) in enumerate(zip(lb, ub))
+            a, b = _grid_bounds(T, lo, hi)
+            isfinite(a) && isfinite(b) && _grid_bounds_fit(lo, hi, a, b) ||
+                throw(ArgumentError("the promoted coordinate precision cannot preserve the bounds in dimension $dim"))
+            _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
+        end
+        grid, widths
     end
-    return grid, widths
 end
 
 _grid_coordinate_type(edges, widths) = float(promote_type(eltype(edges), eltype(widths)))
+
+const _LowPrecisionGridFloat = Union{Float16, Float32}
+
+_grid_bin_width(edges, widths, bin, tail...) = widths[bin, tail...]
+
+function _grid_bin_width(edges::AbstractArray{T}, widths, bin, tail...) where {T <: _LowPrecisionGridFloat}
+    return Float64(edges[bin + 1, tail...]) - Float64(edges[bin, tail...])
+end
 
 function _bound_grid_point(point, grid, dim)
     return clamp(point, minmax(grid[1, dim], grid[end, dim])...)
@@ -143,10 +159,64 @@ function _adapt_grid!(edges, widths, weights, proposed)
     return nothing
 end
 
+function _set_uniform_grid_axis!(edges, widths, a::BigFloat, b::BigFloat)
+    bits = precision(BigFloat)
+    nbins = length(widths)
+    if a == b
+        fill!(edges, a)
+        fill!(widths, zero(a))
+        return nothing
+    end
+    _with_vegas_precision(bits + ndigits(nbins; base = 2) + 32) do
+        span = b - a
+        edges[1] = a
+        previous = a
+        for i in 1:(nbins - 1)
+            edge = BigFloat(fma(BigFloat(i) / nbins, span, a); precision = bits)
+            (a < b ? previous < edge < b : previous > edge > b) || throw(_grid_resolution_error(a, nbins))
+            edges[i + 1] = previous = edge
+        end
+        edges[end] = b
+    end
+    for i in eachindex(widths)
+        width = edges[i + 1] - edges[i]
+        isfinite(width) && !iszero(width) || throw(_grid_resolution_error(a, nbins))
+        widths[i] = width
+    end
+    return nothing
+end
+
+_with_vegas_mapping(f, edges, widths) = f(widths, nothing)
+
+function _with_vegas_mapping(f, edges::AbstractArray{BigFloat}, widths)
+    bits = precision(BigFloat)
+    bits >= 64 && return f(widths, nothing)
+    return _with_vegas_precision(64) do
+        f(diff(edges; dims = 1), bits)
+    end
+end
+
+_round_vegas_coordinate(point, ::Nothing) = point
+_round_vegas_coordinate(point::BigFloat, bits::Int) = BigFloat(point; precision = bits)
+
 function _rebin!(edges, widths, mass, proposed)
+    return _with_grid_rounding(eltype(edges)) do
+        changed = _with_vegas_mapping(edges, widths) do working_widths, bits
+            _rebin_grid_axis!(edges, working_widths, mass, proposed, bits)
+        end
+        if changed
+            for i in eachindex(widths)
+                widths[i] = edges[i + 1] - edges[i]
+            end
+        end
+        nothing
+    end
+end
+
+function _rebin_grid_axis!(edges, working_widths, mass, proposed, bits)
     nbins = length(mass)
     step = sum(mass) / nbins
-    iszero(step) && return
+    iszero(step) && return false
     bin = 1
     left = 0.0
     right = mass[1]
@@ -160,18 +230,15 @@ function _rebin!(edges, widths, mass, proposed)
             right += mass[bin]
         end
         fraction = clamp((target - left) / mass[bin], 0.0, 1.0)
-        edge = eltype(edges)(muladd(fraction, widths[bin], edges[bin]))
+        edge = _round_vegas_coordinate(eltype(edges)(muladd(fraction, _grid_bin_width(edges, working_widths, bin), edges[bin])), bits)
         # Keep the current map if a narrower bin cannot be represented on this axis.
-        (ascending ? previous < edge < last(edges) : previous > edge > last(edges)) || return
-        isfinite(edge - previous) || return
+        (ascending ? previous < edge < last(edges) : previous > edge > last(edges)) || return false
+        isfinite(_round_vegas_coordinate(edge - previous, bits)) || return false
         proposed[i] = previous = edge
     end
-    isfinite(last(edges) - previous) || return
+    isfinite(_round_vegas_coordinate(last(edges) - previous, bits)) || return false
     edges[2:nbins] .= view(proposed, 1:(nbins - 1))
-    for i in eachindex(widths)
-        widths[i] = edges[i + 1] - edges[i]
-    end
-    return nothing
+    return true
 end
 
 """

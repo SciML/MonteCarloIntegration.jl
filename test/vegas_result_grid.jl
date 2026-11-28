@@ -1,5 +1,5 @@
 using MonteCarloIntegration
-using Random: seed!
+using Random: rand!, seed!
 using Test
 
 const Float64GridResult = VEGASResult{Float64, Float64, Float64, Matrix{Float64}, Matrix{Float64}}
@@ -69,4 +69,139 @@ end
     @test converted.adaptive_grid == edges
     @test converted.grid_spacing == widths
     @test fieldcount(Float64GridResult) == 5
+end
+
+@testset "Native BigFloat grids survive changes in caller rounding" begin
+    settings = (; ncalls = 64, maxiter = 1, alpha = 0.0)
+    cases = (
+        (128, BigFloat(2; precision = 128)^53, 1 // 8, 81 // 8),
+        (192, BigFloat(2; precision = 192)^80, -1 // 8, 97 // 8),
+    )
+    for (bits, center, low, high) in cases, nbins in (6, 7), direction in (identity, reverse)
+        setprecision(BigFloat, bits) do
+            lower, upper = direction((center + low, center + high))
+            expected = Float64(upper - lower)
+            for create_rounding in (RoundNearest, RoundUp, RoundDown)
+                original = setrounding(BigFloat, create_rounding) do
+                    vegas(Returns(1.0), [lower], [upper]; settings..., nbins)
+                end
+                for reuse_rounding in (RoundNearest, RoundUp, RoundDown, RoundToZero)
+                    @testset "$bits-bit, $nbins bins, $create_rounding → $reuse_rounding, $direction" begin
+                        setrounding(BigFloat, reuse_rounding) do
+                            observed = Ref(true)
+                            calls = Ref(0)
+                            warmed = vegas(original; settings...) do point
+                                calls[] += 1
+                                observed[] &= rounding(BigFloat) === reuse_rounding
+                                observed[] &= min(lower, upper) <= only(point) <= max(lower, upper)
+                                return 1.0
+                            end
+                            @test calls[] == settings.ncalls
+                            @test observed[]
+                            @test warmed.adaptive_grid == original.adaptive_grid
+                            @test warmed.grid_spacing == original.grid_spacing
+                            @test warmed.integral_estimate ≈ expected rtol = 2eps(Float64)
+                            @test iszero(warmed.standard_deviation)
+                            @test rounding(BigFloat) === reuse_rounding
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
+@testset "Adapted BigFloat grids retain their stored geometry across modes" begin
+    setprecision(BigFloat, 128) do
+        offset = BigFloat(2)^53
+        lo, hi = offset + 1 // 8, offset + 81 // 8
+        settings = (; ncalls = 128, maxiter = 2, nbins = 7)
+        trained = setrounding(BigFloat, RoundDown) do
+            seed!(347)
+            vegas(point -> exp(only(point) - offset), [lo], [hi]; settings...)
+        end
+        @test length(unique(trained.grid_spacing)) > 1
+        for mode in (RoundNearest, RoundUp, RoundToZero)
+            setrounding(BigFloat, mode) do
+                reused = vegas(Returns(1.0), trained; settings..., alpha = 0.0)
+                @test reused.adaptive_grid == trained.adaptive_grid
+                @test reused.grid_spacing == trained.grid_spacing
+                @test rounding(BigFloat) === mode
+            end
+        end
+    end
+end
+
+@testset "Low-bit BigFloat grids use stored physical spans" begin
+    settings = (; ncalls = 4096, maxiter = 2, alpha = 0.0, atol = 0.0, rtol = 0.0)
+    for (bits, span) in ((8, 29), (11, 29), (16, 15), (24, 31)), direction in (identity, reverse)
+        lo, hi = direction((BigFloat(0; precision = bits), BigFloat(span; precision = bits)))
+        expected = direction === identity ? span : -span
+        correctly_typed = Ref(true)
+        function constant(point)
+            correctly_typed[] &= precision(only(point)) == bits
+            return one(only(point))
+        end
+        seed!(826)
+        result = vegas(constant, [lo], [hi]; settings..., nbins = 7)
+        seed!(826)
+        warmed = vegas(constant, result; settings...)
+        @test correctly_typed[]
+        @test result.adaptive_grid == warmed.adaptive_grid
+        @test result.grid_spacing == warmed.grid_spacing
+        @test all(x -> precision(x) == bits, result.grid_spacing)
+        @test result.integral_estimate == warmed.integral_estimate
+        @test result.standard_deviation == warmed.standard_deviation
+        @test abs(result.integral_estimate - expected) <= 6result.standard_deviation + eps(Float64(expected))
+    end
+
+    bits, nbins = 11, 2500
+    lo, hi = BigFloat(-1; precision = bits), BigFloat(1; precision = bits)
+    seed!(5928)
+    result = vegas(Returns(1.0), [lo], [hi]; settings..., nbins)
+    @test length(unique(result.adaptive_grid)) == nbins + 1
+    @test first(result.adaptive_grid) == lo
+    @test last(result.adaptive_grid) == hi
+    @test all(w -> w > 0, result.grid_spacing)
+    @test all(x -> precision(x) == bits, result.adaptive_grid)
+    @test abs(result.integral_estimate - 2.0) <= 6result.standard_deviation + eps(2.0)
+    seed!(5928)
+    warmed = vegas(Returns(1.0), result; settings...)
+    @test warmed.integral_estimate == result.integral_estimate
+    @test warmed.adaptive_grid == result.adaptive_grid
+    points = MonteCarloIntegration.sample_from_adaptive_grid(warmed, 128)
+    @test all(point -> lo <= only(point) <= hi && precision(only(point)) == bits, points)
+
+    setprecision(BigFloat, bits) do
+        ncalls = 65_536
+        coordinates = Matrix{BigFloat}(undef, 1, ncalls)
+        bins = zeros(Int, 1, ncalls)
+        weights = zeros(ncalls)
+        grid, widths = warmed.adaptive_grid, warmed.grid_spacing
+        MonteCarloIntegration._with_vegas_mapping(grid, widths) do working_widths, native_bits
+            seed!(1234)
+            rand!(coordinates)
+            MonteCarloIntegration._map_vegas_points!(coordinates, coordinates, bins, weights, nothing, grid, working_widths, native_bits)
+        end
+        @test length(unique(bins)) == nbins
+        @test all(x -> precision(x) == bits, coordinates)
+    end
+end
+
+@testset "BigFloat Jacobian factors round once for Float64 statistics" begin
+    setprecision(BigFloat, 53) do
+        settings = (; nbins = 7, ncalls = 2048, maxiter = 1, alpha = 0.0, atol = 0.0, rtol = 0.0)
+        for extra_scales in (BigFloat[], [BigFloat(2)^1100, BigFloat(2)^(-1100)])
+            upper = vcat(ones(BigFloat, 32), extra_scales)
+            lower = zeros(BigFloat, length(upper))
+            for direction in (identity, reverse)
+                a, b = direction((lower, upper))
+                target = isodd(count(i -> b[i] < a[i], eachindex(a))) ? -1.0 : 1.0
+                seed!(7714)
+                result = vegas(Returns(1.0), a, b; settings...)
+                @test abs(result.integral_estimate - target) <= max(2eps(Float64), 6result.standard_deviation)
+                @test isfinite(result.standard_deviation)
+            end
+        end
+    end
 end

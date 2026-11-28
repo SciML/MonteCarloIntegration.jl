@@ -26,9 +26,15 @@ Float64 uses Float64. Exact-only inputs normally use Float64 and can select
 BigFloat when the requested grid needs more precision.
 
 If the bounds include BigFloat values, VEGAS uses the largest precision stored
-in those arguments. It draws BigFloat random variates at that precision. This
-also applies when the ambient BigFloat precision differs. The result estimate
-and estimated standard error use Float64.
+in those arguments for callback coordinates and the grid, even when it differs
+from the ambient precision. The result estimate and estimated standard error
+use Float64.
+
+BigFloat grid construction, adaptation, and warm-start validation round bin
+geometry to nearest. When the requested precision is below 64 bits, unit
+sampling and bin calculations use extra precision. Callback coordinates and
+stored grid values retain the requested precision. Integrand evaluation uses
+the caller's BigFloat rounding mode.
 
 ```@example matrix_batch
 start = BigFloat(2)^53

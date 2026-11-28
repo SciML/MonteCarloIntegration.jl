@@ -33,6 +33,8 @@ cannot represent the requested grid. Non-dyadic rational and irrational bounds
 round inward on intervals of nonzero width. If the selected type cannot
 preserve the bounds or resolve the requested bins, provide higher-precision
 bounds or use fewer bins. Estimates and standard errors use Float64.
+For Float16 and Float32 grids, integration and sampling compute signed bin spans
+from the stored edges in Float64.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
@@ -84,14 +86,13 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     proposed = similar(widths, nbins)
-    exponents = _requires_scaled_jacobian(widths) ? Vector{Int}(undef, ncalls) : nothing
+    exponents = _vegas_jacobian_exponents(grid, widths, ncalls)
     estimates = _IterationMean[]
     errors = _IterationError[]
     exact_means = exact_variances = nothing
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
-        rand!(unit_points)
-        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
+        _sample_vegas_iteration!(points, unit_points, bins, values, exponents, grid, widths)
         _evaluate!(values, func, points, batch, exponents)
         estimate, stderr, exact_mean, exact_variance = _iteration_moments(values)
         exact_means = _record_iteration_mean!(estimates, exact_means, estimate, exact_mean)
@@ -107,19 +108,30 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
             break
         end
         if exponents === nothing && !iszero(stderr) && !iszero(alpha) && nbins > 1 && iter < maxiter
-            if _requires_scaled_jacobian(widths)
-                exponents = Vector{Int}(undef, ncalls)
-            end
+            exponents = _vegas_jacobian_exponents(grid, widths, ncalls)
         end
     end
     return VEGASResult(_rounded_mean(mean), _rounded_error(error), chi_squared, grid, widths)
 end
 
-function _requires_scaled_jacobian(widths)
+function _sample_vegas_iteration!(points, unit_points, bins, values, exponents, grid, widths)
+    return _with_vegas_mapping(grid, widths) do working_widths, bits
+        rand!(unit_points)
+        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, working_widths, bits)
+    end
+end
+
+function _vegas_jacobian_exponents(grid, widths, ncalls)
+    return _with_vegas_mapping(grid, widths) do working_widths, _
+        _requires_scaled_jacobian(working_widths, grid) ? Vector{Int}(undef, ncalls) : nothing
+    end
+end
+
+function _requires_scaled_jacobian(widths, grid = nothing)
     nbins = size(widths, 1)
     lower = upper = 1.0
-    for axis in eachcol(widths)
-        smallest, largest = extrema(abs, axis)
+    for dim in axes(widths, 2)
+        smallest, largest = _grid_width_extrema(grid, widths, dim)
         small_factor = _vegas_bin_factor(smallest, nbins)
         large_factor = _vegas_bin_factor(largest, nbins)
         lower *= small_factor
@@ -129,29 +141,46 @@ function _requires_scaled_jacobian(widths)
     return false
 end
 
+_grid_width_extrema(grid, widths, dim) = extrema(abs, view(widths, :, dim))
+
+function _grid_width_extrema(grid::AbstractMatrix{T}, widths, dim) where {T <: _LowPrecisionGridFloat}
+    return extrema(i -> abs(_grid_bin_width(grid, widths, i, dim)), axes(widths, 1))
+end
+
 _vegas_bin_factor(width, nbins) = Float64(nbins * width)
+_vegas_bin_factor(width::BigFloat, nbins) = Float64(nbins * width, RoundNearest)
 _vegas_bin_factor(width::Union{Float16, Float32}, nbins) = nbins * Float64(width)
 
-function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths)
+_vegas_jacobian_one(::Type) = 1.0
+_vegas_jacobian_one(::Type{BigFloat}) = one(BigFloat)
+
+_vegas_jacobian_factor(width, nbins) = _vegas_bin_factor(width, nbins)
+_vegas_jacobian_factor(width::BigFloat, nbins) = nbins * width
+
+_float64_jacobian(value::Float64) = value
+_float64_jacobian(value::BigFloat) = Float64(value, RoundNearest)
+
+function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths, bits = nothing)
     nbins = size(widths, 1)
+    unit_jacobian = _vegas_jacobian_one(eltype(grid))
     for j in axes(points, 2)
-        jacobian, exponent = 1.0, 0
+        jacobian, exponent = unit_jacobian, 0
         for dim in axes(points, 1)
             y = unit_points[dim, j] * nbins
             bin = min(nbins, floor(Int, y) + 1)
             bins[dim, j] = bin
-            width = widths[bin, dim]
+            width = _grid_bin_width(grid, widths, bin, dim)
             point = muladd(y - (bin - 1), width, grid[bin, dim])
-            points[dim, j] = _bound_grid_point(point, grid, dim)
+            points[dim, j] = _round_vegas_coordinate(_bound_grid_point(point, grid, dim), bits)
             if exponents === nothing
-                jacobian *= _vegas_bin_factor(width, nbins)
+                jacobian *= _vegas_jacobian_factor(width, nbins)
             else
                 mantissa, shift = frexp(width)
-                jacobian, step = frexp(jacobian * (Float64(mantissa) * nbins))
+                jacobian, step = frexp(jacobian * _vegas_jacobian_factor(mantissa, nbins))
                 exponent += shift + step
             end
         end
-        weights[j] = jacobian
+        weights[j] = _float64_jacobian(jacobian)
         exponents === nothing || (exponents[j] = exponent)
     end
     return nothing
@@ -166,11 +195,13 @@ stored coordinate type and BigFloat precision.
 function sample_from_adaptive_grid(res, ncalls)
     x, delx = _sampling_grid(res)
     return _with_vegas_precision(_stored_grid_precision(x, delx)) do
-        _sample_adaptive_grid(x, delx, ncalls, _grid_coordinate_type(x, delx))
+        _with_vegas_mapping(x, delx) do working_widths, bits
+            _sample_adaptive_grid(x, working_widths, ncalls, _grid_coordinate_type(x, delx), bits)
+        end
     end
 end
 
-function _sample_adaptive_grid(x, delx, ncalls, ::Type{T}) where {T}
+function _sample_adaptive_grid(x, delx, ncalls, ::Type{T}, bits = nothing) where {T}
     nbins = size(delx, 1)
     ndim = size(x, 2)
 
@@ -180,7 +211,11 @@ function _sample_adaptive_grid(x, delx, ncalls, ::Type{T}) where {T}
 
     from_y_to_i(y) = min(nbins, floor(Int, nbins * y) + 1)
     delta(y) = y * nbins + 1 - from_y_to_i(y)
-    from_y_to_x(y, dim) = _bound_grid_point(x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y), x, dim)
+    function from_y_to_x(y, dim)
+        bin = from_y_to_i(y)
+        point = x[bin, dim] + _grid_bin_width(x, delx, bin, dim) * delta(y)
+        return _round_vegas_coordinate(_bound_grid_point(point, x, dim), bits)
+    end
 
     xmat = similar(ymat, T)
     for dim in 1:ndim

@@ -7,9 +7,22 @@ _vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points))
 
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
 
+function _apply_vegas_weight(weight, value::BigFloat, ::Nothing, _)
+    return _with_vegas_precision(max(64, precision(value))) do
+        Float64(weight * value, RoundNearest)
+    end
+end
+
 function _apply_vegas_weight(weight, value, exponents, j)
     mantissa, exponent = frexp(float(value))
     return ldexp(weight * mantissa, exponents[j] + exponent)
+end
+
+function _apply_vegas_weight(weight, value::BigFloat, exponents, j)
+    return _with_vegas_precision(max(64, precision(value))) do
+        mantissa, exponent = frexp(value)
+        Float64(ldexp(weight * mantissa, exponents[j] + exponent), RoundNearest)
+    end
 end
 
 function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
@@ -61,6 +74,31 @@ function _set_uniform_grid_axis!(edges, widths, a, b)
     return nothing
 end
 
+function _set_uniform_grid_axis!(edges, widths, a::T, b::T) where {T <: _LowPrecisionGridFloat}
+    nbins = length(widths)
+    if a == b
+        fill!(edges, a)
+        fill!(widths, zero(T))
+        return nothing
+    end
+
+    origin = Float64(a)
+    span = Float64(b) - origin
+    edges[1] = a
+    previous = a
+    for i in 1:(nbins - 1)
+        edge = T(muladd(i / nbins, span, origin))
+        (a < b ? previous < edge < b : previous > edge > b) || throw(_grid_resolution_error(a, nbins))
+        edges[i + 1] = previous = edge
+    end
+    edges[end] = b
+    for i in eachindex(widths)
+        widths[i] = edges[i + 1] - edges[i]
+        isfinite(widths[i]) && !iszero(widths[i]) || throw(_grid_resolution_error(a, nbins))
+    end
+    return nothing
+end
+
 function _grid_resolution_error(bound, nbins)
     return ArgumentError("the selected coordinate precision ($(typeof(bound)), $(precision(bound)) bits) cannot represent $nbins grid bins; use fewer bins or higher-precision bounds")
 end
@@ -76,7 +114,9 @@ match the grid size. Other keywords have the same meaning as in [`vegas`](@ref).
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)
     edges, widths = previous.adaptive_grid, previous.grid_spacing
     return _with_vegas_precision(_stored_grid_precision(edges, widths)) do
-        x, delx = _copy_vegas_grid(edges, widths)
+        x, delx = _with_grid_rounding(_grid_coordinate_type(edges, widths)) do
+            _copy_vegas_grid(edges, widths)
+        end
         grid_bins = size(delx, 1)
         (nbins === nothing || nbins == grid_bins) || throw(ArgumentError("nbins must match the previous grid ($grid_bins)"))
         _vegas(func, view(x, 1, :), view(x, size(x, 1), :), (x, delx); nbins = grid_bins, kwargs...)
@@ -136,6 +176,25 @@ function _canonicalize_grid_axis!(edges, widths, rtol)
         width_rtol = width isa BigFloat ? _bigfloat_width_rtol(width) : rtol
         isfinite(actual) && (iszero(actual) || sign(actual) == direction) && isapprox(actual, width; rtol = width_rtol) || return false
         widths[i] = actual
+    end
+    return true
+end
+
+function _canonicalize_grid_axis!(edges::AbstractVector{T}, widths, rtol) where {T <: _LowPrecisionGridFloat}
+    a, b = first(edges), last(edges)
+    direction = cmp(b, a)
+    valid = all(eachindex(widths)) do i
+        actual = edges[i + 1] - edges[i]
+        return isfinite(actual) && (iszero(actual) || sign(actual) == direction) && isapprox(actual, widths[i]; rtol)
+    end
+    if valid
+        for i in eachindex(widths)
+            widths[i] = edges[i + 1] - edges[i]
+        end
+    elseif _is_uniform_grid_axis(edges, widths)
+        _set_uniform_grid_axis!(edges, widths, a, b)
+    else
+        return false
     end
     return true
 end
