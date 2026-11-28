@@ -16,7 +16,7 @@ include("grid.jl")
 """
     vegas(f, lb = zeros(2), ub = ones(2); maxiter = 10, nbins = 1000,
           ncalls = 10000, rtol = 1e-4, atol = 1e-4, debug = false, batch = false,
-          alpha = 1.5)
+          alpha = 1.5, callback_type = nothing)
 
 Estimate the integral of a real scalar function over the box from `lb` to `ub`
 using adaptive importance sampling. Each of up to `maxiter` iterations draws
@@ -25,7 +25,7 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 `f` receives a vector of `ncalls` coordinate vectors. With `batch = :matrix`, it
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
-Sample coordinates and grid edges normally use `Float64`. Non-dyadic rational
+Grid coordinates normally use `Float64`. Non-dyadic rational
 bounds and built-in irrational constants are rounded inward for intervals of
 nonzero width. VEGAS uses `BigFloat` when bin widths are subnormal or approach
 the spacing between adjacent `Float64` values, a bound or span overflows, a
@@ -34,6 +34,14 @@ The active `BigFloat` precision must preserve binary-exact bounds and the signed
 span to `Float64` accuracy and resolve the bins. Increase it around the call
 with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
 errors use `Float64`.
+
+With `callback_type = nothing`, the integrand receives `Float64` coordinates
+when all grid bounds are exactly representable as finite `Float64` values and
+`BigFloat` coordinates otherwise. This applies to all batch modes. Use
+`callback_type = BigFloat` to receive distinct coordinates between adjacent
+`Float64` values on widened grids. On a `Float64` grid, this converts the existing
+coordinates at the active `BigFloat` precision. An explicit callback type must
+represent the grid bounds exactly.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
@@ -59,7 +67,8 @@ end
 
 function _vegas(
         func, lb, ub, initial_grid; maxiter = 10, nbins = 1000, ncalls = 10000,
-        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5
+        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5,
+        callback_type = nothing
     )
     _check_vegas_batch(batch)
     maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
@@ -67,14 +76,15 @@ function _vegas(
     ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
     grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+    coordinates = _vegas_callback_type(grid, callback_type)
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, coordinates)
 end
 
-function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha)
+function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, ::Type{T}) where {T}
     nbins = size(widths, 1)
     ndim = size(grid, 2)
-    points = Matrix{eltype(grid)}(undef, ndim, ncalls)
-    unit_points = eltype(points) === Float64 ? points : similar(points, Float64)
+    points = Matrix{T}(undef, ndim, ncalls)
+    unit_points = T === Float64 ? points : similar(points, Float64)
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     proposed = similar(widths, nbins)
