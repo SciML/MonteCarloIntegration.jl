@@ -607,7 +607,6 @@ end
     previous = vegas(Returns(0), Float32[0], Float32[1]; options...)
     @test sum(previous.grid_spacing) ≈ 1.0
     result = vegas(Returns(1), previous; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
-    # The nominal width 1/3 is stored as Float32 on this grid.
     @test result.integral_estimate ≈ 1.0 rtol = eps(Float32)
 
     width = 1.0f0 / 3
@@ -617,5 +616,6 @@ end
     reused = vegas(Returns(1), historical; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
     @test reused.integral_estimate ≈ 1.0
     @test edges[2] == Float64(width)
-    @test reused.grid_spacing ≈ fill(1 / 3, 3, 1) rtol = 2eps()
+    @test reused.adaptive_grid == edges
+    @test reused.grid_spacing == diff(edges; dims = 1)
 end
