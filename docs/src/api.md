@@ -17,11 +17,12 @@ trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
 trained.integral_estimate
 ```
 
-VEGAS uses `BigFloat` coordinates when bin widths are subnormal or approach the
-local spacing between representable `Float64` values, a bound or span overflows,
-a binary-exact bound is rounded, or rounding the bounds materially changes the
-interval's span. The active precision must preserve binary-exact bounds and the
-signed span to `Float64` accuracy, and it must resolve the bins. If needed, use
+VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
+for intervals of nonzero width. It uses `BigFloat` when bin widths are subnormal
+or approach the local spacing between representable `Float64` values, a bound
+or span overflows, a binary-exact bound is rounded, or rounding materially changes
+the signed span. The active precision must preserve binary-exact bounds and the
+signed span to `Float64` accuracy and resolve the bins. If needed, use
 `setprecision(BigFloat, bits)` around the integration call. A matrix-batched
 integrand can accept both coordinate types by preserving the element type of
 its inputs.
@@ -32,7 +33,7 @@ evaluations in both sampling modes.
 
 ### Reuse the adaptive grid
 
-Pass a previous result to start a fresh estimate on the same bounds and grid.
+Pass a previous result to start a fresh estimate on its stored bounds and grid.
 For example, reuse the Gaussian's grid to compute its second radial moment.
 When reusing or sampling a `BigFloat` grid, set the active precision to at
 least the largest precision stored in the grid's edges or widths.

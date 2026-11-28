@@ -57,7 +57,7 @@ end
 """
     vegas(f, previous::VEGASResult; kwargs...)
 
-Integrate `f` over the same bounds as `previous`, starting from a copy of its
+Integrate `f` over the bounds stored in `previous`, starting from a copy of its
 adaptive grid. The estimate and uncertainty use only the samples from this
 call. The number of bins comes from the grid. If supplied, `nbins` must match
 that number. Uniform grids with bins too narrow for `Float64` are reconstructed

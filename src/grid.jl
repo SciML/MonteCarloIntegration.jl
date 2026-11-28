@@ -4,7 +4,7 @@ function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
     wide_coordinates = false
     for dim in eachindex(lb, ub)
         lo, hi = lb[dim], ub[dim]
-        a, b = _grid_bound(Float64, lo), _grid_bound(Float64, hi)
+        a, b = _grid_bounds(Float64, lo, hi)
         if !isfinite(a) || !isfinite(b)
             isfinite(lo) && isfinite(hi) || throw(ArgumentError("bounds must be finite"))
             wide_coordinates = true
@@ -20,6 +20,34 @@ _grid_bound(::Type{T}, bound) where {T} = T(bound)
 
 function _grid_bound(::Type{Float64}, bound::Rational)
     return Float64(BigFloat(bound, RoundNearest; precision = 128), RoundNearest)
+end
+
+function _grid_bound(::Type{BigFloat}, bound::Rational)
+    bits = precision(BigFloat)
+    value = BigFloat(bound, RoundNearest; precision = bits + 16)
+    return BigFloat(value, RoundNearest; precision = bits)
+end
+
+_grid_bound(T::Type, bound, rounding) = _grid_bound(T, bound)
+_grid_bound(T::Type, bound::Irrational, rounding) = T(bound, rounding)
+
+function _grid_bound(T::Type, bound::Rational, rounding)
+    value = _grid_bound(T, bound)
+    (ispow2(denominator(bound)) || !isfinite(value)) && return value
+    # Guard bits keep the approximation within one step of the inward endpoint.
+    exact_value = Rational{BigInt}(value)
+    rounding === RoundUp && exact_value < bound && return nextfloat(value)
+    rounding === RoundDown && exact_value > bound && return prevfloat(value)
+    return value
+end
+
+function _grid_bounds(T, lo, hi)
+    if lo < hi
+        return _grid_bound(T, lo, RoundUp), _grid_bound(T, hi, RoundDown)
+    elseif hi < lo
+        return _grid_bound(T, lo, RoundDown), _grid_bound(T, hi, RoundUp)
+    end
+    return _grid_bound(T, lo), _grid_bound(T, hi)
 end
 
 function _needs_wide_grid_axis(a, b, nbins, nonflat = a != b)
@@ -69,7 +97,7 @@ end
 function _check_bigfloat_grid_bounds(lo, hi, a, b, nbins)
     reason = if _binary_bound_rounded(lo, a) || _binary_bound_rounded(hi, b)
         "preserve the grid bounds exactly"
-    elseif !_grid_span_matches(lo, hi, a, b, (b - a) / nbins, nbins)
+    elseif (lo < hi) != (a < b) || (hi < lo) != (b < a) || !_grid_span_matches(lo, hi, a, b, (b - a) / nbins, nbins)
         "preserve the signed grid span"
     else
         return nothing
@@ -82,7 +110,7 @@ function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
     widths = Matrix{T}(undef, nbins, length(lb))
     for dim in eachindex(lb, ub)
         lo, hi = lb[dim], ub[dim]
-        a, b = _grid_bound(T, lo), _grid_bound(T, hi)
+        a, b = _grid_bounds(T, lo, hi)
         T === BigFloat && _check_bigfloat_grid_bounds(lo, hi, a, b, nbins)
         _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
     end
@@ -92,9 +120,7 @@ end
 _grid_coordinate_type(edges, widths) =
     eltype(edges) === BigFloat || eltype(widths) === BigFloat ? BigFloat : Float64
 
-_bound_grid_point(point, grid, dim) = point
-
-function _bound_grid_point(point::BigFloat, grid, dim)
+function _bound_grid_point(point, grid, dim)
     return clamp(point, minmax(grid[1, dim], grid[end, dim])...)
 end
 
