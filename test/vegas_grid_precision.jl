@@ -214,6 +214,37 @@ end
     end
 end
 
+@testset "Narrow intervals with irrational endpoints" begin
+    options = (; nbins = 1, ncalls = 4, maxiter = 1, alpha = 0.0)
+    for constant in (π, Base.MathConstants.ℯ, Base.MathConstants.φ)
+        source = BigFloat(constant; precision = 1200)
+        for bits in (512, 768), direction in (-1, 1)
+            inward = BigFloat(source, direction > 0 ? RoundUp : RoundDown; precision = bits)
+            upper = setprecision(BigFloat, bits) do
+                inward + direction * ldexp(BigFloat(1), 210 - bits)
+            end
+            expected = Float64(upper - inward)
+            for (lo, hi, sign) in ((constant, upper, 1), (upper, constant, -1))
+                result = vegas(Returns(1.0), [lo], [hi]; options...)
+                @test vec(result.adaptive_grid) == (sign == 1 ? [inward, upper] : [upper, inward])
+                @test all(x -> precision(x) == bits, result.adaptive_grid)
+                @test result.integral_estimate === sign * expected
+                @test iszero(result.standard_deviation)
+            end
+        end
+        rational = bound_ratio(BigFloat(source, RoundUp; precision = 704))
+        for (lo, hi, sign) in ((constant, rational, 1), (rational, constant, -1))
+            result = vegas(Returns(1.0), [lo], [hi]; options...)
+            exact_span = setprecision(BigFloat, 1200) do
+                Float64(BigFloat(rational) - source)
+            end
+            @test eltype(result.adaptive_grid) === BigFloat
+            @test result.integral_estimate === sign * exact_span
+            @test iszero(result.standard_deviation)
+        end
+    end
+end
+
 @testset "VEGAS validates the effective span of subnormal grids" begin
     intervals = (
         (nextfloat(0.0), nextfloat(0.0, 1024), 2),

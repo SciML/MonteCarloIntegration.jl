@@ -152,9 +152,12 @@ function _copy_vegas_grid(edges, widths)
     x, delx = Matrix{T}(edges), Matrix{T}(widths)
     all(isfinite, x) && all(isfinite, delx) ||
         throw(ArgumentError("the previous grid must contain finite edges and widths"))
-    rtol = eltype(widths) in (Float16, Float32) ? 2eps(eltype(widths)) : 2eps(T)
+    rtol = 2eps(T)
+    for storage in (eltype(edges), eltype(widths))
+        storage in (Float16, Float32, Float64) && (rtol = max(rtol, 2eps(storage)))
+    end
     for dim in axes(x, 2)
-        _canonicalize_grid_axis!(view(x, :, dim), view(delx, :, dim), rtol) ||
+        _canonicalize_grid_axis!(view(x, :, dim), view(delx, :, dim), view(widths, :, dim), rtol) ||
             throw(ArgumentError("the previous grid has inconsistent edges and widths in dimension $dim"))
     end
     if T === BigFloat
@@ -193,7 +196,7 @@ function _float64_grid_spans_match(edges, widths)
     return true
 end
 
-function _canonicalize_grid_axis!(edges::AbstractVector{Float64}, widths, rtol)
+function _canonicalize_grid_axis!(edges::AbstractVector{Float64}, widths, stored, rtol)
     a, b = first(edges), last(edges)
     direction = cmp(b, a)
     nominal = _is_uniform_grid_axis(edges, widths)
@@ -204,13 +207,19 @@ function _canonicalize_grid_axis!(edges::AbstractVector{Float64}, widths, rtol)
     for i in eachindex(widths)
         actual = edges[i + 1] - edges[i]
         isfinite(actual) && (iszero(actual) || sign(actual) == direction) || return false
-        (nominal || isapprox(actual, widths[i]; rtol)) || return false
+        (nominal || _grid_width_matches(actual, stored[i], rtol)) || return false
         widths[i] = actual
     end
     return true
 end
 
-function _canonicalize_grid_axis!(edges, widths, rtol)
+_grid_width_matches(actual, width, rtol) = isapprox(actual, width; rtol)
+_grid_width_matches(actual, width::BigFloat, rtol) = isapprox(actual, width; rtol = max(rtol, _bigfloat_width_rtol(width)))
+function _grid_width_matches(actual, width::T, rtol) where {T <: Union{Float16, Float32, Float64}}
+    return T(actual, RoundNearest) == width || isapprox(actual, width; rtol)
+end
+
+function _canonicalize_grid_axis!(edges, widths, stored, rtol)
     a, b = first(edges), last(edges)
     if _is_uniform_grid_axis(edges, widths)
         _set_uniform_grid_axis!(edges, widths, a, b)
@@ -219,20 +228,18 @@ function _canonicalize_grid_axis!(edges, widths, rtol)
     direction = cmp(b, a)
     for i in eachindex(widths)
         actual = edges[i + 1] - edges[i]
-        width = widths[i]
-        width_rtol = width isa BigFloat ? _bigfloat_width_rtol(width) : rtol
-        isfinite(actual) && (iszero(actual) || sign(actual) == direction) && isapprox(actual, width; rtol = width_rtol) || return false
+        isfinite(actual) && (iszero(actual) || sign(actual) == direction) && _grid_width_matches(actual, stored[i], rtol) || return false
         widths[i] = actual
     end
     return true
 end
 
-function _canonicalize_grid_axis!(edges::AbstractVector{T}, widths, rtol) where {T <: _LowPrecisionGridFloat}
+function _canonicalize_grid_axis!(edges::AbstractVector{T}, widths, stored, rtol) where {T <: _LowPrecisionGridFloat}
     a, b = first(edges), last(edges)
     direction = cmp(b, a)
     valid = all(eachindex(widths)) do i
         actual = edges[i + 1] - edges[i]
-        return isfinite(actual) && (iszero(actual) || sign(actual) == direction) && isapprox(actual, widths[i]; rtol)
+        return isfinite(actual) && (iszero(actual) || sign(actual) == direction) && _grid_width_matches(actual, stored[i], rtol)
     end
     if valid
         for i in eachindex(widths)

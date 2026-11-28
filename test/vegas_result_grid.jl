@@ -406,3 +406,38 @@ end
         end
     end
 end
+
+@testset "Warm starts use the stored precision of mixed grid matrices" begin
+    setprecision(BigFloat, 128) do
+        for T in (Float16, Float32, Float64), reverse_axis in (false, true)
+            for (points, spacing) in ((BigFloat[0, BigFloat("0.1"), 1], T[0.1, 0.9]), (T[0, 0.1, 1], [BigFloat("0.1"), BigFloat("0.9")]))
+                edges = reshape(reverse_axis ? reverse(points) : points, :, 1)
+                widths = reshape(reverse_axis ? -reverse(spacing) : spacing, :, 1)
+                start = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+                saved_edges, saved_widths = copy(edges), copy(widths)
+                normalized = BigFloat.(edges)
+                physical = diff(normalized; dims = 1)
+                reference = VEGASResult(0.0, 0.0, 0.0, normalized, physical)
+                solve(grid) = vegas(only, grid; ncalls = 16, maxiter = 1, alpha = 0.0)
+                seed!(114)
+                target = solve(reference)
+                seed!(114)
+                result = solve(start)
+                @test result.adaptive_grid == normalized && result.grid_spacing == physical
+                @test (result.integral_estimate, result.standard_deviation) == (target.integral_estimate, target.standard_deviation)
+                @test (edges, widths) == (saved_edges, saved_widths)
+                wrong = copy(widths)
+                wrong[1] /= 2
+                @test_throws ArgumentError solve(VEGASResult(0.0, 0.0, 0.0, edges, wrong))
+            end
+        end
+        step = ldexp(BigFloat(1), -1075)
+        edges = reshape(BigFloat[0, step, 2step], :, 1)
+        for sign in (-1, 1)
+            box = VEGASResult(0.0, 0.0, 0.0, sign .* edges, zeros(2, 1))
+            result = vegas(Returns(1), box; ncalls = 4, maxiter = 1, alpha = 0.0)
+            @test result.grid_spacing == fill(sign * step, 2, 1)
+            @test result.integral_estimate === sign * nextfloat(0.0)
+        end
+    end
+end
