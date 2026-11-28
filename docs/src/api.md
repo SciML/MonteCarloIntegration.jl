@@ -30,11 +30,13 @@ in those arguments for callback coordinates and the grid, even when it differs
 from the ambient precision. The result estimate and estimated standard error
 use Float64.
 
-BigFloat grid construction, adaptation, and warm-start validation round bin
-geometry to nearest. When the requested precision is below 64 bits, unit
-sampling and bin calculations use extra precision. Callback coordinates and
-stored grid values retain the requested precision. Integrand evaluation uses
-the caller's BigFloat rounding mode.
+BigFloat grid construction, adaptation, warm-start validation, and sampling
+round coordinates to nearest. When the requested precision is below 64 bits,
+unit sampling and bin calculations use extra precision. Callback coordinates
+and stored grid values retain the requested precision. Integrand evaluation
+uses the caller's BigFloat rounding mode. BigInt and Rational{BigInt} results
+retain their exact values through Jacobian weighting before rounding to Float64.
+Direct grid sampling promotes the coordinate type from both grid matrices.
 
 ```@example matrix_batch
 start = BigFloat(2)^53

@@ -7,6 +7,26 @@ _vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points))
 
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
 
+const _ExactVegasValue = Union{BigInt, Rational{BigInt}}
+
+function _apply_exact_vegas_weight(weight, value, exponent)
+    isfinite(weight) && isfinite(value) || return weight * Float64(value)
+    if iszero(weight) || iszero(value)
+        return xor(signbit(weight), signbit(value)) ? -0.0 : 0.0
+    end
+    weighted = Rational{BigInt}(weight) * value
+    num, den = numerator(weighted), denominator(weighted)
+    order = Int128(exponent) + ndigits(num; base = 2) - ndigits(den; base = 2)
+    # Bit lengths bound the magnitude above and below by adjacent powers of two.
+    order <= -1076 && return num < 0 ? -0.0 : 0.0
+    order >= 1025 && return num < 0 ? -Inf : Inf
+    shift = Int128(exponent) + 1074
+    return shift >= 0 ? _round_binary64_units(num << shift, den) : _round_binary64_units(num, den << -shift)
+end
+
+_apply_vegas_weight(weight, value::_ExactVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
+_apply_vegas_weight(weight, value::_ExactVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
+
 function _apply_vegas_weight(weight, value::BigFloat, ::Nothing, _)
     return _with_vegas_precision(max(64, precision(value))) do
         Float64(weight * value, RoundNearest)
@@ -146,6 +166,7 @@ end
 function _sampling_grid(result)
     edges, widths = result.adaptive_grid, result.grid_spacing
     T = eltype(edges)
+    T !== eltype(widths) && _grid_coordinate_type(edges, widths) === BigFloat && return edges, widths
     if T === Float64
         _float64_grid_spans_match(edges, widths) || return _copy_vegas_grid(edges, widths)
     elseif T in (Float16, Float32)

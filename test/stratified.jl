@@ -633,3 +633,35 @@ using Test
         @test total_variance(stratified) < 0.5 * total_variance(classic)
     end
 end
+
+@testset "Stratified BigFloat mapping preserves the callback rounding mode" begin
+    lo = BigFloat(1; precision = 8)
+    hi = nextfloat(lo)
+    options = (; stratified = true, ncalls = 64, nbins = 1, maxiter = 1, alpha = 0.0)
+    previous = vegas(Returns(1), [lo], [hi]; options...)
+    original = nothing
+    for mode in (RoundNearest, RoundUp, RoundDown)
+        setrounding(BigFloat, mode) do
+            for args in (([lo], [hi]), (previous,))
+                points = BigFloat[]
+                modes = RoundingMode[]
+                function integrand(x)
+                    push!(points, only(x))
+                    push!(modes, rounding(BigFloat))
+                    return big(10001) << 7
+                end
+                seed!(54170)
+                result = vegas(integrand, args...; options...)
+                snapshot = (points, rand(UInt64, 4))
+                original = original === nothing ? snapshot : original
+                @test isequal(snapshot, original)
+                @test length(unique(points)) == 2
+                @test all(x -> precision(x) == 8, points)
+                @test modes == fill(mode, options.ncalls)
+                @test result.integral_estimate == 10001.0
+                @test iszero(result.standard_deviation)
+                @test rounding(BigFloat) === mode
+            end
+        end
+    end
+end

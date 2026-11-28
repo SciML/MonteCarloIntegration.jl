@@ -205,3 +205,145 @@ end
         end
     end
 end
+
+@testset "Exact callback values retain their digits on low-precision grids" begin
+    scale = big(2)^1100
+    cases = ((big(10001), 10001.0), (big(355) // big(113), 355 / 113), (3, 3.0), (3 // 2, 1.5))
+    for bits in (8, 16), mode in (RoundNearest, RoundUp, RoundDown), batch in (false, true, :matrix)
+        for (value, expected) in cases, exponent in (0, -1100)
+            exponent == -1100 && !(value isa Union{BigInt, Rational{BigInt}}) && continue
+            x = BigFloat(0; precision = bits)
+            y = BigFloat(ldexp(big(1.0), exponent); precision = bits)
+            weighted_value = exponent == 0 ? value : scale * value
+            setrounding(BigFloat, mode) do
+                seen = Ref(true)
+                function evaluate(point)
+                    seen[] &= rounding(BigFloat) === mode && precision(only(point)) == bits
+                    return weighted_value
+                end
+                integrand = batch === false ? evaluate : (points -> map(evaluate, batch === true ? points : eachcol(points)))
+                result = vegas(integrand, [x], [y]; batch, ncalls = 4, nbins = 1, maxiter = 1, alpha = 0.0)
+                @test seen[]
+                @test result.integral_estimate === expected
+                @test iszero(result.standard_deviation)
+            end
+        end
+    end
+end
+
+@testset "BigFloat sampling rounds coordinates independently of the callback" begin
+    a = BigFloat(1; precision = 53)
+    b = nextfloat(a)
+    width = b - a
+    ncalls = 8192
+    settings = (; ncalls, nbins = 1, maxiter = 1, alpha = 0.0)
+    baseline = vegas(Returns(0.0), [a], [b]; settings...)
+    seed!(1)
+    reference = MonteCarloIntegration.sample_from_adaptive_grid(baseline, ncalls)
+    @test 0.46 < count(==((b,)), reference) / ncalls < 0.54
+    for mode in (RoundNearest, RoundUp, RoundDown), batch in (false, true, :matrix)
+        setrounding(BigFloat, mode) do
+            seen = Ref(true)
+            function evaluate(point)
+                seen[] &= rounding(BigFloat) === mode && precision(only(point)) == 53
+                return (only(point) - a) / width
+            end
+            integrand = batch === false ? evaluate : (points -> map(evaluate, batch === true ? points : eachcol(points)))
+            seed!(1)
+            fresh = vegas(integrand, [a], [b]; batch, settings...)
+            seed!(1)
+            warm = vegas(integrand, baseline; batch, settings...)
+            @test seen[]
+            @test abs(fresh.integral_estimate - Float64(width) / 2) < 6fresh.standard_deviation
+            @test (fresh.integral_estimate, fresh.standard_deviation) == (warm.integral_estimate, warm.standard_deviation)
+            @test rounding(BigFloat) === mode
+            if batch === false
+                seed!(1)
+                @test MonteCarloIntegration.sample_from_adaptive_grid(warm, ncalls) == reference
+            end
+        end
+    end
+end
+
+@testset "Exact integrands with extreme Jacobian exponents" begin
+    setprecision(BigFloat, 64) do
+        options = (; ncalls = 4, nbins = 1, maxiter = 1, alpha = 0.0)
+        lo, unit = [BigFloat(0)], [BigFloat(1)]
+        microscopic = [ldexp(BigFloat(1), -10_000_000)]
+        for value in (big(0), big(1), big(-1), big(355) // big(113))
+            f = Returns(value)
+            vegas(f, lo, unit; options...)
+            result = vegas(f, lo, microscopic; options...)
+            ordinary_bytes = @allocated vegas(f, lo, unit; options...)
+            microscopic_bytes = @allocated vegas(f, lo, microscopic; options...)
+            @test microscopic_bytes <= 16ordinary_bytes + 16_384
+            @test result.integral_estimate === (signbit(value) ? -0.0 : 0.0)
+            @test iszero(result.standard_deviation)
+        end
+
+        half_smallest = [ldexp(BigFloat(1), -1075)]
+        q = nextfloat(0.0)
+        for (value, expected) in ((big(1), 0.0), (big(-1), -0.0), (big(3), 2q), (big(10001) // big(10000), q))
+            result = vegas(Returns(value), lo, half_smallest; options...)
+            @test result.integral_estimate === expected
+        end
+
+        large = [ldexp(BigFloat(1), 1023)]
+        largest_finite = (big(2)^53 - 1) // big(2)^52
+        overflow_threshold = (big(2)^54 - 1) // big(2)^53
+        @test vegas(Returns(largest_finite), lo, large; options...).integral_estimate === floatmax(Float64)
+        @test_throws DomainError vegas(Returns(overflow_threshold), lo, large; options...)
+        @test_throws DomainError vegas(Returns(big(1)), lo, [ldexp(BigFloat(1), 10_000_000)]; options...)
+    end
+end
+
+@testset "Direct sampling promotes mixed grid matrices" begin
+    lo, hi = 1.0, nextfloat(1.0)
+    edges = reshape([lo, hi], :, 1)
+    widths = reshape([BigFloat(hi - lo; precision = 53)], :, 1)
+    original = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+    sampler = MonteCarloIntegration.sample_from_adaptive_grid
+    for mode in (RoundNearest, RoundUp, RoundDown)
+        setrounding(BigFloat, mode) do
+            warmed = vegas(Returns(0.0), original; ncalls = 4, maxiter = 1, alpha = 0.0)
+            seed!(1)
+            actual = sampler(original, 256)
+            seed!(1)
+            expected = sampler(warmed, 256)
+            @test actual == expected
+            @test 0 < count(point -> only(point) == hi, actual) < length(actual)
+            @test all(point -> precision(only(point)) == 53, actual)
+            @test rounding(BigFloat) === mode
+        end
+    end
+    @test original.adaptive_grid === edges && edges == reshape([lo, hi], :, 1)
+    @test original.grid_spacing === widths && only(widths) == hi - lo
+end
+
+@testset "Direct sampling accepts rounded widths in mixed grids" begin
+    setprecision(BigFloat, 128) do
+        large_edges = [BigFloat(0), BigFloat("0.1"), BigFloat(1)]
+        small_edges = [0.0, 0.1, 1.0]
+        sampler = MonteCarloIntegration.sample_from_adaptive_grid
+        for (points, spacing) in ((large_edges, [0.1, 0.9]), (small_edges, diff(large_edges))), reversed in (false, true)
+            edges = reshape(reversed ? reverse(points) : points, :, 1)
+            widths = reshape(reversed ? -reverse(spacing) : spacing, :, 1)
+            saved_edges, saved_widths = copy(edges), copy(widths)
+            physical_edges = BigFloat.(edges)
+            normalized = VEGASResult(0.0, 0.0, 0.0, physical_edges, diff(physical_edges; dims = 1))
+            original = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+            seed!(1)
+            expected = sampler(normalized, 256)
+            for mode in (RoundNearest, RoundUp, RoundDown)
+                setrounding(BigFloat, mode) do
+                    seed!(1)
+                    actual = sampler(original, 256)
+                    @test actual == expected
+                    @test all(point -> 0 <= only(point) <= 1 && precision(only(point)) == 128, actual)
+                    @test rounding(BigFloat) === mode
+                end
+            end
+            @test edges == saved_edges && widths == saved_widths
+        end
+    end
+end

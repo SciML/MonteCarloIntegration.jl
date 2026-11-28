@@ -144,6 +144,10 @@ function _grid_bin_width(edges::AbstractArray{T}, widths, bin, tail...) where {T
     return Float64(edges[bin + 1, tail...]) - Float64(edges[bin, tail...])
 end
 
+function _grid_bin_width(edges::AbstractArray{T}, widths::AbstractArray{BigFloat}, bin, tail...) where {T <: _LowPrecisionGridFloat}
+    return widths[bin, tail...]
+end
+
 function _bound_grid_point(point, grid, dim)
     return clamp(point, minmax(grid[1, dim], grid[end, dim])...)
 end
@@ -228,18 +232,27 @@ function _set_uniform_grid_axis!(edges, widths, a::BigFloat, b::BigFloat)
     return nothing
 end
 
-_with_vegas_mapping(f, edges, widths) = f(widths, nothing)
+_bigfloat_mapping_widths(edges) = diff(BigFloat.(edges); dims = 1)
+_bigfloat_mapping_widths(edges::AbstractArray{BigFloat}) = diff(edges; dims = 1)
 
-function _with_vegas_mapping(f, edges::AbstractArray{BigFloat}, widths)
-    bits = precision(BigFloat)
-    bits >= 64 && return f(widths, nothing)
-    return _with_vegas_precision(64) do
-        f(diff(edges; dims = 1), bits)
+_with_vegas_mapping(f, edges, widths) = _with_vegas_mapping(f, edges, widths, _grid_coordinate_type(edges, widths))
+_with_vegas_mapping(f, edges, widths, ::Type) = f(widths, nothing)
+
+function _with_vegas_mapping(f, edges, widths, ::Type{BigFloat})
+    return _with_grid_rounding(BigFloat) do
+        bits = precision(BigFloat)
+        if bits >= 64
+            working_widths = eltype(edges) === eltype(widths) === BigFloat ? widths : _bigfloat_mapping_widths(edges)
+            return f(working_widths, nothing)
+        end
+        _with_vegas_precision(64) do
+            f(_bigfloat_mapping_widths(edges), bits)
+        end
     end
 end
 
 _round_vegas_coordinate(point, ::Nothing) = point
-_round_vegas_coordinate(point::BigFloat, bits::Int) = BigFloat(point; precision = bits)
+_round_vegas_coordinate(point, bits::Int) = BigFloat(point; precision = bits)
 
 function _rebin!(edges, widths, mass, proposed)
     return _with_grid_rounding(eltype(edges)) do
