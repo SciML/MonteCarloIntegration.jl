@@ -108,7 +108,8 @@ function _iteration_estimate(values::Vector{_IterationMean})
                 (!iszero(v.low) && abs(tail(v)) < floatmin(Float64)), values
         )
     )
-    if midpoint || cancellation
+    # Round subnormal results directly in units of the smallest subnormal.
+    if abs(mean) <= floatmin(Float64) || midpoint || cancellation
         total = sum(v -> _binary64_units(v.high) + _binary64_units(v.low), values; init = big(0))
         mean = _round_binary64_units(total, n)
     end

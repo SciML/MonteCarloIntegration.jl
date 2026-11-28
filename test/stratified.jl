@@ -573,7 +573,6 @@ rounded_sqrt(x) = setprecision(() -> Float64(sqrt(BigFloat(x)), RoundNearest), B
 
     @testset "Stopping at small ambient BigFloat precision" begin
         q = nextfloat(0.0)
-        # The Float64 standard error rounds above the exact one for 1.24 and below it for 1.25.
         for z in (1.24, 1.25)
             samples = [-q, z, z, z, z, z]
             mean = sum(Rational{BigInt}, samples) / 6

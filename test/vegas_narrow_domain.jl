@@ -204,3 +204,48 @@ end
         @test all(point -> a <= only(point) <= b, points)
     end
 end
+
+@testset "Native Float64 subnormal grids round each edge independently" begin
+    q = nextfloat(0.0)
+    options = (; nbins = 1000, ncalls = 32, maxiter = 1, alpha = 0.0)
+    for (lower, upper) in ((0, 202402), (0, 2600), (2^52 - 1278, 2^52 + 1322)),
+            bounds in ((lower, upper), (upper, lower), (-upper, -lower), (-lower, -upper))
+        @testset "$(bounds[1]) → $(bounds[2]) subnormal units" begin
+            a, b = bounds
+            units = [round(Int, a + (big(i) * (b - a)) // options.nbins) for i in 0:options.nbins]
+            spacing = diff(units)
+            bins = floor.(Int, options.nbins .* rand(Random.Xoshiro(42), options.ncalls)) .+ 1
+            sample_units = options.nbins .* BigInt.(spacing[bins])
+            sampled = sum(sample_units) // options.ncalls
+            expected = round(Int, sampled) * q
+            variance = sum(abs2, sample_units .- sampled) / (options.ncalls * (options.ncalls - 1))
+            lower_error = isqrt(div(numerator(variance), denominator(variance)))
+            midpoint² = ((2lower_error + 1) // 2)^2
+            round_up = variance > midpoint² || (variance == midpoint² && isodd(lower_error))
+            expected_error = Float64(lower_error + round_up) * q
+            Random.seed!(42)
+            result = vegas(Returns(1), [a * q], [b * q]; options...)
+            @test result.adaptive_grid isa Matrix{Float64}
+            @test vec(result.adaptive_grid) == units .* q
+            @test vec(result.grid_spacing) == spacing .* q
+            @test result.integral_estimate === expected
+            @test result.standard_deviation === expected_error
+            Random.seed!(42)
+            reused = vegas(Returns(1), result; options...)
+            @test reused.integral_estimate === expected
+            @test reused.standard_deviation === expected_error
+            @test reused.adaptive_grid == result.adaptive_grid
+            points = MonteCarloIntegration.sample_from_adaptive_grid(reused, 32)
+            @test points isa Vector{Tuple{Float64}}
+            @test all(x -> min(a, b) * q <= only(x) <= max(a, b) * q, points)
+        end
+    end
+    calls = Ref(0)
+    observe(_) = (calls[] += 1; 1.0)
+    Random.seed!(42)
+    next_draw = rand(UInt64)
+    Random.seed!(42)
+    @test_throws ArgumentError vegas(observe, [0.0], [999q]; options...)
+    @test calls[] == 0
+    @test rand(UInt64) == next_draw
+end
