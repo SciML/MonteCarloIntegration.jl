@@ -25,38 +25,6 @@ function _evaluate!(weighted_values, func, xmat, batch)
     return weighted_values
 end
 
-function _vegas_sample_moments(values, scale)
-    n = length(values)
-    if iszero(scale) || !isfinite(scale) || 1.0e-100 <= scale <= 1.0e100
-        estimate = sum(values) / n
-        variance = (sum(abs2, values) / n - estimate^2) / (n - 1) + eps()
-        (variance > 0.0 || !isfinite(variance)) && return estimate, variance, false
-    end
-    center = sum(v -> v / scale, values) / n
-    residual = sum(v -> abs2(v / scale - center), values)
-    stderr = scale * sqrt(residual / n / (n - 1))
-    return scale * center, hypot(stderr, sqrt(eps())), true
-end
-
-function _combine_scaled_samples(estimates, errors)
-    smallest = minimum(errors)
-    weight_sum = sum(e -> abs2(smallest / e), errors)
-    center = sum(eachindex(errors)) do i
-        ratio = smallest / errors[i]
-        return (estimates[i] * ratio) * (ratio / weight_sum)
-    end
-    return clamp(center, extrema(estimates)...), smallest / sqrt(weight_sum)
-end
-
-function _scaled_chi_squared(estimates, errors, center)
-    length(errors) <= 1 && return 0.0
-    scatter = sum(eachindex(errors)) do i
-        delta = estimates[i] - center
-        return abs2(isfinite(delta) ? delta / errors[i] : estimates[i] / errors[i] - center / errors[i])
-    end
-    return scatter / (length(errors) - 1)
-end
-
 function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
     x = zeros(nbins + 1, length(lb))
     delx = zeros(nbins, length(lb))

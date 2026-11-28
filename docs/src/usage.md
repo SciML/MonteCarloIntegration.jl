@@ -25,3 +25,16 @@ moment(x) = sum(abs2, x) * exp(-sum(abs2, x))
 reused = vegas(moment, trained)
 reused.integral_estimate, reused.standard_deviation
 ```
+
+## Interpreting the uncertainty
+
+`result.standard_deviation` estimates the standard error of the integral. For a
+single iteration with independent Jacobian-weighted samples, it is their sample
+standard deviation divided by the square root of the sample count. VEGAS uses
+inverse-variance weights when all iteration variances are positive. If any iteration
+has zero variance, it keeps every estimate with equal weight and also accounts
+for the scatter between iterations. Early stopping requires a positive standard
+error below both tolerances. While the error stays zero, VEGAS continues drawing
+samples up to the iteration limit. A rare peak can escape every sample. Increase
+the budget and compare independent runs when the integral is dominated by a small
+region.

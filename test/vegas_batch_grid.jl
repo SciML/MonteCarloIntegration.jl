@@ -205,18 +205,81 @@ end
 @testset "VEGAS warm starts at extreme integrand scales" begin
     Random.seed!(1)
     trained = vegas(Returns(1.0), [0.0], [1.0]; nbins = 4, ncalls = 32, maxiter = 1, alpha = 0.0)
-    for scale in (1.0e-200, 1.0e200)
+    for scale in (1.0e-315, 1.0e-200, 1.0e-50, 1.0, 1.0e50, 1.0e200, 1.0e305)
         @testset "Scale: $scale" begin
             Random.seed!(1)
-            result = vegas(Returns(scale), trained; ncalls = 128, maxiter = 2, rtol = 0.0, atol = 0.0)
-            # With adaptation, even a constant integrand has random Jacobian weights.
-            @test result.integral_estimate / scale ≈ 1.0 rtol = 0.02
-            @test isfinite(result.standard_deviation)
-            @test isfinite(result.chi_squared_average)
-            @test all(isfinite, result.adaptive_grid)
-            @test all(isfinite, result.grid_spacing)
+            calls = Ref(0)
+            result = vegas(trained; ncalls = 128, maxiter = 2, rtol = 1.0e-3, atol = Inf) do _
+                calls[] += 1
+                return scale
+            end
+            @test calls[] == 256
+            @test result.integral_estimate == scale
+            @test result.standard_deviation == 0.0
+            @test result.chi_squared_average == 0.0
+            @test result.adaptive_grid == trained.adaptive_grid
+            @test result.grid_spacing == trained.grid_spacing
         end
     end
+end
+
+@testset "VEGAS uncertainty and scale covariance" begin
+    peak(x) = exp(-200 * (x[1] - 0.5)^2)
+    signed(x) = sin(2π * x[1]) + 0.25
+    options = (; nbins = 50, ncalls = 500, maxiter = 10, rtol = 0.0, atol = 0.0)
+    for (f, integral) in ((peak, sqrt(π / 200)), (signed, 0.25))
+        Random.seed!(42)
+        unit = vegas(f, [0.0], [1.0]; options...)
+        @test abs(unit.integral_estimate - integral) <= 4unit.standard_deviation
+        @test unit.standard_deviation > 0.0
+        for scale in (1.0e-200, 1.0e-120, 1.0e-50, 1.0e50, 1.0e200)
+            Random.seed!(42)
+            result = vegas(x -> scale * f(x), [0.0], [1.0]; options...)
+            @test result.integral_estimate / scale ≈ unit.integral_estimate
+            @test result.standard_deviation / scale ≈ unit.standard_deviation
+            @test result.chi_squared_average ≈ unit.chi_squared_average
+        end
+    end
+end
+
+@testset "VEGAS inverse-variance iteration estimates" begin
+    for scale in (1.0e-200, 1.0, 1.0e200)
+        batches = (scale .* [-1.0, 0.0, 1.0, 2.0], scale .* [-1.0, 2.0, 5.0, 8.0])
+        calls = Ref(0)
+        result = vegas(
+            _ -> batches[calls[] += 1], [0.0], [1.0];
+            nbins = 2, ncalls = 4, maxiter = 2, alpha = 0.0, batch = :matrix,
+            rtol = 0.0, atol = 0.0,
+        )
+        @test result.integral_estimate / scale ≈ 0.8
+        @test result.standard_deviation / scale ≈ sqrt(3 / 8)
+        @test result.chi_squared_average ≈ 2.16
+    end
+end
+
+@testset "VEGAS zero-variance batches retain information" begin
+    options = (; nbins = 2, ncalls = 2, alpha = 0.0, batch = :matrix)
+    for a in (1.0e-200, 1.0, 1.0e200)
+        b = nextfloat(a, 4)
+        batches = ([a, a], [b, b])
+        calls = Ref(0)
+        result = vegas(_ -> batches[calls[] += 1], [0.0], [1.0]; options..., maxiter = 2)
+        @test calls[] == 2
+        @test result.integral_estimate == a + (b - a) / 2
+        @test result.standard_deviation == (b - a) / 2
+        @test result.chi_squared_average == 0.0
+    end
+
+    batches = ([1.0, 1.0], [0.0, 0.0], [0.0, 1.0])
+    calls = Ref(0)
+    result = vegas(
+        _ -> batches[calls[] += 1], [0.0], [1.0];
+        options..., maxiter = 3, atol = 1.0e-10, rtol = 1.0e-10,
+    )
+    @test calls[] == 3
+    @test result.integral_estimate == 0.5
+    @test result.standard_deviation ≈ sqrt(1 / 12)
+    @test result.chi_squared_average == 0.0
 end
 
 @testset "VEGAS warm starts with low-precision bounds" begin

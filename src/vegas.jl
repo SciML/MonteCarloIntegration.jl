@@ -11,6 +11,8 @@ struct VEGASResult{T1,T2,T3,T4,T5}
 	adaptive_grid::T4
 	grid_spacing::T5
 end
+
+include("estimates.jl")
 """
     vegas(f, lb = [0.0, 0.0], ub = [1.0, 1.0]; kwargs...)
 
@@ -55,10 +57,15 @@ Output:
 ------
 A VEGASResult object with the following fields:
 - Estimate for the integral 
-- Standard deviation
-- χ^2 / (numiter - 1): should be less than 1 
-otherwise integral estimate should not be trusted. 
+- Estimated standard error of the integral
+- Reduced chi-squared among iterations with positive standard error
 - final adapted map
+
+Early stopping requires a positive standard error below both `atol` and
+`rtol * abs(integral_estimate)`. VEGAS keeps sampling while the error stays zero
+and the budget allows. It weights iteration estimates by inverse variance
+when all iteration variances are positive. With any zero-variance iteration,
+the estimates receive equal weight and the error accounts for their scatter.
 
 References:
 -----------
@@ -83,17 +90,14 @@ function _vegas(
 
     ndim = length(lb)
     x, delx = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    integrals = Float64[]
-    sigma_squares = Float64[]
-    scaled_errors = Float64[]
-    Itot = sd = 0.0
-    iter = 1
+    estimates, errors = Float64[], Float64[]
+    mean = error = chi_squared = 0.0
 
     ymat = zeros(ndim, ncalls)
     xmat = similar(ymat)
     imat = Matrix{Int}(undef, ndim, ncalls)
     Jsf = Vector{Float64}(undef, ncalls)
-    while iter <= maxiter
+    for iter in 1:maxiter
         rand!(ymat)
         for dim in 1:ndim
             lo, hi = minmax(x[1, dim], x[end, dim])
@@ -109,46 +113,26 @@ function _vegas(
         end
         _evaluate!(Jsf, func, xmat, batch)
 
-        scale = maximum(abs, Jsf)
-        integral_mc, uncertainty, scaled = _vegas_sample_moments(Jsf, scale)
-        if scaled && isempty(scaled_errors)
-            append!(scaled_errors, sqrt.(sigma_squares))
-        end
-        push!(integrals, integral_mc)
-        if scaled || !isempty(scaled_errors)
-            push!(scaled_errors, scaled ? uncertainty : sqrt(uncertainty))
-        else
-            push!(sigma_squares, uncertainty)
-        end
+        estimate, stderr = _iteration_estimate(Jsf)
+        push!(estimates, estimate)
+        push!(errors, stderr)
 
-        if isfinite(scale) && !iszero(scale) && !iszero(alpha) && nbins > 1
-            d = calculate_d(Jsf, imat, nbins, alpha, scale)
+        if !iszero(stderr) && !iszero(alpha) && nbins > 1
+            d = calculate_d(Jsf, imat, nbins, alpha)
             xnew, delxnew = update_grid(x, delx, d)
             x .= xnew
             delx .= delxnew
         end
 
-        if isempty(scaled_errors)
-            Itot = sum(integrals ./ sigma_squares) / sum(1 ./ sigma_squares)
-            sd = 1 / sqrt(sum(1 ./ sigma_squares))
-        else
-            Itot, sd = _combine_scaled_samples(integrals, scaled_errors)
-        end
-
-        if debug
-            println("Iteration $iter, abs(sd/Itot) = $(abs(sd / Itot))")
-        end
-        if abs(sd / Itot) < rtol && abs(sd) < atol
+        mean, error, chi_squared = _combine_estimates(estimates, errors)
+        debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
+        if 0.0 < error < atol && error < rtol * abs(mean)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
-        iter += 1
     end
 
-    chi_squared = isempty(scaled_errors) ?
-        sum(((integrals .- Itot) .^ 2) ./ sigma_squares) / (iter - 1) :
-        _scaled_chi_squared(integrals, scaled_errors, Itot)
-    return VEGASResult(Itot, sd, chi_squared, x, delx)
+    return VEGASResult(mean, error, chi_squared, x, delx)
 end
 
 _bounded_grid_coordinate(edge, width, fraction, lo, hi) = clamp(edge + width * fraction, lo, hi)
