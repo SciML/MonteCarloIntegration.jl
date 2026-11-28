@@ -385,6 +385,37 @@ using Test
             @test result.standard_deviation == 0.0
         end
 
+        big_term = 2.0^100
+        small_term = 2.0^-100
+        fifths = (big_term, 1.0, small_term, -big_term, -1.0)
+        for values in (fifths, reverse(fifths), map(-, fifths), (big_term, 1.0, 2.0^-55, -big_term, -prevfloat(1.0)))
+            exact = Float64(sum(Rational{BigInt}, values) / length(values))
+            scalar = x -> values[floor(Int, 5 * x[1]) + 1]
+            matrix = points -> map(scalar, eachcol(points))
+            for calls in (20, 21), (integrand, batch) in ((scalar, false), (matrix, :matrix))
+                seed!(1)
+                result = vegas(integrand, [0.0], [1.0]; stratified = true, ncalls = calls, nbins = 1, maxiter = 1, batch)
+                @test result.integral_estimate == exact
+                @test result.standard_deviation == 0.0
+            end
+        end
+
+        samples = [big_term, 1.0, small_term, -big_term, -1.0, 0.0, 0.0, 0.0]
+        expected = Float64(sum(Rational{BigInt}, samples) / length(samples))
+        for values in (samples, circshift(samples, 4))
+            call = Ref(0)
+            scalar = _ -> values[call[] += 1]
+            matrix = points -> map(scalar, eachcol(points))
+            for (integrand, batch) in ((scalar, false), (matrix, :matrix))
+                call[] = 0
+                seed!(1)
+                result = vegas(integrand, [0.0], [1.0]; stratified = true, ncalls = 8, nbins = 1, maxiter = 1, batch)
+                @test call[] == length(values)
+                @test result.integral_estimate == expected
+                @test result.standard_deviation ≈ big_term / sqrt(24)
+            end
+        end
+
         large = floatmax(Float64)
         average(values) = MonteCarloIntegration._rounded_mean(first(MonteCarloIntegration._stratum_average(values)))
         @test average([large, large]) == large

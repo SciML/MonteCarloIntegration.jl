@@ -110,7 +110,7 @@ function _stratified_estimate!(strata, values)
     end
 
     nstrata = length(strata.counts)
-    mean, tiny_tail = _stratum_average(strata.means)
+    mean, exact_average = _stratum_average(strata.means, normal_scale, length(values))
     if iszero(normal_scale)
         scale, scaled_variance = narrow_scale, narrow_variance
     else
@@ -119,7 +119,7 @@ function _stratified_estimate!(strata, values)
     end
     error = _scaled_error(scale.mantissa * (sqrt(scaled_variance) / nstrata), scale.exponent)
     exact_variance = _needs_extended_error(error)
-    if exact_variance || exact_mean || tiny_tail || _needs_exact_stratum_average(mean, strata.means)
+    if exact_variance || exact_mean || exact_average || _needs_exact_stratum_average(mean, strata.means)
         unrounded, variance = _exact_stratum_moments(strata.counts, values, exact_variance)
         return _IterationMean(_rounded_mean(unrounded), 0.0), error, unrounded, variance
     end
@@ -173,29 +173,34 @@ function _exact_stratum_mean(counts, values)
 end
 
 function _stratum_total(means, scale)
-    total = correction = 0.0
+    total = correction = magnitude = 0.0
     for mean in means
-        total, residual = _two_sum(total, _rounded_mean(mean) / scale)
+        high = _rounded_mean(mean)
+        magnitude = max(magnitude, abs(high))
+        total, residual = _two_sum(total, high / scale)
         correction += residual + _mean_low(mean) / scale
     end
-    return total, correction
+    return total, correction, magnitude
 end
 
-function _stratum_average(means)
+function _stratum_average(means, max_stderr = 0.0, nsamples = 0)
     n = length(means)
     scale = 1.0
-    total, correction = _stratum_total(means, scale)
+    total, correction, magnitude = _stratum_total(means, scale)
     if !isfinite(total + correction)
         scale = exp2(ceil(log2(n)) + 1)
-        total, correction = _stratum_total(means, scale)
+        total, correction, magnitude = _stratum_total(means, scale)
     end
     average = total / n
     residual = fma(-average, Float64(n), total) + correction
     adjustment = residual / n
     high, low = _two_sum(average, adjustment)
-    tail = low * scale
+    rounded = high * scale
+    # Each sample can differ from its cell mean by at most (count - 1) standard errors.
+    cutoff = max((8eps(Float64) * n) * magnitude, (8eps(Float64) * nsamples) * max_stderr)
+    cancellation = 0 < cutoff && abs(rounded) <= cutoff
     tiny_tail = !iszero(residual) && abs(adjustment * scale) < floatmin(Float64)
-    return _IterationMean(high * scale, tail), tiny_tail
+    return _IterationMean(rounded, low * scale), cancellation || tiny_tail
 end
 
 function _stratified_training_weights!(strata)
