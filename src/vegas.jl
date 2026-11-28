@@ -247,13 +247,14 @@ end
 
 Draw `ncalls` independent points inside the adaptive grid and return a vector
 of coordinate tuples. Each dimension uses equal bin probabilities. Samples
-use the stored coordinate type and BigFloat precision. Use `Random.seed!` to
-seed the default RNG. The sample count must be nonnegative.
+use the stored coordinate type and BigFloat precision. For Float64 grids,
+each draw checks the stored width of the selected cell against its edges.
+Use `Random.seed!` to seed the default RNG. The sample count must be nonnegative.
 """
 function sample_from_adaptive_grid(res, ncalls::Integer)
     ncalls >= 0 || throw(ArgumentError("ncalls must be nonnegative"))
-    edges, widths = _sampling_grid(res)
-    return _with_vegas_precision(_stored_grid_precision(edges, widths)) do
+    return _with_vegas_precision(_stored_grid_precision(res.adaptive_grid, res.grid_spacing)) do
+        edges, widths = _sampling_grid(res)
         _with_vegas_mapping(edges, widths) do working_widths, bits
             _draw_grid_samples(ncalls, edges, working_widths, _grid_coordinate_type(edges, widths), bits)
         end
@@ -266,8 +267,23 @@ function _draw_grid_samples(ncalls, edges, widths, ::Type{T}, bits) where {T}
     return _sample_grid!(samples, edges, widths, T, bits)
 end
 
+_sampling_cell(edges, widths, bin, dim, ::Nothing) = (edges[bin, dim], _grid_bin_width(edges, widths, bin, dim))
+
+function _sampling_cell(edges, widths, bin, dim, canonical)
+    if isnothing(canonical[])
+        lower = edges[bin, dim]
+        span = edges[bin + 1, dim] - lower
+        isfinite(span) && span == widths[bin, dim] && return lower, span
+        canonical[] = _copy_vegas_grid(edges, widths)
+    end
+    grid, spacing = canonical[]::Tuple{Matrix{Float64}, Matrix{Float64}}
+    return grid[bin, dim], spacing[bin, dim]
+end
+
 function _sample_grid!(samples::Vector{NTuple{N, T}}, edges, widths, ::Type{T}, bits) where {N, T}
     nbins = size(widths, 1)
+    canonical = T === Float64 && eltype(edges) === Float64 ?
+        Ref{Union{Nothing, Tuple{Matrix{Float64}, Matrix{Float64}}}}(nothing) : nothing
     for i in eachindex(samples)
         samples[i] = ntuple(Val(N)) do dim
             if T === BigFloat
@@ -279,9 +295,7 @@ function _sample_grid!(samples::Vector{NTuple{N, T}}, edges, widths, ::Type{T}, 
                 bin = floor(Int, scaled) + 1
                 fraction = scaled + 1 - bin
             end
-            lower = edges[bin, dim]
-            width = T === Float64 && eltype(edges) === Float64 ?
-                edges[bin + 1, dim] - lower : _grid_bin_width(edges, widths, bin, dim)
+            lower, width = _sampling_cell(edges, widths, bin, dim, canonical)
             point = lower + width * fraction
             return convert(T, _round_vegas_coordinate(_bound_grid_point(point, edges, dim), bits))
         end

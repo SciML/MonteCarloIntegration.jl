@@ -227,6 +227,40 @@ function Base.getindex(matrix::ReadCountingSamplingMatrix, row::Int, col::Int)
     return matrix.values[row, col]
 end
 
+@testset "Direct sampling validates the widths of drawn cells" begin
+    for direction in (-1, 1)
+        edges = reshape(direction .* [0.0, 1.0, 3.0], :, 1)
+        for invalid in ([1.0, 8.0], [NaN, 2.0], [1.0, Inf], [-1.0, 2.0])
+            widths = reshape(direction .* invalid, :, 1)
+            grid = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+            seed!(100)
+            @test_throws ArgumentError sample_from_adaptive_grid(grid, 8)
+        end
+        narrow = Float16.(edges)
+        mixed = VEGASResult(0.0, 0.0, 0.0, narrow, reshape(direction .* BigFloat[1, 8], :, 1))
+        seed!(100)
+        @test_throws ArgumentError sample_from_adaptive_grid(mixed, 8)
+
+        nbins = 10
+        step = direction / nbins
+        nominal = fill(step, nbins, 1)
+        points = reshape([i * step for i in 0:nbins], :, 1)
+        physical = diff(points; dims = 1)
+        @test any(physical .!= nominal)
+        original = VEGASResult(0.0, 0.0, 0.0, points, nominal)
+        seed!(85217)
+        expected = map(1:32) do _
+            scaled = rand() * nbins
+            bin = floor(Int, scaled) + 1
+            (points[bin] + physical[bin] * (scaled + 1 - bin),)
+        end
+        following = rand(UInt64)
+        seed!(85217)
+        @test sample_from_adaptive_grid(original, 32) == expected
+        @test rand(UInt64) == following
+    end
+end
+
 @testset "Sparse Float64 sampling reads only the drawn bins" begin
     for (lo, hi) in ((0.0, 1.0), (1.0e9, 1.001e9))
         raw_edges = reshape(collect(range(lo, hi; length = 1_000_001)), :, 1)
@@ -239,7 +273,8 @@ end
         actual = sample_from_adaptive_grid(grid, 4)
         next_draw = rand(UInt64)
         @test edges.reads <= 4 * length(actual) + 4
-        @test widths.reads <= 2
+        # In addition to the axis preflight, each draw compares one stored width with its edges.
+        @test widths.reads <= length(actual) + 2
 
         seed!(638191)
         expected = map(1:4) do _
@@ -301,7 +336,7 @@ end
         points = sample_from_adaptive_grid(grid, 4)
         next_draw = rand(UInt64)
         @test edges.reads <= 20
-        @test widths.reads <= 2
+        @test widths.reads <= length(points) + 2
         seed!(56602)
         expected = map(1:4) do _
             scaled = nbins * rand()

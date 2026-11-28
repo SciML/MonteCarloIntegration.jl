@@ -178,7 +178,11 @@ function _sampling_grid(result)
     edges, widths = result.adaptive_grid, result.grid_spacing
     nbins, ndim = _vegas_grid_size(edges, widths)
     T = eltype(edges)
-    T !== eltype(widths) && _grid_coordinate_type(edges, widths) === BigFloat && return edges, widths
+    if T !== eltype(widths) && _grid_coordinate_type(edges, widths) === BigFloat
+        return _with_grid_rounding(BigFloat) do
+            _copy_vegas_grid(edges, widths)
+        end
+    end
     if T === Float64
         for dim in 1:ndim
             a, b = edges[1, dim], edges[end, dim]
