@@ -33,14 +33,16 @@ function _exact_grid_bits(lb, ub, nbins)
     bits = 128
     bins_bits = ndigits(nbins; base = 2)
     for (lo, hi) in zip(lb, ub)
-        a, b = _exact_bound(lo), _exact_bound(hi)
-        for x in (a, b)
-            numerator_bits = ndigits(abs(numerator(x)); base = 2)
-            !iszero(x) && ispow2(denominator(x)) && (bits = max(bits, numerator_bits - trailing_zeros(abs(numerator(x)))))
+        for bound in (lo, hi)
+            if !iszero(bound) && _is_binary_exact_bound(bound)
+                num = abs(numerator(_exact_bound(bound)))
+                bits = max(bits, ndigits(num; base = 2) - trailing_zeros(num))
+            end
         end
-        if a != b
-            scale = _rational_exponent(max(abs(a), abs(b)))
-            span = _rational_exponent(abs(b - a))
+        if lo != hi
+            a, b = _separated_bound_ranges(lo, hi, bits)
+            scale = _rational_exponent(max(abs(a[1]), abs(a[2]), abs(b[1]), abs(b[2])))
+            span = _rational_exponent(max(b[1] - a[2], a[1] - b[2]))
             bits = max(bits, 64 + bins_bits + scale - span)
         end
     end
@@ -48,11 +50,36 @@ function _exact_grid_bits(lb, ub, nbins)
 end
 
 _exact_bound(bound::Union{AbstractFloat, Integer, Rational}) = Rational{BigInt}(bound)
+_exact_bound(bound::BigFloat) = _with_vegas_precision(() -> Rational{BigInt}(bound), precision(bound))
 
 function _exact_bound(bound)
     return _with_vegas_precision(256) do
         Rational{BigInt}(BigFloat(bound))
     end
+end
+
+function _irrational_range(bound, bits)
+    return _with_vegas_precision(bits) do
+        lower = setrounding(() -> BigFloat(bound), BigFloat, RoundDown)
+        upper = setrounding(() -> BigFloat(bound), BigFloat, RoundUp)
+        lower, upper
+    end
+end
+
+function _bound_range(bound, _)
+    value = _exact_bound(bound)
+    return value, value
+end
+_bound_range(bound::Irrational, bits) = map(_exact_bound, _irrational_range(bound, bits))
+
+function _separated_bound_ranges(lo, hi, bits)
+    while true
+        a, b = _bound_range(lo, bits), _bound_range(hi, bits)
+        (a[2] < b[1] || b[2] < a[1]) && return a, b
+        a[1] == a[2] == b[1] == b[2] && throw(ArgumentError("the supplied endpoints cannot be distinguished at their precision"))
+        bits *= 2
+    end
+    return
 end
 
 _rational_exponent(x) = ndigits(numerator(x); base = 2) - ndigits(denominator(x); base = 2)
@@ -80,7 +107,16 @@ function _grid_bound(::Type{BigFloat}, bound::Rational)
 end
 
 _grid_bound(T::Type, bound, rounding) = _grid_bound(T, bound)
-_grid_bound(T::Type, bound::Irrational, rounding) = T(bound, rounding)
+function _grid_bound(T::Type, bound::Irrational, rounding)
+    bits = max(64, precision(T) + 16)
+    while true
+        a, b = _irrational_range(bound, bits)
+        lower, upper = T(a, rounding), T(b, rounding)
+        lower == upper && return lower
+        bits *= 2
+    end
+    return
+end
 
 function _grid_bound(T::Type, bound::Rational, rounding)
     value = _grid_bound(T, bound)
@@ -93,12 +129,15 @@ function _grid_bound(T::Type, bound::Rational, rounding)
 end
 
 function _grid_bounds(T, lo, hi)
-    if lo < hi
-        return _grid_bound(T, lo, RoundUp), _grid_bound(T, hi, RoundDown)
-    elseif hi < lo
-        return _grid_bound(T, lo, RoundDown), _grid_bound(T, hi, RoundUp)
+    lo == hi && return _grid_bound(T, lo), _grid_bound(T, hi)
+    if lo isa Irrational || hi isa Irrational
+        a, b = _separated_bound_ranges(lo, hi, max(64, precision(T)))
+        increasing = a[2] < b[1]
+    else
+        increasing = lo < hi
     end
-    return _grid_bound(T, lo), _grid_bound(T, hi)
+    return increasing ? (_grid_bound(T, lo, RoundUp), _grid_bound(T, hi, RoundDown)) :
+        (_grid_bound(T, lo, RoundDown), _grid_bound(T, hi, RoundUp))
 end
 
 _is_binary_exact_bound(bound::Union{Integer, AbstractFloat}) = true
@@ -112,12 +151,25 @@ function _grid_bounds_fit(lo, hi, a, b)
     a == lo && b == hi && return true
     _binary_bound_rounded(lo, a) && return false
     _binary_bound_rounded(hi, b) && return false
-    (lo < hi) == (a < b) && (hi < lo) == (b < a) || return false
-    lo == hi && return true
-    expected = _exact_bound(hi) - _exact_bound(lo)
-    actual = Rational{BigInt}(b) - Rational{BigInt}(a)
+    lo == hi && return a == b
+    a == b && return false
+    actual = _exact_bound(b) - _exact_bound(a)
     scale = big(1) << max(0, min(precision(a), precision(b), 53) - 2)
-    return abs(expected - actual) * scale <= max(abs(expected), abs(actual))
+    if !(lo isa Irrational || hi isa Irrational)
+        expected = _exact_bound(hi) - _exact_bound(lo)
+        return sign(expected) == sign(actual) && abs(expected - actual) * scale <= max(abs(expected), abs(actual))
+    end
+    bits = max(64, precision(a), precision(b)) + 32
+    magnitude = abs(actual)
+    while true
+        x, y = _bound_range(lo, bits), _bound_range(hi, bits)
+        small, large = actual > 0 ? (y[1] - x[2], y[2] - x[1]) : (x[1] - y[2], x[2] - y[1])
+        # The permitted relative error bounds the exact span on both sides of the stored span.
+        small > 0 && small * scale >= magnitude * (scale - 1) && large * (scale - 1) <= magnitude * scale && return true
+        (large <= 0 || large * scale < magnitude * (scale - 1) || small * (scale - 1) > magnitude * scale) && return false
+        bits *= 2
+    end
+    return
 end
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
