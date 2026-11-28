@@ -17,41 +17,47 @@ trained = vegas(gaussian_batch, [0.0, 0.0], [1.0, 1.0]; batch = :matrix)
 trained.integral_estimate
 ```
 
-VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
-for intervals of nonzero width. It uses `BigFloat` when bin widths are subnormal
-or approach the local spacing between representable `Float64` values, a bound
-or span overflows, a binary-exact bound is rounded, or rounding materially changes
-the signed span. The active precision must preserve binary-exact bounds and the
-signed span to `Float64` accuracy and resolve the bins. If needed, use
-`setprecision(BigFloat, bits)` around the integration call. A matrix-batched
-integrand can accept both coordinate types by preserving the element type of
-its inputs.
+The bounds select the floating-point type for callback coordinates,
+`adaptive_grid`, `grid_spacing`, and samples drawn from the result. Floating
+bounds follow Julia's promotion rules. When floating and exact bounds mix,
+the floating bounds select the type and the exact bounds must fit its precision.
+For example, Float32 paired with an integer uses Float32, and Float32 paired with
+Float64 uses Float64. Exact-only inputs normally use Float64 and can select
+BigFloat when the requested grid needs more precision.
 
-The default `callback_type = nothing` passes `Float64` coordinates to the
-integrand when all grid bounds are exactly representable as finite `Float64`
-values and `BigFloat` coordinates otherwise. This applies to scalar and batch
-calls. Use `callback_type = BigFloat` to observe distinct coordinates between
-adjacent `Float64` values on a widened grid. On a `Float64` grid this converts the
-existing coordinates at the active `BigFloat` precision. An explicit callback
-type must represent all grid bounds exactly.
+If the bounds include BigFloat values, VEGAS uses the largest precision stored
+in those arguments for callback coordinates and the grid, even when it differs
+from the ambient precision. The result estimate and estimated standard error
+use Float64.
 
-The function below ranges from 1 to 3 between its bounds and integrates to 4.
-The widened callback coordinates let it evaluate at points between those bounds.
+BigFloat grid construction, adaptation, and warm-start validation round bin
+geometry to nearest. When the requested precision is below 64 bits, unit
+sampling and bin calculations use extra precision. Callback coordinates and
+stored grid values retain the requested precision. Integrand evaluation uses
+the caller's BigFloat rounding mode.
 
 ```@example matrix_batch
-a = 1.0e16
-b = nextfloat(a)
-narrow = vegas(x -> 1 + (only(x) - a), [a], [b]; nbins = 2, callback_type = BigFloat)
-narrow.integral_estimate
+start = BigFloat(2)^53
+lower = BigFloat(start; precision = 128)
+upper = BigFloat(start + 2; precision = 128)
+narrow = vegas(x -> 1 + (only(x) - lower), [lower], [upper]; nbins = 2)
+narrow.integral_estimate, precision(first(narrow.adaptive_grid))
 ```
+
+Non-dyadic rational bounds and built-in irrational constants round inward on
+intervals of nonzero width. A type can represent only finitely spaced values.
+If the promoted type cannot preserve the supplied bounds or hold the requested
+bin widths and distinct edges, provide higher-precision bounds or reduce the
+number of bins. A narrow bin can have representable edges and still have few
+representable interior coordinates. The reported standard error measures
+variation in the sampled integrand values.
 
 ### Reuse the adaptive grid
 
 Pass a previous result to start a fresh estimate on its stored bounds and grid.
-For example, reuse the Gaussian's grid to compute its second radial moment.
-When reusing or sampling a `BigFloat` grid, set the active precision to at
-least the largest precision stored in the grid's edges or widths. The default
-`callback_type` is selected from the stored bounds when reusing a grid.
+The stored grid also determines the point type and BigFloat precision. On Julia
+versions with process-wide BigFloat precision, coordinate concurrent BigFloat
+work that changes or depends on the ambient precision.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))

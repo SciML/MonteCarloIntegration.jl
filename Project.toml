@@ -1,7 +1,7 @@
 name = "MonteCarloIntegration"
 uuid = "4886b29c-78c9-11e9-0a6e-41e1f4161f7b"
 authors = ["Ranjan Anantharaman <ranjan.anantharaman@gmail.com>"]
-version = "0.3.2"
+version = "0.4.0"
 
 [deps]
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"

@@ -73,10 +73,8 @@ end
     @test points != fresh_points
     @test reused.integral_estimate ≈ fresh.integral_estimate rtol = 0.15
     weighted_values = [
-        points[2, j] * prod(
-                nbins * widths[searchsortedlast(view(edges, :, dim), points[dim, j]), dim]
-                for dim in eachindex(lb)
-            )
+        points[2, j] *
+            prod(nbins * widths[searchsortedlast(view(edges, :, dim), points[dim, j]), dim] for dim in eachindex(lb))
             for j in 1:ncalls
     ]
     expected_mean = sum(weighted_values) / ncalls
@@ -130,8 +128,9 @@ end
     widths = fill((ub - lb) / nbins, nbins, 1)
     @test any(iszero, diff(edges; dims = 1))
     previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
-    result = vegas(Returns(1), previous; ncalls = 32, maxiter = 1, alpha = 0.0)
-    @test result.integral_estimate ≈ ub - lb
+    @test_throws ArgumentError vegas(Returns(1), previous; ncalls = 32, maxiter = 1, alpha = 0.0)
+    resolved = vegas(Returns(1), [BigFloat(lb)], [BigFloat(ub)]; nbins, ncalls = 32, maxiter = 1, alpha = 0.0)
+    @test resolved.integral_estimate ≈ ub - lb
 
     inconsistent = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, 2 .* widths)
     @test_throws ArgumentError vegas(Returns(1), inconsistent; ncalls = 32)
@@ -159,10 +158,9 @@ end
     nbins = 9
     peak(x) = x[1] == lower + 4.0 ? 1.0e6 : 1.0
     for (lb, ub) in ((lower, upper), (upper, lower))
-        edges = reshape(collect(range(lb, ub; length = nbins + 1)), :, 1)
-        widths = fill((ub - lb) / nbins, nbins, 1)
-        previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
-        for domain in (([lb], [ub]), (previous,))
+        lower_bound, upper_bound = BigFloat(lb), BigFloat(ub)
+        previous = vegas(Returns(0), [lower_bound], [upper_bound]; nbins, ncalls = 32, maxiter = 1)
+        for domain in (([lower_bound], [upper_bound]), (previous,))
             @testset "Reversed: $(lb > ub), reused: $(length(domain) == 1)" begin
                 Random.seed!(1)
                 trained = vegas(peak, domain...; nbins, ncalls = 128, maxiter = 1)
@@ -180,10 +178,8 @@ end
     lower, upper = prevfloat(-2.0^53), -2.0^53
     for (lb, ub) in ((lower, upper), (upper, lower))
         @testset "Reversed: $(lb > ub)" begin
-            fresh = vegas(Returns(0.0), [lb], [ub]; nbins = 3, ncalls = 16, maxiter = 1)
-            width = (ub - lb) / 3
-            edges = reshape([fma(i, width, lb) for i in 0:3], :, 1)
-            historical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, fill(width, 3, 1))
+            fresh = vegas(Returns(0.0), [BigFloat(lb)], [BigFloat(ub)]; nbins = 3, ncalls = 16, maxiter = 1)
+            historical = deepcopy(fresh)
             function bounded(p)
                 x = only(p)
                 return sqrt(x - lower) + sqrt(upper - x)
@@ -399,12 +395,220 @@ end
     @test result.chi_squared_average == 0.0
 end
 
+@testset "VEGAS long histories with zero or subnormal errors" begin
+    function integration(batches; tolerance = 0.0)
+        step = Ref(0)
+        result = vegas(
+            _ -> batches[step[] += 1], [0.0], [1.0];
+            nbins = 1, ncalls = 4, maxiter = length(batches),
+            batch = :matrix, alpha = 0.0, rtol = tolerance, atol = tolerance,
+        )
+        return result, step[]
+    end
+
+    function reference(batches)
+        return setprecision(BigFloat, 4096) do
+            means = map(batches) do batch
+                sum(BigFloat, batch) / length(batch)
+            end
+            variances = map(batches, means) do batch, mean
+                sum(x -> abs2(BigFloat(x) - mean), batch) / (length(batch) * (length(batch) - 1))
+            end
+            weights = map(v -> iszero(v) ? zero(v) : inv(v), variances)
+            n = length(batches)
+            center = sum(weights .* means) / sum(weights)
+            chi_squared = sum(weights .* abs2.(means .- center)) / (count(>(0), weights) - 1)
+            if any(iszero, variances)
+                mean = sum(means) / n
+                scatter = sum(abs2, means .- mean) / (n * (n - 1))
+                error = sqrt(max(scatter, sum(variances) / n^2))
+                return Float64.((mean, error, chi_squared))
+            end
+            return Float64.((center, inv(sqrt(sum(weights))), chi_squared))
+        end
+    end
+
+    q = nextfloat(0.0)
+    for (first_batch, bytes_per_iteration) in ((zeros(4), 4096), ([-q, q, q, q], 65536))
+        rng = Random.MersenneTwister(2026)
+        batches = [first_batch, [1 .+ rand(rng, 4) for _ in 2:240]...]
+        integration(batches[1:32]; tolerance = q)
+        for (n, tolerance) in ((120, 0.0), (240, 0.0), (120, q))
+            history = batches[1:n]
+            expected_mean, expected_error, expected_chi_squared = reference(history)
+            measured = @timed integration(history; tolerance)
+            result, evaluated = measured.value
+            @test evaluated == n
+            if iszero(first_batch[2])
+                @test result.integral_estimate ≈ expected_mean rtol = 16eps()
+            else
+                @test result.integral_estimate == expected_mean == q
+            end
+            @test result.standard_deviation ≈ expected_error rtol = 16eps()
+            @test result.chi_squared_average ≈ expected_chi_squared rtol = 32eps()
+            @test measured.bytes < bytes_per_iteration * n
+        end
+    end
+
+    history = [
+        [-1.0, 1.0, 0.0, q],
+        [(isodd(i) ? 0.5 : 1.0) .+ [0.0, 1.0, 3.0, 5.0] ./ (i + 1) for i in 2:240]...,
+    ]
+    expected_mean, expected_error, expected_chi_squared = reference(history)
+    integration(history[1:32]; tolerance = q)
+    measured = @timed integration(history; tolerance = q)
+    result, evaluated = measured.value
+    @test evaluated == length(history)
+    @test result.integral_estimate ≈ expected_mean rtol = 16eps()
+    @test result.standard_deviation ≈ expected_error rtol = 16eps()
+    @test result.chi_squared_average ≈ expected_chi_squared rtol = 32eps()
+    @test measured.bytes < 65536 * length(history)
+
+    rng = Random.MersenneTwister(7)
+    ordinary = map(1:32) do _
+        a = 1 + rand(rng)
+        [-a, a, 9q, 9q]
+    end
+    for perturbed in (false, true)
+        history = [[0.0, 6q, 6q, 6q], copy.(ordinary)...]
+        perturbed && (history[end][end] = 10q)
+        for sign in (-1, 1), batches in (history, reverse(history))
+            result, evaluated = integration(map(batch -> sign .* batch, batches))
+            @test evaluated == length(batches)
+            @test result.integral_estimate == sign * (perturbed ? 5q : 4q)
+            @test result.standard_deviation == q
+            @test iszero(result.chi_squared_average)
+        end
+    end
+
+    ties = repeat([q .* [2, -2, 1, 4], q .* [-5, -4, -2, -3]], 16)
+    for sign in (-1, 1), batches in (ties, reverse(ties))
+        result, _ = integration(map(batch -> sign .* batch, batches))
+        @test result.integral_estimate == -sign * 2q
+        @test iszero(result.standard_deviation)
+        @test result.chi_squared_average ≈ (57 / 5) * 16 / 31
+    end
+end
+
+@testset "VEGAS cancellation and stopping boundaries" begin
+    function integrate_batches(batches; rtol = 0.0, atol = 0.0)
+        calls = Ref(0)
+        result = vegas(
+            _ -> batches[calls[] += 1], [0.0], [1.0];
+            nbins = 1, ncalls = 4, maxiter = length(batches),
+            batch = :matrix, alpha = 0.0, rtol, atol,
+        )
+        return result, calls[]
+    end
+
+    function reference_history(batches)
+        moments = map(batches) do batch
+            values = Rational{BigInt}.(batch)
+            mean = sum(values) / 4
+            return mean, sum(v -> abs2(v - mean), values) / 12
+        end
+        return map(eachindex(moments)) do n
+            means = first.(moments[1:n])
+            variances = last.(moments[1:n])
+            if any(iszero, variances)
+                mean = sum(means) / n
+                scatter = n == 1 ? zero(mean) : sum(m -> abs2(m - mean), means) / n / (n - 1)
+                return mean, max(scatter, sum(variances) / n / n)
+            end
+            weights = inv.(variances)
+            return sum(weights .* means) / sum(weights), inv(sum(weights))
+        end
+    end
+
+    cancellation = (
+        [prevfloat(1.0), prevfloat(1.0), 1.0, 1.0],
+        fill(-1.0, 4), fill(2.0^-54, 4), fill(2.0^-110, 4),
+    )
+    for batches in (cancellation, reverse(cancellation)), scale in (1.0, -1.0, 2.0^200)
+        result, calls = integrate_batches(map(batch -> scale .* batch, batches))
+        @test result.integral_estimate == scale * 2.0^-112
+        @test calls == 4
+    end
+
+    q = nextfloat(0.0)
+    for (seed, side) in ((2028, -1), (2027, 1))
+        rng = Random.MersenneTwister(seed)
+        draws = [q .* rand(rng, (10^11):(10^12), 4) for _ in 1:5]
+        for batches in (draws, reverse(draws)), relative in (false, true)
+            history = reference_history(batches)
+            tolerance, expected = setprecision(BigFloat, 1024) do
+                mean, variance = history[4]
+                target = sqrt(BigFloat(variance))
+                relative && (target /= abs(BigFloat(mean)))
+                tolerance = target * (1 + side * ldexp(BigFloat(1), -200))
+                exact = Rational{BigInt}(tolerance)
+                index = findfirst(history) do (mean, variance)
+                    variance < abs2(exact * (relative ? mean : 1))
+                end
+                return tolerance, something(index, length(batches))
+            end
+            for bits in (24, 1024)
+                _, calls = setprecision(BigFloat, bits) do
+                    relative ? integrate_batches(batches; rtol = tolerance, atol = Inf) :
+                        integrate_batches(batches; rtol = Inf, atol = tolerance)
+                end
+                @test calls == expected
+            end
+        end
+    end
+
+    rng = Random.MersenneTwister(706)
+    delta = 2.0^46 * q
+    equality = [zeros(4)]
+    for i in 2:8
+        spread = rand(rng, (10^11):(10^12)) * q
+        center = i == 8 ? 8delta : 0.0
+        push!(equality, center .+ [-spread, -spread, spread, spread])
+    end
+    _, variance = reference_history(equality)[8]
+    @test variance == Rational{BigInt}(delta)^2
+    for relative in (false, true)
+        batches = [equality; [fill(relative ? 8delta : 0.0, 4)]]
+        exact = relative ? one(Rational{BigInt}) : Rational{BigInt}(delta)
+        tolerances = (exact, BigFloat(exact; precision = 1024))
+        for tolerance in tolerances
+            _, calls = setprecision(BigFloat, 24) do
+                relative ? integrate_batches(batches; rtol = tolerance, atol = Inf) :
+                    integrate_batches(batches; rtol = Inf, atol = tolerance)
+            end
+            @test calls == 9
+        end
+    end
+
+    draws = [q .* rand(rng, (10^11):(10^12), 4) for _ in 1:5]
+    for (power, expected) in ((-100_000, 5), (100_000, 1)), relative in (false, true)
+        tolerance = ldexp(BigFloat(1), power)
+        _, calls = relative ? integrate_batches(draws; rtol = tolerance, atol = Inf) :
+            integrate_batches(draws; rtol = Inf, atol = tolerance)
+        @test calls == expected
+    end
+
+    # The inverse variances sum to 16, but their normalized ratio is not dyadic.
+    unequal_variances = [big(4) // 9, big(4) // 55]
+    for sign in (-1, 1), variances in (unequal_variances, reverse(unequal_variances))
+        means = fill(big(sign) // 1, 2)
+        mean, error, _ = MonteCarloIntegration._combine_bounded_estimates(means, variances, nothing)
+        @test mean == sign
+        @test MonteCarloIntegration._rounded_error(error) == 0.25
+        for tolerance in (big(1) // 4, BigFloat(0.25; precision = 1024))
+            @test !MonteCarloIntegration._meets_error_tolerances(error, mean, tolerance, Inf)
+            @test !MonteCarloIntegration._meets_error_tolerances(error, mean, Inf, tolerance)
+        end
+    end
+end
+
 @testset "VEGAS warm starts with low-precision bounds" begin
     options = (; nbins = 3, ncalls = 32, maxiter = 1)
     previous = vegas(Returns(0), Float32[0], Float32[1]; options...)
     @test sum(previous.grid_spacing) ≈ 1.0
     result = vegas(Returns(1), previous; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
-    @test result.integral_estimate ≈ 1.0
+    # The nominal width 1/3 is stored as Float32 on this grid.
+    @test result.integral_estimate ≈ 1.0 rtol = eps(Float32)
 
     width = 1.0f0 / 3
     edges = reshape(Float64[i * width for i in 0:3], :, 1)

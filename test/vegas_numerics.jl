@@ -154,3 +154,55 @@ end
         @test measured ≈ Float64(reference)
     end
 end
+
+@testset "Refinement preserves selected coordinate precision" begin
+    for (stored, importance) in (
+                (Float16[1024, 1025, 1026, 1027, 1028], [1.0, 0.0, 0.0, 0.0]),
+                (Float16[-65504, -32752, 0, 32752, 65504], [1.0, 0.0, 0.0, 0.0]),
+            ), reversed in (false, true)
+        axis = reshape(reversed ? reverse(stored) : stored, :, 1)
+        mass = reshape(reversed ? reverse(importance) : importance, :, 1)
+        widths = diff(axis; dims = 1)
+        edges, spacing = MonteCarloIntegration.update_grid(axis, widths, mass)
+        @test edges == axis
+        @test spacing == widths
+        @test all(x -> isfinite(x) && sign(x) == (reversed ? -1 : 1), spacing)
+    end
+
+    for T in (Float16, Float32, Float64)
+        axis = reshape(T[0, 0.25, 0.5, 0.75, 1], :, 1)
+        widths = diff(axis; dims = 1)
+        weights = reshape([1.0, 1.0, 2.0, 4.0], :, 1)
+        edges, spacing = MonteCarloIntegration.update_grid(axis, widths, weights)
+        @test edges != axis
+        @test eltype(edges) === eltype(spacing) === T
+        @test spacing == diff(edges; dims = 1)
+        @test all(>(0), spacing)
+    end
+
+    f(x) = only(x) < 0.5 ? 0.8 : 1.0
+    options = (; nbins = 8, ncalls = 65_536, maxiter = 1, rtol = 0.0)
+    Random.seed!(817)
+    half = vegas(f, Float16[0], Float16[1]; options...)
+    Random.seed!(817)
+    double = vegas(f, [0.0], [1.0]; options...)
+    @test eltype(half.adaptive_grid) === Float16
+    # Point and edge rounding at Float16 precision can move the learned edges.
+    @test maximum(abs, half.adaptive_grid .- double.adaptive_grid) <= 4eps(Float16)
+    @test all(>(0), half.grid_spacing)
+end
+
+@testset "VEGAS bin selection at the upper endpoint" begin
+    for T in (Float16, Float32, Float64, BigFloat)
+        edges = reshape(T[0, 0.25, 0.5, 0.75, 1], :, 1)
+        widths = diff(edges; dims = 1)
+        units = reshape(T === BigFloat ? BigFloat[0, 1] : [0.0, prevfloat(1.0)], 1, :)
+        points = Matrix{T}(undef, 1, 2)
+        bins = Matrix{Int}(undef, 1, 2)
+        weights = zeros(2)
+        MonteCarloIntegration._map_vegas_points!(points, units, bins, weights, nothing, edges, widths)
+        @test vec(bins) == [1, 4]
+        @test points[1] == 0 && 0.75 <= points[2] <= 1
+        @test weights == [1, 1]
+    end
+end
