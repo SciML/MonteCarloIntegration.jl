@@ -23,14 +23,15 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 `f` receives a vector of `ncalls` coordinate vectors. With `batch = :matrix`, it
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
-Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
-when bin widths are subnormal or approach the spacing between adjacent `Float64`
-values, a bound or span overflows, a binary-exact bound is rounded, or rounding
-the bounds materially changes the interval's span. Sample coordinates, edges,
-and widths then use the active `BigFloat` precision. It must preserve binary-exact
-bounds, preserve the signed span to `Float64` accuracy, and resolve the bins.
-Increase the active precision with `setprecision(BigFloat, bits)` if needed.
-Integral estimates and standard errors use `Float64`.
+Sample coordinates and grid edges normally use `Float64`. Non-dyadic rational
+bounds and built-in irrational constants are rounded inward for intervals of
+nonzero width. VEGAS uses `BigFloat` when bin widths are subnormal or approach
+the spacing between adjacent `Float64` values, a bound or span overflows, a
+binary-exact bound is rounded, or rounding materially changes the signed span.
+The active `BigFloat` precision must preserve binary-exact bounds and the signed
+span to `Float64` accuracy and resolve the bins. Increase it around the call
+with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
+errors use `Float64`.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
@@ -148,8 +149,8 @@ end
 """
     sample_from_adaptive_grid(res, ncalls)
 
-Draw `ncalls` independent points from the adaptive grid in `res` as a vector
-of coordinate tuples. Each coordinate picks a bin with equal probability
+Draw `ncalls` independent points within the bounds stored in `res` and return
+them as a vector of coordinate tuples. Each coordinate picks a bin with equal probability
 and samples uniformly within it. The coordinates preserve the grid's
 floating-point precision. Uniform grids with bins too narrow for `Float64`
 are reconstructed at the active `BigFloat` precision. For a `BigFloat` grid,
