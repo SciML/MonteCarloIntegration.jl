@@ -51,6 +51,29 @@ end
     end
 end
 
+@testset "Equal-weight means at the normal boundary" begin
+    q = nextfloat(0.0)
+    normal_units = Int64(1) << 52
+    cases = (
+        [6544293208522764; 2181431069507588; zeros(Int64, 29)],
+        [normal_units - 2, normal_units - 1],
+        [normal_units - 1, normal_units],
+        [normal_units, normal_units + 1],
+        [normal_units + 1, normal_units + 2],
+        [1, 0],
+    )
+    for units in cases, sign in (-1, 1)
+        expected = sign * (round(Int64, sum(BigInt, units) // length(units)) * q)
+        values = (sign * q) .* units
+        iteration = Ref(0)
+        result = vegas([0.0], [1.0]; batch = true, nbins = 1, ncalls = 2, maxiter = length(values), alpha = 0, rtol = 0, atol = 0) do _
+            return fill(values[iteration[] += 1], 2)
+        end
+        @test iteration[] == length(values)
+        @test result.integral_estimate === expected
+    end
+end
+
 @testset "Variance of the integral estimate" begin
     for scale in (1.0, 1.0e-240, 1.0e240)
         samples = scale .* [1, 2, 3, 4]

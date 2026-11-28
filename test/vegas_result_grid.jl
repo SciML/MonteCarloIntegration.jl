@@ -407,6 +407,52 @@ end
     end
 end
 
+@testset "Native binary callback products straddle Float64 midpoints" begin
+    power(n) = n < 0 ? big(1) // (big(1) << -n) : (big(1) << n) // 1
+    setprecision(BigFloat, 128) do
+        for T in (Float16, Float32, Float64)
+            larger = nextfloat(one(T))
+            smaller = prevfloat(one(T), 4)
+            cases = (
+                (larger, 1 + power(-53)),
+                (smaller, power(-1022) - 3power(-1075)),
+                (larger, power(1024) - power(970)),
+            )
+            for (magnitude, midpoint) in cases, side in (RoundDown, RoundUp)
+                quotient = midpoint / Rational{BigInt}(magnitude)
+                width = BigFloat(quotient, side; precision = 128)
+                product = Rational{BigInt}(width) * Rational{BigInt}(magnitude)
+                @test side === RoundDown ? product < midpoint : product > midpoint
+                @test floatmin(Float64) <= Float64(width, RoundNearest) <= floatmax(Float64)
+                for reversed in (false, true), callback_sign in (-1, 1)
+                    a, b = reversed ? (width, zero(width)) : (zero(width), width)
+                    value = copysign(magnitude, T(callback_sign))
+                    exact = (reversed ? -product : product) * callback_sign
+                    expected = Float64(BigFloat(exact; precision = 256), RoundNearest)
+                    for mode in (RoundNearest, RoundUp, RoundDown)
+                        setrounding(BigFloat, mode) do
+                            observed = Ref(true)
+                            function integrand(_)
+                                observed[] &= precision(BigFloat) == 128 && rounding(BigFloat) === mode
+                                return value
+                            end
+                            run() = vegas(integrand, [a], [b]; ncalls = 4, nbins = 1, maxiter = 1, alpha = 0.0)
+                            if isfinite(expected)
+                                result = run()
+                                @test (result.integral_estimate, result.standard_deviation) === (expected, 0.0)
+                            else
+                                @test_throws DomainError run()
+                            end
+                            @test observed[]
+                            @test precision(BigFloat) == 128 && rounding(BigFloat) === mode
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 @testset "Warm starts use the stored precision of mixed grid matrices" begin
     setprecision(BigFloat, 128) do
         for T in (Float16, Float32, Float64), reverse_axis in (false, true)
@@ -439,5 +485,156 @@ end
             @test result.grid_spacing == fill(sign * step, 2, 1)
             @test result.integral_estimate === sign * nextfloat(0.0)
         end
+    end
+end
+
+@testset "Warm starts reject widths outside the stored edge intervals" begin
+    setprecision(BigFloat, 128) do
+        for (swap, direction) in ((identity, 1), (reverse, -1)), sign in (1, -1)
+            edges = reshape(sign .* swap(Float16[0, 1, 2]), :, 1)
+            widths = BigFloat[1 + big(7) // 4096, 1 - big(7) // 4096]
+            spacing = reshape(sign * direction .* swap(widths), :, 1)
+            previous = VEGASResult(0.0, 0.0, 0.0, edges, spacing)
+            calls = Ref(0)
+            observe(_) = (calls[] += 1; 1.0)
+            seed!(785661)
+            subsequent = rand(UInt64)
+            seed!(785661)
+            @test_throws ArgumentError vegas(observe, previous; ncalls = 4, maxiter = 1, alpha = 0.0)
+            @test calls[] == 0
+            @test rand(UInt64) == subsequent
+        end
+    end
+end
+
+@testset "Warm starts compare mixed widths at rounding midpoints" begin
+    options = (; ncalls = 4, maxiter = 1, alpha = 0.0)
+    setprecision(BigFloat, 128) do
+        for T in (Float16, Float32, Float64), at_limit in (false, true)
+            upper = at_limit ? floatmax(T) : one(T)
+            lower = at_limit ? prevfloat(upper) : zero(T)
+            limit = if at_limit
+                2 * (BigFloat(upper) - BigFloat(lower))
+            else
+                (BigFloat(1) + BigFloat(nextfloat(upper)) - BigFloat(prevfloat(lower))) / 2
+            end
+            for direction in (1, -1)
+                edges = reshape(direction .* T[lower, upper], :, 1)
+                exact_edges = BigFloat.(edges)
+                lo, hi = minmax(exact_edges...)
+                valid = VEGASResult(0.0, 0.0, 0.0, edges, fill(direction * limit, 1, 1))
+                result = vegas(Returns(1), valid; options...)
+                @test result.adaptive_grid == exact_edges
+                @test result.grid_spacing == diff(exact_edges; dims = 1)
+                @test all(p -> lo <= only(p) <= hi, MonteCarloIntegration.sample_from_adaptive_grid(result, 4))
+                invalid = VEGASResult(0.0, 0.0, 0.0, edges, fill(direction * nextfloat(limit), 1, 1))
+                @test_throws ArgumentError vegas(Returns(1), invalid; options...)
+            end
+        end
+        for direction in (1, -1)
+            edges = reshape(direction .* Float16[1, nextfloat(Float16(2))], :, 1)
+            valid = fill(BigFloat(direction * (1 + 12 // 4096); precision = 12), 1, 1)
+            invalid = fill(BigFloat(direction * (1 + 14 // 4096); precision = 12), 1, 1)
+            result = vegas(Returns(1), VEGASResult(0.0, 0.0, 0.0, edges, valid); options...)
+            @test only(result.grid_spacing) == direction * (1 + 1 // 512)
+            @test_throws ArgumentError vegas(Returns(1), VEGASResult(0.0, 0.0, 0.0, edges, invalid); options...)
+        end
+    end
+end
+
+@testset "Exact stored edges accept widths rounded to signed zero" begin
+    q = big(1) // (big(1) << 1075)
+    for direction in (1, -1)
+        edges = reshape([zero(q), direction * q], :, 1)
+        previous = VEGASResult(0.0, 0.0, 0.0, edges, fill(copysign(0.0, direction), 1, 1))
+        result = vegas(Returns(1), previous; ncalls = 4, maxiter = 1, alpha = 0.0)
+        @test only(result.grid_spacing) == direction * ldexp(BigFloat(1), -1075)
+    end
+end
+
+@testset "Warm starts and direct draws retain declared mixed edge precision" begin
+    options = (; ncalls = 4, maxiter = 1, alpha = 0.0)
+    lower, upper = 1.0, nextfloat(1.0)
+    pairs = (
+        ([lower, upper], 8), ([lower, upper], 24), ([lower, upper], 52),
+        ([1.0, nextfloat(1.0), 2.0], 8), ([1.0, nextfloat(1.25), 2.0], 8),
+        ([big(2)^53 + 1, big(2)^53 + 9], 53),
+        ([1 + big(1) // big(2)^55, 1 + big(1) // big(2)^54], 53),
+        ([big(1) // 3, big(1) // 3 + big(1) // big(2)^80], 53),
+    )
+    for (axis, bits) in pairs, direction in (identity, reverse)
+        edges = reshape(direction(axis), :, 1)
+        widths = reshape([BigFloat(span, RoundNearest; precision = bits) for span in diff(direction(axis))], :, 1)
+        previous = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        calls = Ref(0)
+        observe(_) = (calls[] += 1; 1.0)
+        seed!(2964)
+        next_draw = rand(UInt64)
+        seed!(2964)
+        @test_throws ArgumentError vegas(observe, previous; options...)
+        @test calls[] == 0
+        @test rand(UInt64) == next_draw
+        seed!(2964)
+        @test_throws ArgumentError MonteCarloIntegration.sample_from_adaptive_grid(previous, 4)
+        @test rand(UInt64) == next_draw
+    end
+
+    for (axis, bits) in (([lower, upper], 53), ([big(1) // 3, big(2) // 3], 96), ([big(2)^53 + 1, big(2)^53 + 9], 54)), direction in (identity, reverse)
+        edges = reshape(direction(axis), :, 1)
+        widths = reshape([BigFloat(span, RoundNearest; precision = bits) for span in diff(direction(axis))], :, 1)
+        previous = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        result = vegas(Returns(1), previous; options...)
+        @test all(x -> precision(x) == bits, result.adaptive_grid)
+        @test vec(result.adaptive_grid) == [BigFloat(x, RoundNearest; precision = bits) for x in direction(axis)]
+        @test result.integral_estimate ≈ Float64(sum(widths))
+        seed!(5739)
+        points = MonteCarloIntegration.sample_from_adaptive_grid(previous, 4)
+        next_draw = rand(UInt64)
+        seed!(5739)
+        @test points == MonteCarloIntegration.sample_from_adaptive_grid(result, 4)
+        @test rand(UInt64) == next_draw
+    end
+end
+
+@testset "Mixed nominal widths account for the last stored edge" begin
+    options = (; ncalls = 4, maxiter = 1, alpha = 0.0)
+    for T in (Float16, Float32, Float64), (direction, order) in ((identity, 1), (reverse, -1)), sign in (1, -1)
+        axis = direction(sign .* T[0, 1, nextfloat(T(2), 2)])
+        widths = fill(BigFloat(sign * order; precision = 128), 2, 1)
+        previous = VEGASResult(0.0, 0.0, 0.0, reshape(axis, :, 1), widths)
+        calls = Ref(0)
+        observe(_) = (calls[] += 1; 1.0)
+        seed!(9685)
+        next_draw = rand(UInt64)
+        seed!(9685)
+        @test_throws ArgumentError vegas(observe, previous; options...)
+        @test calls[] == 0
+        @test rand(UInt64) == next_draw
+        seed!(9685)
+        @test_throws ArgumentError MonteCarloIntegration.sample_from_adaptive_grid(previous, 4)
+        @test rand(UInt64) == next_draw
+    end
+
+    for direction in (1, -1), anchor_end in (false, true)
+        lo, hi = direction .* (Float16(0.7), Float16(2.1))
+        nbins = 5
+        step = (hi - lo) / nbins
+        edges = reshape([lo + i * step for i in 0:nbins], :, 1)
+        if anchor_end
+            edges[end] = hi
+        else
+            @test (edges[end] - lo) / nbins != step
+        end
+        widths = fill(BigFloat(step; precision = 128), nbins, 1)
+        previous = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        result = vegas(Returns(1), previous; options...)
+        @test result.adaptive_grid[1] == lo && result.adaptive_grid[end] == edges[end]
+        @test result.grid_spacing == diff(result.adaptive_grid; dims = 1)
+        seed!(4205)
+        points = MonteCarloIntegration.sample_from_adaptive_grid(previous, 4)
+        next_draw = rand(UInt64)
+        seed!(4205)
+        @test points == MonteCarloIntegration.sample_from_adaptive_grid(result, 4)
+        @test rand(UInt64) == next_draw
     end
 end
