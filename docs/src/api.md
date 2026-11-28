@@ -18,7 +18,7 @@ trained.integral_estimate
 ```
 
 VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
-for intervals of nonzero width. It stores the grid in `BigFloat` when bin widths
+for intervals of nonzero width. It computes the grid in `BigFloat` when bin widths
 are subnormal or approach the local spacing between representable `Float64` values,
 a bound or span overflows, a binary-exact bound is rounded, or rounding materially
 changes the signed span. The active precision must preserve binary-exact bounds
@@ -68,6 +68,18 @@ b = nextfloat(a)
 narrow = vegas(x -> 1 + (only(x) - a), [a], [b]; nbins = 2, callback_type = BigFloat)
 narrow.integral_estimate
 ```
+
+The result fields `adaptive_grid` and `grid_spacing` are `Matrix{Float64}` by
+default when each axis contains a finite `Float64` coordinate, the rounded
+bounds retain a finite nonzero span for each nonzero axis, and no width
+underflows or overflows.
+Rounded edges can repeat or round away from the exact bounds. To inspect or edit
+the native grid, use `grid_precision = :native` with either callback coordinate
+type. Unchanged axes retain their exact stored grid for reuse and sampling,
+including after `deepcopy`. Sampling a rounded result uses inward-clamped
+`Float64` coordinates. Editing either displayed matrix uses both displayed
+columns for that axis. Set its edges and widths consistently before reusing it
+with `vegas`.
 
 ### Reuse the adaptive grid
 

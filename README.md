@@ -74,7 +74,7 @@ second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 the bounds stored in `trained`.
 
 VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
-for intervals of nonzero width. VEGAS stores the grid in `BigFloat` when its bounds
+for intervals of nonzero width. VEGAS computes the grid in `BigFloat` when its bounds
 or bin widths require extra precision. The active precision must preserve
 binary-exact bounds and the signed span to `Float64` accuracy and resolve the
 bins. Set it around the call with `setprecision(BigFloat, bits)` if needed.
@@ -89,6 +89,8 @@ more than that fraction of an axis's span. The reported standard error excludes
 coordinate-rounding bias. Use `callback_type = BigFloat` when the integrand needs
 interior coordinates from a widened grid. Reusing a `BigFloat` grid requires
 active precision at least as high as the precision stored in its edges or widths.
+The result displays `Float64` grid matrices when this retains usable axis bounds.
+Use `grid_precision = :native` to inspect or edit the precise grid.
 
 ### Roadmap 
 - Supporting vector valued functions

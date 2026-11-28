@@ -29,7 +29,7 @@ using Test: @test, @testset, @test_throws
                         batch === false && return 1.0
                         return ones(batch === true ? length(points) : size(points, 2))
                     end
-                    options = (; nbins = 2, ncalls = 16, maxiter = 1, alpha = 0.0, batch)
+                    options = (; nbins = 2, ncalls = 16, maxiter = 1, alpha = 0.0, batch, grid_precision = :native)
                     setprecision(BigFloat, low) do
                         seed!(522)
                         next_draw = rand(UInt64)
@@ -97,7 +97,7 @@ end
 @testset "VEGAS keeps a wide rational grid inside the requested interval" begin
     lo = big(2)^64 + 1 // 3
     hi = lo + 102
-    options = (; nbins = 2, ncalls = 4096, maxiter = 1, alpha = 0.0)
+    options = (; nbins = 2, ncalls = 4096, maxiter = 1, alpha = 0.0, grid_precision = :native)
     inside(x) = lo <= Rational{BigInt}(x) <= hi
 
     for (a, b, width) in ((lo, hi, 102.0), (hi, lo, -102.0))
@@ -215,7 +215,7 @@ end
         @test precision(BigFloat) == 64
     end
     setprecision(BigFloat, 128) do
-        result = vegas(Returns(1), [π], [hi]; options...)
+        result = vegas(Returns(1), [π], [hi]; options..., grid_precision = :native)
         @test eltype(result.adaptive_grid) === BigFloat
         @test result.integral_estimate ≈ expected rtol = 2eps(Float64)
         @test precision(BigFloat) == 128

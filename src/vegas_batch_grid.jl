@@ -129,12 +129,72 @@ function _check_uniform_grid_resolution(a::BigFloat, b::BigFloat, width)
     return nothing
 end
 
+_float64_grid_result(result) = result
+
+function _float64_grid_result(result::VEGASResult{A, B, C, Matrix{BigFloat}, Matrix{BigFloat}}) where {A, B, C}
+    grid, widths = result.adaptive_grid, result.grid_spacing
+    _inward_float64_callback_bounds(grid) === nothing && return result
+    for dim in axes(grid, 2)
+        a, b = grid[begin, dim], grid[end, dim]
+        span = Float64(b) - Float64(a)
+        isfinite(span) && (a == b || !iszero(span)) || return result
+    end
+    edges, spacing = Matrix{Float64}(grid), Matrix{Float64}(widths)
+    all(isfinite, edges) && all(isfinite, spacing) || return result
+    any(i -> iszero(spacing[i]) && !iszero(widths[i]), eachindex(widths)) && return result
+    projected = _ProjectedVEGASGrid(edges, (grid, widths))
+    return VEGASResult{A, B, C, Matrix{Float64}, Matrix{Float64}}(
+        result.integral_estimate, result.standard_deviation, result.chi_squared_average, projected, spacing,
+    )
+end
+
+_result_grid(result) = result.adaptive_grid, result.grid_spacing
+
+_has_projected_grid(result) = false
+_has_projected_grid(result::VEGASResult) = getfield(result, :adaptive_grid) isa _ProjectedVEGASGrid
+
+function _result_grid(result::VEGASResult)
+    grid, widths = getfield(result, :adaptive_grid), result.grid_spacing
+    grid isa _ProjectedVEGASGrid || return grid, widths
+    edges = grid.rounded
+    precise_edges, precise_widths = grid.native
+    if all(dim -> _matches_projected_axis(edges, widths, precise_edges, precise_widths, dim), axes(edges, 2))
+        return grid.native
+    end
+    native_edges, native_widths = copy(precise_edges), copy(precise_widths)
+    for dim in axes(edges, 2)
+        _matches_projected_axis(edges, widths, precise_edges, precise_widths, dim) && continue
+        _copy_edited_axis!(native_edges, edges, dim)
+        _copy_edited_axis!(native_widths, widths, dim)
+    end
+    return native_edges, native_widths
+end
+
+function _matches_projected_axis(edges, widths, precise_edges, precise_widths, dim)
+    return all(i -> isequal(edges[i, dim], Float64(precise_edges[i, dim])), axes(edges, 1)) &&
+        all(i -> isequal(widths[i, dim], Float64(precise_widths[i, dim])), axes(widths, 1))
+end
+
+function _copy_edited_axis!(native, rounded, dim)
+    for row in axes(rounded, 1)
+        value = rounded[row, dim]
+        converted = BigFloat(value)
+        isfinite(converted) && isequal(converted, value) ||
+            throw(ArgumentError("the edited grid needs finite values and sufficient active BigFloat precision"))
+        native[row, dim] = converted
+    end
+    return nothing
+end
+
 """
     vegas(f, previous::VEGASResult; kwargs...)
 
 Integrate `f` over the bounds stored in `previous`, starting from a copy of its
 adaptive grid. The estimate and uncertainty use only the samples from this
-call. The number of bins comes from the grid. If supplied, `nbins` must match
+call. A widened grid retains its native data for any axis whose displayed
+edges and widths are unedited. Editing either matrix on an axis uses the
+displayed data for that axis. The number of bins comes from the grid.
+If supplied, `nbins` must match
 that number. Uniform grids with bins too narrow for `Float64` are reconstructed
 at the active `BigFloat` precision. Reusing a `BigFloat` grid requires active
 precision at least as high as the largest precision stored in its edges or
@@ -149,8 +209,9 @@ function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)
     return _vegas(func, view(x, 1, :), view(x, size(x, 1), :), (x, delx); nbins = grid_bins, kwargs...)
 end
 
-function _copy_vegas_grid(previous)
-    edges, widths = previous.adaptive_grid, previous.grid_spacing
+_copy_vegas_grid(previous) = _copy_vegas_grid(_result_grid(previous)...)
+
+function _copy_vegas_grid(edges, widths)
     edges isa AbstractMatrix{<:Real} && widths isa AbstractMatrix{<:Real} ||
         throw(ArgumentError("the previous grid must contain real matrices of edges and widths"))
     nbins, ndim = size(widths)
@@ -177,7 +238,7 @@ function _copy_vegas_grid(previous)
 end
 
 function _sampling_grid(result)
-    edges, widths = result.adaptive_grid, result.grid_spacing
+    edges, widths = _result_grid(result)
     _check_grid_precision(edges, widths)
     _unresolved_uniform_grid(edges, widths) && return _copy_vegas_grid(result)
     return edges, widths

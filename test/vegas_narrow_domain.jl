@@ -4,7 +4,7 @@ using Test: @test, @testset, @test_throws
 
 @testset "VEGAS narrow domains" begin
     a = 10^16
-    options = (; nbins = 2, ncalls = 8192, maxiter = 2, rtol = 0.0, atol = 0.0)
+    options = (; nbins = 2, ncalls = 8192, maxiter = 2, rtol = 0.0, atol = 0.0, grid_precision = :native)
     for (lo, hi, expected) in (
             (a, a + 1, 1.0), (a + 1, a, -1.0),
             (a + 1, a + 12, 11.0), (a + 12, a + 1, -11.0),
@@ -30,7 +30,7 @@ using Test: @test, @testset, @test_throws
     grid = copy(result.adaptive_grid)
     f_batch(points) = map(f, eachcol(points))
     Random.seed!(1906)
-    warmed = vegas(f_batch, result; ncalls = options.ncalls, maxiter = options.maxiter, batch = :matrix, callback_type = BigFloat)
+    warmed = vegas(f_batch, result; ncalls = options.ncalls, maxiter = options.maxiter, batch = :matrix, callback_type = BigFloat, grid_precision = :native)
     @test warmed.integral_estimate ≈ 4.0 atol = 0.06
     @test result.adaptive_grid == grid
     @test a < warmed.adaptive_grid[2] < b
@@ -38,7 +38,7 @@ end
 
 @testset "VEGAS rational bounds" begin
     a = 10^16
-    options = (; nbins = 2, ncalls = 32, maxiter = 1, alpha = 0.0)
+    options = (; nbins = 2, ncalls = 32, maxiter = 1, alpha = 0.0, grid_precision = :native)
     for (lo, hi, expected) in (((a + 1) // 1, (a + 12) // 1, 11.0), ((a + 12) // 1, (a + 1) // 1, -11.0))
         result = vegas(Returns(1), [lo], [hi]; options...)
         @test result.integral_estimate == expected
@@ -52,7 +52,7 @@ end
     lo, hi, previous = setprecision(BigFloat, 256) do
         lo, hi = BigFloat(1), BigFloat(1) + BigFloat(2)^-80
         Random.seed!(2518)
-        trained = vegas(x -> (x[1] - lo) / (hi - lo), [lo], [hi]; nbins = 4, ncalls = 256, maxiter = 2, callback_type = BigFloat)
+        trained = vegas(x -> (x[1] - lo) / (hi - lo), [lo], [hi]; nbins = 4, ncalls = 256, maxiter = 2, callback_type = BigFloat, grid_precision = :native)
         # The widths fit in 64 bits of precision even when coordinates need more.
         spacing = (hi - lo) / 2^48
         edges = lo .+ round.((trained.adaptive_grid .- lo) ./ spacing) .* spacing
@@ -90,12 +90,12 @@ end
     for alpha in (0.0, 1.5)
         previous = setprecision(BigFloat, 64) do
             Random.seed!(42)
-            vegas(x -> only(x) - a, [a], [b]; nbins = 3, ncalls = 128, maxiter = 2, alpha, callback_type = BigFloat)
+            vegas(x -> only(x) - a, [a], [b]; nbins = 3, ncalls = 128, maxiter = 2, alpha, callback_type = BigFloat, grid_precision = :native)
         end
         setprecision(BigFloat, 256) do
             edges, widths = copy(previous.adaptive_grid), copy(previous.grid_spacing)
             Random.seed!(1907)
-            resumed = vegas(Returns(1), previous; ncalls = 2048, maxiter = 1, alpha = 0.0)
+            resumed = vegas(Returns(1), previous; ncalls = 2048, maxiter = 1, alpha = 0.0, grid_precision = :native)
             @test resumed.integral_estimate ≈ b - a rtol = 0.03
             for (stored, original, expanded) in (
                     (previous.adaptive_grid, edges, resumed.adaptive_grid),
@@ -111,7 +111,7 @@ end
 
 @testset "VEGAS historical uniform grids preserve narrow bounds" begin
     a, b = prevfloat(-2.0^53), -2.0^53
-    options = (; nbins = 3, ncalls = 1000, maxiter = 1, alpha = 0.0)
+    options = (; nbins = 3, ncalls = 1000, maxiter = 1, alpha = 0.0, grid_precision = :native)
     for bits in (64, 256), (lo, hi) in ((a, b), (b, a))
         @testset "$bits-bit precision, $lo → $hi" begin
             setprecision(BigFloat, bits) do
@@ -158,7 +158,7 @@ end
 end
 
 @testset "VEGAS subnormal bin widths" begin
-    options = (; nbins = 1000, ncalls = 256, maxiter = 1, alpha = 0.0)
+    options = (; nbins = 1000, ncalls = 256, maxiter = 1, alpha = 0.0, grid_precision = :native)
     for b in (nextfloat(0.0), nextfloat(0.0, 2600), 1.0e-318), (lo, hi) in ((0.0, b), (b, 0.0))
         @testset "$lo → $hi" begin
             fresh = vegas(Returns(1.0), [lo], [hi]; options...)

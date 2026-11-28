@@ -4,7 +4,7 @@ using Test: @test, @test_logs, @testset, @test_throws, collect_test_logs
 
 @testset "VEGAS preserves integer bounds above binary64 precision" begin
     offset = 2^53
-    options = (; nbins = 2, ncalls = 128, maxiter = 1, alpha = 0.0)
+    options = (; nbins = 2, ncalls = 128, maxiter = 1, alpha = 0.0, grid_precision = :native)
     for (batch, f) in ((false, Returns(1.0)), (true, x -> ones(length(x))), (:matrix, x -> ones(size(x, 2))))
         for (lb, ub) in ((offset + 1, offset + 3), (offset + 3, offset + 1), (offset + 1, offset + 2))
             @testset "batch = $batch, $lb → $ub" begin
@@ -154,7 +154,7 @@ end
     record(x) = (push!(seen, only(x)); 1.0)
     scalar64(x::point64) = (calls[] += 1; record(x))
     batch64(x::views64) = (calls[] += 1; map(record, x))
-    options = (; nbins = 4, ncalls = 64, maxiter = 2, alpha = 0.0)
+    options = (; nbins = 4, ncalls = 64, maxiter = 2, alpha = 0.0, grid_precision = :native)
     output = zeros(options.ncalls)
     matrix64(x::Matrix{Float64}) = (calls[] += 1; map!(record, output, eachcol(x)))
     scalar_wide(x::AbstractVector{BigFloat}) = (push!(wide, only(x)); 2.0)
@@ -233,7 +233,7 @@ end
             views(x::Vector{<:AbstractVector{Float64}}) = map(point, x)
             matrix(x::AbstractMatrix{Float64}) = map(point, eachcol(x))
             integrand = batch === false ? point : (batch === true ? views : matrix)
-            options = (; batch, nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0)
+            options = (; batch, nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0, grid_precision = :native)
             expected = Float64(BigFloat(b) - BigFloat(a))
             seed!(701)
             result = vegas(integrand, [a], [b]; options...)
@@ -284,7 +284,7 @@ end
         return 1.0
     end
     seed!(702)
-    reused = vegas(f, previous; ncalls = 64, maxiter = 1, alpha = 0.0)
+    reused = vegas(f, previous; ncalls = 64, maxiter = 1, alpha = 0.0, grid_precision = :native)
     @test calls[] == 64
     @test inside[]
     @test eltype(reused.adaptive_grid) === BigFloat
@@ -389,7 +389,7 @@ end
     dual_matrix(points::Matrix{BigFloat}) = fill(2.0, size(points, 2))
 
     lo, hi = 1.0e16, 1.0e16 + 16
-    options = (; nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0)
+    options = (; nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0, grid_precision = :native)
     for (batch, typed, dual) in ((false, typed_point, dual_point), (true, typed_batch, dual_batch), (:matrix, typed_matrix, dual_matrix))
         for (a, b) in ((lo, hi), (hi, lo))
             for integrand in (typed, x -> typed(x), dual)
