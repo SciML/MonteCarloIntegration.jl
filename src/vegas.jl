@@ -251,8 +251,8 @@ Sample within the bounds stored in the adaptive grid. Coordinates use the
 stored coordinate type and BigFloat precision.
 """
 function sample_from_adaptive_grid(res, ncalls)
-    x, delx = _sampling_grid(res)
-    return _with_vegas_precision(_stored_grid_precision(x, delx)) do
+    return _with_vegas_precision(_stored_grid_precision(res.adaptive_grid, res.grid_spacing)) do
+        x, delx = _sampling_grid(res)
         _with_vegas_mapping(x, delx) do working_widths, bits
             _sample_adaptive_grid(x, working_widths, ncalls, _grid_coordinate_type(x, delx), bits)
         end
