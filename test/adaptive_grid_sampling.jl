@@ -214,3 +214,77 @@ end
         @test isequal((grid, nominal_widths), original)
     end
 end
+
+mutable struct ReadCountingSamplingMatrix <: AbstractMatrix{Float64}
+    values::Matrix{Float64}
+    reads::Int
+end
+
+Base.size(matrix::ReadCountingSamplingMatrix) = size(matrix.values)
+
+function Base.getindex(matrix::ReadCountingSamplingMatrix, row::Int, col::Int)
+    matrix.reads += 1
+    return matrix.values[row, col]
+end
+
+@testset "Sparse Float64 sampling reads only the drawn bins" begin
+    for (lo, hi) in ((0.0, 1.0), (1.0e9, 1.001e9))
+        raw_edges = reshape(collect(range(lo, hi; length = 1_000_001)), :, 1)
+        raw_widths = diff(raw_edges; dims = 1)
+        edges = ReadCountingSamplingMatrix(raw_edges, 0)
+        widths = ReadCountingSamplingMatrix(raw_widths, 0)
+        grid = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+
+        seed!(638191)
+        actual = sample_from_adaptive_grid(grid, 4)
+        next_draw = rand(UInt64)
+        @test edges.reads <= 4 * length(actual) + 4
+        @test widths.reads <= 2
+
+        seed!(638191)
+        expected = map(1:4) do _
+            scaled = size(raw_widths, 1) * rand()
+            bin = floor(Int, scaled) + 1
+            (raw_edges[bin] + raw_widths[bin] * (scaled + 1 - bin),)
+        end
+        @test actual == expected
+        @test rand(UInt64) == next_draw
+    end
+end
+
+@testset "Direct sampling resolves promoted collapsed legacy grids" begin
+    for T in (Float16, Float32), at_zero in (false, true), direction in (identity, reverse)
+        a = at_zero ? zero(T) : T === Float16 ? T(1024) : T(2^24)
+        lo, hi = direction((a, nextfloat(a, at_zero ? 1 : 4)))
+        nbins = 16
+        nominal = (hi - lo) / nbins
+        original = reshape(Float64[lo + (i - 1) * nominal for i in 1:(nbins + 1)], :, 1)
+        original[end] = hi
+        original_edges = copy(original)
+        widths = fill(Float64(nominal), nbins, 1)
+        migrated = reshape(collect(range(Float64(lo), Float64(hi); length = nbins + 1)), :, 1)
+        original_result = VEGASResult(0.0, 0.0, 0.0, original, widths)
+        migrated_result = VEGASResult(0.0, 0.0, 0.0, migrated, diff(migrated; dims = 1))
+        @test any(iszero, diff(original; dims = 1))
+        seed!(7487)
+        expected = sample_from_adaptive_grid(migrated_result, 16)
+        next_draw = rand(UInt64)
+        seed!(7487)
+        @test sample_from_adaptive_grid(original_result, 16) == expected
+        @test rand(UInt64) == next_draw
+        @test original_result.adaptive_grid == original_edges
+        @test all(==(Float64(nominal)), original_result.grid_spacing)
+    end
+end
+
+@testset "Direct sampling rejects a collapsed binary64 grid before drawing" begin
+    for (lo, hi) in ((0.0, nextfloat(0.0)), (nextfloat(0.0), 0.0))
+        edges = reshape([lo, lo, lo, lo, hi], :, 1)
+        grid = VEGASResult(0.0, 0.0, 0.0, edges, zeros(4, 1))
+        seed!(7751)
+        next_draw = rand(UInt64)
+        seed!(7751)
+        @test_throws ArgumentError sample_from_adaptive_grid(grid, 4)
+        @test rand(UInt64) == next_draw
+    end
+end

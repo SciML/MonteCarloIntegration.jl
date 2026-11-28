@@ -242,8 +242,10 @@ function _sample_grid!(samples::Vector{NTuple{N, T}}, edges, widths, ::Type{T}, 
                 bin = floor(Int, scaled) + 1
                 fraction = scaled + 1 - bin
             end
-            width = _grid_bin_width(edges, widths, bin, dim)
-            point = edges[bin, dim] + width * fraction
+            lower = edges[bin, dim]
+            width = T === Float64 && eltype(edges) === Float64 ?
+                edges[bin + 1, dim] - lower : _grid_bin_width(edges, widths, bin, dim)
+            point = lower + width * fraction
             return convert(T, _round_vegas_coordinate(_bound_grid_point(point, edges, dim), bits))
         end
     end
