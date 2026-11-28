@@ -46,6 +46,56 @@ end
     end
 end
 
+@testset "Flat batches retain the evaluation budget" begin
+    batches = ([1.0, 1.0], [0.0, 0.0], [0.0, 1.0])
+    calls = Ref(0)
+    result = vegas(
+        _ -> batches[calls[] += 1], [0.0], [1.0];
+        batch = :matrix, nbins = 2, ncalls = 2, maxiter = 3, alpha = 0.0,
+        atol = 1.0e-10, rtol = 1.0e-10,
+    )
+    @test calls[] == 3
+    @test result.integral_estimate == 0.5
+    @test result.standard_deviation > 0.0
+end
+
+@testset "Jacobian factors with widely separated scales" begin
+    small, large = 2.0^-600, 2.0^900
+    for (batch, f) in ((false, Returns(1)), (true, x -> ones(length(x))), (:matrix, x -> ones(size(x, 2))))
+        for ub in ([small, small, large], [small, large, small], [-small, small, large], [large, large, small, small])
+            @testset "batch = $batch, bounds = $ub" begin
+                expected = length(ub) == 4 ? 2.0^600 : copysign(2.0^-300, first(ub))
+                result = vegas(f, zeros(length(ub)), ub; batch, nbins = 2, ncalls = 16, maxiter = 1, alpha = 0.0)
+                @test result.integral_estimate == expected
+                @test result.standard_deviation == 0.0
+            end
+        end
+    end
+    result = vegas(Returns(2.0^900), [0.0, 0.0], [small, small]; nbins = 2, ncalls = 16, maxiter = 1)
+    @test result.integral_estimate == 2.0^-300
+    @test result.standard_deviation == 0.0
+    @testset "A span larger than binary64" begin
+        bound = 2.0^1023
+        result = vegas(Returns(1), [-bound, 0.0], [bound, 2.0^-1000]; nbins = 2, ncalls = 16, maxiter = 1)
+        @test result.integral_estimate == 2.0^24
+        @test result.standard_deviation == 0.0
+    end
+end
+
+@testset "Cancellation across binary64 scales" begin
+    large, tiny = 2.0^1000, 2.0^-500
+    expected = tiny / 3
+    for bits in (32, 256)
+        setprecision(BigFloat, bits) do
+            for values in ([large, -large, tiny], [large, tiny, -large], [tiny, -large, large])
+                result = vegas(Returns(values), [0.0], [1.0]; batch = :matrix, nbins = 2, ncalls = 3, maxiter = 1)
+                @test abs(result.integral_estimate - expected) <= 2eps(expected)
+                @test isfinite(result.standard_deviation) && result.standard_deviation > 0.0
+            end
+        end
+    end
+end
+
 @testset "Large offsets and grid weights" begin
     a = 1.5e250
     b = nextfloat(a)

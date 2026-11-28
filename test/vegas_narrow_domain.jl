@@ -1,6 +1,6 @@
 using MonteCarloIntegration: MonteCarloIntegration, vegas
 using Random: Random
-using Test: @test, @testset
+using Test: @test, @testset, @test_throws
 
 @testset "VEGAS narrow domains" begin
     a = 10^16
@@ -34,6 +34,54 @@ using Test: @test, @testset
     @test warmed.integral_estimate ≈ 4.0 atol = 0.06
     @test result.adaptive_grid == grid
     @test a < warmed.adaptive_grid[2] < b
+end
+
+@testset "VEGAS rational bounds" begin
+    a = 10^16
+    options = (; nbins = 2, ncalls = 32, maxiter = 1, alpha = 0.0)
+    for (lo, hi, expected) in (((a + 1) // 1, (a + 12) // 1, 11.0), ((a + 12) // 1, (a + 1) // 1, -11.0))
+        result = vegas(Returns(1), [lo], [hi]; options...)
+        @test result.integral_estimate == expected
+        @test first(result.adaptive_grid) == lo
+        @test last(result.adaptive_grid) == hi
+        @test vegas(Returns(1), result; options...).integral_estimate == expected
+    end
+end
+
+@testset "VEGAS adapted grids require their stored precision" begin
+    lo, hi, previous = setprecision(BigFloat, 256) do
+        lo, hi = BigFloat(1), BigFloat(1) + BigFloat(2)^-80
+        Random.seed!(2518)
+        trained = vegas(x -> (x[1] - lo) / (hi - lo), [lo], [hi]; nbins = 4, ncalls = 256, maxiter = 2)
+        # The widths fit in 64 bits of precision even when coordinates need more.
+        spacing = (hi - lo) / 2^48
+        edges = lo .+ round.((trained.adaptive_grid .- lo) ./ spacing) .* spacing
+        previous = MonteCarloIntegration.VEGASResult(
+            trained.integral_estimate, trained.standard_deviation, trained.chi_squared_average,
+            edges, diff(edges; dims = 1),
+        )
+        (lo, hi, previous)
+    end
+    @test length(unique(previous.grid_spacing)) > 1
+    setprecision(BigFloat, 64) do
+        calls = Ref(0)
+        @test_throws ArgumentError vegas(_ -> (calls[] += 1), previous; ncalls = 64, maxiter = 1)
+        @test calls[] == 0
+        @test_throws ArgumentError MonteCarloIntegration.sample_from_adaptive_grid(previous, 64)
+    end
+    setprecision(BigFloat, 256) do
+        interior = BigFloat[]
+        Random.seed!(2519)
+        vegas(previous; ncalls = 64, maxiter = 1) do x
+            push!(interior, only(x))
+            return 1
+        end
+        points = MonteCarloIntegration.sample_from_adaptive_grid(previous, 64)
+        for coordinates in (interior, only.(points))
+            @test all(x -> lo < x < hi, coordinates)
+            @test length(unique(coordinates)) > 1
+        end
+    end
 end
 
 @testset "VEGAS warm start across BigFloat precisions" begin

@@ -16,14 +16,17 @@ trained.integral_estimate
 ```
 
 VEGAS uses `BigFloat` coordinates when integration bins approach the local
-spacing between representable `Float64` values or an integer bound cannot be
-represented as `Float64`. A matrix-batched integrand can accept both types by
-preserving the element type of its inputs.
+spacing between representable `Float64` values, a span overflows, an integer
+bound is rounded, or rounding the bounds materially changes the interval's
+span. A matrix-batched integrand can accept both types by preserving the
+element type of its inputs.
 
 ## Reuse the adaptive grid
 
 Pass a previous result to start a fresh estimate on the same bounds and grid.
 For example, reuse the Gaussian's grid to compute its second radial moment.
+When reusing or sampling a `BigFloat` grid, set the active precision to at
+least the largest precision stored in the grid's edges or widths.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))
@@ -38,6 +41,8 @@ single iteration with independent Jacobian-weighted samples, it is their sample
 standard deviation divided by the square root of the sample count. VEGAS uses
 inverse-variance weights when all iteration variances are positive. If any iteration
 has zero variance, it keeps every estimate with equal weight and also accounts
-for the scatter between iterations. A rare peak can
-escape every sample. Increase the budget and compare independent runs when the
-integral is dominated by a small region.
+for the scatter between iterations. Early stopping requires a positive standard
+error below both tolerances. While the error stays zero, VEGAS continues drawing
+samples up to the iteration limit. A rare peak can escape every sample. Increase
+the budget and compare independent runs when the integral is dominated by a small
+region.

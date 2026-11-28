@@ -3,10 +3,17 @@ function _check_vegas_batch(batch)
     throw(ArgumentError("batch must be false, true, or :matrix"))
 end
 
-function _evaluate!(weighted_values, func, xmat, batch)
+_apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
+
+function _apply_vegas_weight(weight, value, exponents, j)
+    mantissa, exponent = frexp(float(value))
+    return ldexp(weight * mantissa, exponents[j] + exponent)
+end
+
+function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
     if batch === false
         for (j, point) in enumerate(eachcol(xmat))
-            weighted_values[j] *= func(point)
+            weighted_values[j] = _apply_vegas_weight(weighted_values[j], func(point), exponents, j)
         end
         return weighted_values
     end
@@ -20,7 +27,7 @@ function _evaluate!(weighted_values, func, xmat, batch)
     ncalls = length(weighted_values)
     length(values) == ncalls || throw(DimensionMismatch("the integrand must return $ncalls values per batch"))
     for (j, value) in enumerate(values)
-        weighted_values[j] *= value
+        weighted_values[j] = _apply_vegas_weight(weighted_values[j], value, exponents, j)
     end
     return weighted_values
 end
@@ -43,7 +50,9 @@ end
 Integrate `f` over the same bounds as `previous`, starting from a copy of its
 adaptive grid. The estimate and uncertainty use only the samples from this
 call. The number of bins comes from the grid. If supplied, `nbins` must match
-that number. Other keywords have the same meaning as in [`vegas`](@ref).
+that number. Reusing a `BigFloat` grid requires active precision at least as
+high as the largest precision stored in its edges or widths. Other keywords
+have the same meaning as in [`vegas`](@ref).
 """
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)
     x, delx = _copy_vegas_grid(previous)
@@ -59,6 +68,7 @@ function _copy_vegas_grid(previous)
     nbins, ndim = size(widths)
     nbins > 0 && ndim > 0 && size(edges) == (nbins + 1, ndim) ||
         throw(ArgumentError("the previous grid must have one more edge than width per dimension"))
+    _check_grid_precision(edges, widths)
     T = _grid_coordinate_type(edges, widths)
     x, delx = Matrix{T}(edges), Matrix{T}(widths)
     all(isfinite, x) && all(isfinite, delx) ||
