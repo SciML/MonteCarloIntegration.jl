@@ -103,26 +103,52 @@ function _integrate_vegas(
     exponents = _vegas_jacobian_exponents(grid, widths, ncalls)
     estimates = _IterationMean[]
     errors = _IterationError[]
-    exact_means = exact_variances = nothing
+    history = _ExactHistory()
+    pending = maxiter > 1 && strata !== nothing ? _deferred_stratum_history(strata.counts, values) : nothing
+    extended = false
+    lowest = highest = 0.0
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
         _sample_vegas_iteration!(points, unit_points, bins, values, exponents, grid, widths, strata)
         _evaluate!(values, func, points, batch, exponents)
         estimate, stderr, exact_mean, exact_variance = isnothing(strata) ? _iteration_moments(values) : _stratified_estimate!(strata, values)
-        exact_means = _record_iteration_mean!(estimates, exact_means, estimate, exact_mean)
-        exact_variances = _record_iteration_variance!(errors, exact_variances, stderr, exact_variance)
+        if maxiter > 1
+            push!(estimates, estimate)
+            push!(errors, stderr)
+            lowest, highest = min(lowest, estimate.high), max(highest, estimate.high)
+            extended |= exact_mean !== nothing || exact_variance !== nothing || lowest < 0 < highest
+            if strata === nothing
+                if iter < maxiter || extended
+                    sample_mean, sample_variance = _sample_moments(values, estimate, stderr, exact_mean, exact_variance)
+                    push!(history.means, sample_mean)
+                    push!(history.variances, sample_variance)
+                end
+            elseif extended
+                _record_stratified_moments!(history, pending, strata.counts, values, iszero(stderr), exact_mean, exact_variance, true)
+            end
+        end
         adapt_grid = !iszero(stderr) && !iszero(alpha) && nbins > 1
         if adapt_grid
             training_weights = isnothing(strata) ? nothing : _stratified_training_weights!(strata)
             _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, proposed, training_weights)
         end
-        mean, error, chi_squared = _combine_estimates(estimates, errors, exact_means, exact_variances)
+        if maxiter == 1
+            mean = exact_mean === nothing ? _rounded_mean(estimate) : exact_mean
+            error = exact_variance === nothing ? _rounded_error(stderr) : exact_variance
+        elseif extended
+            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history)
+        else
+            mean, error, chi_squared = _combine_estimates(estimates, _RoundedIterationErrors(errors))
+        end
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(_rounded_error(error) / _rounded_mean(mean)))")
         if _meets_error_tolerances(error, mean, rtol, atol)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
         if !isnothing(strata) && iter < maxiter
+            if !extended
+                _record_stratified_moments!(history, pending, strata.counts, values, iszero(stderr), exact_mean, exact_variance, false)
+            end
             _redistribute_strata!(strata)
         end
         if exponents === nothing && adapt_grid && iter < maxiter

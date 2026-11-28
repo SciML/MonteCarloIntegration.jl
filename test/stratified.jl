@@ -499,6 +499,75 @@ using Test
         end
     end
 
+    @testset "Cross-iteration cancellation with unequal allocation" begin
+        magnitude = 2.0^100
+        function moments(cells)
+            means = map(cell -> sum(Rational{BigInt}, cell) / length(cell), cells)
+            variances = map(cells, means) do cell, mean
+                sum(value -> abs2(Rational{BigInt}(value) - mean), cell) / (length(cell) * (length(cell) - 1))
+            end
+            return sum(means) / 2, sum(variances) / 4
+        end
+        for tail in (1.0, 2.0^-100), direction in (-1, 1), batch in (false, true, :matrix)
+            first = ([magnitude, tail, 0.0, 0.0], zeros(4))
+            second = ([-1.5magnitude, 0.0, 0.0, 0.0, 0.0, 0.0], fill(tail, 2))
+            mean1, variance1 = moments(first)
+            mean2, variance2 = moments(second)
+            expected_mean = Float64(direction * (mean1 * variance2 + mean2 * variance1) / (variance1 + variance2))
+            expected_stderr = sqrt(Float64(variance1 * variance2 / (variance1 + variance2)))
+            expected_chi = Float64(abs2(mean1 - mean2) / (variance1 + variance2))
+            counts = zeros(Int, 2, 2)
+            calls = Ref(0)
+            function evaluate(point)
+                iteration = calls[] ÷ 8 + 1
+                cell = only(point) < 0.5 ? 1 : 2
+                counts[cell, iteration] += 1
+                calls[] += 1
+                return direction * (first, second)[iteration][cell][counts[cell, iteration]]
+            end
+            integrand = if batch === false
+                evaluate
+            elseif batch === true
+                points -> map(evaluate, points)
+            else
+                points -> map(evaluate, eachcol(points))
+            end
+            seed!(1)
+            result = vegas(integrand, [0.0], [1.0]; stratified = true, batch, maxiter = 2, ncalls = 8, nbins = 1, atol = 0.0, rtol = 0.0)
+            @test calls[] == 16
+            @test counts == [4 6; 4 2]
+            @test result.integral_estimate === expected_mean
+            @test result.standard_deviation ≈ expected_stderr rtol = 8eps(Float64)
+            @test result.chi_squared_average ≈ expected_chi rtol = 8eps(Float64)
+        end
+    end
+
+    @testset "Exact history after deferred samples fill the budget" begin
+        calls, positive_batches = 8192, 13
+        strata = calls ÷ 4
+        magnitude, tail = 2.0^100, 2.0^-100
+        batches = Ref(0)
+        seed!(1)
+        result = vegas(
+            [0.0], [1.0]; stratified = true, batch = :matrix, ncalls = calls, nbins = 1,
+            maxiter = positive_batches + 1, atol = 0.0, rtol = 0.0,
+        ) do points
+            batches[] += 1
+            last = batches[] > positive_batches
+            return map(eachcol(points)) do point
+                return if only(point) < 1 / strata
+                    last ? tail : 0.0
+                else
+                    last ? -positive_batches * magnitude : magnitude
+                end
+            end
+        end
+        @test batches[] == positive_batches + 1
+        @test result.integral_estimate === tail / (strata * (positive_batches + 1))
+        @test result.standard_deviation ≈ magnitude * (1 - 1 / strata)
+        @test iszero(result.chi_squared_average)
+    end
+
     @testset "Exact mean with one tiny stratum" begin
         q = nextfloat(0.0)
         ncalls, nstrata = 2048, 512

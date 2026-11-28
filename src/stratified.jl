@@ -143,18 +143,69 @@ end
 
 function _exact_stratum_moments(counts, values, exact_variance)
     exact_variance || return _exact_stratum_mean(counts, values), nothing
-    total = variance_total = big(0) // 1
+    groups = Dict{Int, Tuple{BigInt, BigInt, Int}}()
+    native_groups = Dict{Tuple{Int, Int}, Tuple{Int128, UInt128}}()
+    nstrata = length(counts)
     first = 1
     for count in counts
         last = first + count - 1
         cell = @view values[first:last]
-        mean, variance = _exact_binary64_moments(cell, count)
-        total += mean
-        variance_total += variance
+        # The bound leaves 106 bits for each squared binary64 significand.
+        native = count <= (1 << 11) && nstrata <= (1 << 22) ÷ count^2 ? _homogeneous_stratum_sums(cell) : nothing
+        if native === nothing
+            total, squares, exponent = _binary64_sums(cell)
+            _merge_stratum_moments!(groups, count, total, count * squares - abs2(total), exponent)
+        else
+            total, squares, exponent = native
+            variance = UInt128(count) * squares - abs2(UInt128(abs(total)))
+            key = (count, exponent)
+            group_sum, group_variance = get(native_groups, key, (Int128(0), UInt128(0)))
+            native_groups[key] = (group_sum + total, group_variance + variance)
+        end
         first = last + 1
     end
-    nstrata = length(counts)
+    for ((count, exponent), (total, variance)) in native_groups
+        _merge_stratum_moments!(groups, count, BigInt(total), BigInt(variance), exponent)
+    end
+    total = variance_total = big(0) // 1
+    for (count, (group_sum, group_variance, exponent)) in groups
+        total += _scaled_rational(group_sum, BigInt(count), exponent)
+        variance_total += _scaled_rational(group_variance, BigInt(count)^2 * (count - 1), 2exponent)
+    end
     return total / nstrata, variance_total / BigInt(nstrata)^2
+end
+
+function _homogeneous_stratum_sums(values)
+    exponent = (reinterpret(UInt64, first(values)) >> 52) & 0x07ff
+    leading = iszero(exponent) ? UInt64(0) : UInt64(1) << 52
+    total, squares = Int128(0), UInt128(0)
+    for value in values
+        word = reinterpret(UInt64, value)
+        (word >> 52) & 0x07ff == exponent || return nothing
+        significand = (word & 0x000fffffffffffff) | leading
+        total += signbit(value) ? -Int128(significand) : Int128(significand)
+        squares += widemul(significand, significand)
+    end
+    return total, squares, max(1, Int(exponent)) - 1075
+end
+
+function _merge_stratum_moments!(groups, count, total, variance, exponent)
+    previous = get(groups, count, nothing)
+    if previous === nothing
+        groups[count] = (total, variance, exponent)
+        return
+    end
+    group_sum, group_variance, group_exponent = previous
+    shift = exponent - group_exponent
+    if shift > 0
+        total <<= shift
+        variance <<= 2shift
+    elseif shift < 0
+        group_sum <<= -shift
+        group_variance <<= -2shift
+    end
+    groups[count] = (group_sum + total, group_variance + variance, min(group_exponent, exponent))
+    return
 end
 
 function _exact_stratum_mean(counts, values)
@@ -170,6 +221,54 @@ function _exact_stratum_mean(counts, values)
         first_index = last + 1
     end
     return numerator(total) // ((denominator(total) * length(counts)) << 1074)
+end
+
+struct _DeferredStratumIteration
+    counts::Vector{Int}
+    values::Vector{Float64}
+    zero_variance::Bool
+end
+
+struct _DeferredStratumHistory
+    iterations::Vector{_DeferredStratumIteration}
+    capacity::Int
+end
+
+function _deferred_stratum_history(counts, values)
+    capacity = (1 << 20) ÷ (sizeof(counts) + sizeof(values))
+    return _DeferredStratumHistory(_DeferredStratumIteration[], capacity)
+end
+
+function _stratified_sample_moments(counts, values, zero_variance, exact_mean = nothing, exact_variance = nothing)
+    exact_variance === nothing || return exact_mean, exact_variance
+    zero_variance || return _exact_stratum_moments(counts, values, true)
+    if exact_mean === nothing
+        total = big(0)
+        first = 1
+        for count in counts
+            total += _binary64_units(values[first])
+            first += count
+        end
+        exact_mean = _scaled_rational(total, BigInt(length(counts)), -1074)
+    end
+    return exact_mean, zero(Rational{BigInt})
+end
+
+function _record_stratified_moments!(history, pending, counts, values, zero_variance, exact_mean, exact_variance, need_exact)
+    if !need_exact && isempty(history.means) && length(pending.iterations) < pending.capacity
+        push!(pending.iterations, _DeferredStratumIteration(copy(counts), copy(values), zero_variance))
+        return
+    end
+    for saved in pending.iterations
+        mean, variance = _stratified_sample_moments(saved.counts, saved.values, saved.zero_variance)
+        push!(history.means, mean)
+        push!(history.variances, variance)
+    end
+    empty!(pending.iterations)
+    mean, variance = _stratified_sample_moments(counts, values, zero_variance, exact_mean, exact_variance)
+    push!(history.means, mean)
+    push!(history.variances, variance)
+    return
 end
 
 function _stratum_total(means, scale)
