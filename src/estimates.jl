@@ -51,13 +51,19 @@ function _iteration_estimate(values::Vector{_IterationMean})
     shifted(value) = value.high / scale - origin
     tail(value) = value.low / scale
     n = length(values)
-    offset = _compensated_sum(shifted, values) / n
-    low = _compensated_sum(tail, values) / n
+    offset, low = if mixed_signs
+        parts = Iterators.flatten(((shifted(v), tail(v)) for v in values))
+        _compensated_sum(identity, parts) / n, 0.0
+    else
+        _compensated_sum(shifted, values) / n, _compensated_sum(tail, values) / n
+    end
     high, correction = _two_sum(origin, offset)
     mean = scale * clamp(high + (correction + low), lo / scale, hi / scale)
-    if mixed_signs && any(
-            v -> (!iszero(v.high) && abs(v.high / scale) < floatmin(Float64)) ||
-                (!iszero(v.low) && abs(tail(v)) < floatmin(Float64)), values
+    if mixed_signs && (
+            abs(offset) <= 8eps(Float64) * n || any(
+                v -> (!iszero(v.high) && abs(v.high / scale) < floatmin(Float64)) ||
+                    (!iszero(v.low) && abs(tail(v)) < floatmin(Float64)), values
+            )
         )
         total = sum(v -> _binary64_units(v.high) + _binary64_units(v.low), values; init = big(0))
         mean = _round_binary64_units(total, n)
@@ -199,15 +205,19 @@ function _combine_extended_estimates(means, variances, history = nothing)
     if bounds !== nothing || !_small_odd_denominators(means, variances)
         return _combine_bounded_estimates(means, variances, history)
     end
-    weights = map(v -> iszero(v) ? v : inv(v), variances)
-    used = count(!iszero, weights)
-    n = length(weights)
+    return _combine_exact_estimates(means, variances)
+end
+
+function _combine_exact_estimates(means, variances, calculate_chi_squared = true)
+    used = count(!iszero, variances)
+    n = length(variances)
     n == 1 && return only(means), only(variances), 0.0
     chi_squared = 0.0
-    if used > 0
+    if used > 0 && (used == n || calculate_chi_squared)
+        weights = map(v -> iszero(v) ? v : inv(v), variances)
         total_weight = sum(weights)
         weighted_mean = sum(i -> weights[i] * means[i], eachindex(weights)) / total_weight
-        if used > 1
+        if used > 1 && calculate_chi_squared
             chi_squared = _rounded_rational(sum(i -> weights[i] * abs2(means[i] - weighted_mean), eachindex(weights)) / (used - 1))
         end
         used == n && return weighted_mean, inv(total_weight), chi_squared
@@ -337,7 +347,7 @@ function _centered_bounds(bounds::_CenteredSums, pivot)
     correction = _quotient_bounds(_squared_bounds(displacement), norm)
     return (
         (pivot + center[1], pivot + center[2]), norm,
-        (max(0, square[1] - correction[2]), max(0, square[2] - correction[1])),
+        (max(zero(square[1]), square[1] - correction[2]), max(zero(square[2]), square[2] - correction[1])),
     )
 end
 
@@ -395,13 +405,25 @@ end
 
 _midpoint(bounds) = (bounds[1] + bounds[2]) / 2
 
+const _BOUND_REFINEMENTS = (192, 384, 768, 1536, 3072, 6144)
+
+struct _BoundedIterationError
+    mean::NTuple{2, Rational{BigInt}}
+    variance::NTuple{2, Rational{BigInt}}
+    means::Vector{Rational{BigInt}}
+    variances::Vector{Rational{BigInt}}
+    bits::Int
+end
+
+_rounded_error(error::_BoundedIterationError) = _rounded_error(_midpoint(error.variance))
+
 function _combine_bounded_estimates(means, variances, history)
     length(variances) == 1 && return only(means), only(variances), 0.0
     previous = history === nothing ? nothing : history.bounds
     bounds = _update_bounds(previous, means, variances, previous === nothing ? 96 : previous.bits)
     mean, variance, chi_squared = _combination_bounds(bounds, means, variances)
     # Refine only when rounding at the two ends of an interval can differ.
-    for bits in (192, 384, 768, 1536, 3072, 6144)
+    for bits in _BOUND_REFINEMENTS
         bits <= bounds.bits && continue
         _rounded_rational(mean[1]) == _rounded_rational(mean[2]) &&
             _rounded_error(variance[1]) == _rounded_error(variance[2]) && break
@@ -410,7 +432,7 @@ function _combine_bounded_estimates(means, variances, history)
     end
     history === nothing || (history.bounds = bounds)
     chi = bounds.used > 1 ? _rounded_rational(_midpoint(chi_squared)) : 0.0
-    return _midpoint(mean), _midpoint(variance), chi
+    return _midpoint(mean), _BoundedIterationError(mean, variance, means, variances, bounds.bits), chi
 end
 
 function _rounded_error(variance::Rational{BigInt})
@@ -427,16 +449,72 @@ function _rounded_error(variance::Rational{BigInt})
     return ldexp(Float64(significand + round_up), shift - 1074)
 end
 
-_meets_error_tolerances(error::Float64, mean, rtol, atol) =
-    0.0 < error < atol && error < rtol * abs(mean)
+function _meets_error_tolerances(error::Float64, mean, rtol, atol)
+    isfinite(error) && error > 0 && atol > 0 && rtol > 0 && !iszero(mean) || return false
+    if rtol isa Float64 && atol isa Float64 && mean isa Float64
+        error < atol || return false
+        relative = rtol * abs(mean)
+        error == relative || return error < relative
+    end
+    return _meets_error_tolerances(abs2(Rational{BigInt}(error)), mean, rtol, atol)
+end
 
 _rational_tolerance(x::Union{Integer, Rational, AbstractFloat}) = Rational{BigInt}(x)
 _rational_tolerance(x) = Rational{BigInt}(Float64(x))
 
+_variance_below(variance, tolerance, magnitude) =
+    variance < abs2(_rational_tolerance(tolerance) * magnitude)
+
+function _variance_below(variance, tolerance::BigFloat, magnitude)
+    iszero(variance) && return true
+    ratio = isone(magnitude) ? variance : variance / abs2(magnitude)
+    num, den = numerator(ratio), denominator(ratio)
+    exponent_bound = fld(ndigits(num; base = 2) - ndigits(den; base = 2), 2)
+    binade = exponent(tolerance)
+    binade > exponent_bound && return true
+    binade < exponent_bound - 1 && return false
+    # Find the greatest point on the tolerance's binary lattice below or at sqrt(ratio).
+    bits = precision(tolerance)
+    step = binade + 1 - bits
+    units = step < 0 ? div(num << (-2step), den) : div(num, den << (2step))
+    significand = isqrt(units)
+    boundary = BigFloat(_binary_rational(significand, step), RoundNearest; precision = max(bits, ndigits(significand; base = 2)))
+    return tolerance > boundary
+end
+
 function _meets_error_tolerances(variance::Rational{BigInt}, mean, rtol, atol)
     variance > 0 && atol > 0 && rtol > 0 && !iszero(mean) || return false
-    isinf(rtol) || variance < abs2(_rational_tolerance(rtol) * Rational{BigInt}(mean)) || return false
-    return isinf(atol) || variance < abs2(_rational_tolerance(atol))
+    isinf(rtol) || _variance_below(variance, rtol, Rational{BigInt}(mean)) || return false
+    return isinf(atol) || _variance_below(variance, atol, 1)
+end
+
+function _certify_error_tolerances(variance, mean, rtol, atol)
+    lower, upper = variance
+    upper > 0 || return false
+    largest = max(abs(mean[1]), abs(mean[2]))
+    iszero(largest) && return false
+    isinf(rtol) || _variance_below(lower, rtol, largest) || return false
+    isinf(atol) || _variance_below(lower, atol, 1) || return false
+    lower > 0 && (mean[2] < 0 || mean[1] > 0) || return nothing
+    smallest = min(abs(mean[1]), abs(mean[2]))
+    isinf(rtol) || _variance_below(upper, rtol, smallest) || return nothing
+    isinf(atol) || _variance_below(upper, atol, 1) || return nothing
+    return true
+end
+
+function _meets_error_tolerances(error::_BoundedIterationError, mean, rtol, atol)
+    rtol > 0 && atol > 0 || return false
+    decision = _certify_error_tolerances(error.variance, error.mean, rtol, atol)
+    decision === nothing || return decision
+    for bits in _BOUND_REFINEMENTS
+        bits <= error.bits && continue
+        bounds = _update_bounds(nothing, error.means, error.variances, bits)
+        mean, variance, _ = _combination_bounds(bounds, error.means, error.variances)
+        decision = _certify_error_tolerances(variance, mean, rtol, atol)
+        decision === nothing || return decision
+    end
+    mean, variance, _ = _combine_exact_estimates(error.means, error.variances, false)
+    return _meets_error_tolerances(variance, mean, rtol, atol)
 end
 
 function _combine_estimates(estimates, errors)

@@ -494,6 +494,118 @@ end
     end
 end
 
+@testset "VEGAS cancellation and stopping boundaries" begin
+    function integrate_batches(batches; rtol = 0.0, atol = 0.0)
+        calls = Ref(0)
+        result = vegas(
+            _ -> batches[calls[] += 1], [0.0], [1.0];
+            nbins = 1, ncalls = 4, maxiter = length(batches),
+            batch = :matrix, alpha = 0.0, rtol, atol,
+        )
+        return result, calls[]
+    end
+
+    function reference_history(batches)
+        moments = map(batches) do batch
+            values = Rational{BigInt}.(batch)
+            mean = sum(values) / 4
+            return mean, sum(v -> abs2(v - mean), values) / 12
+        end
+        return map(eachindex(moments)) do n
+            means = first.(moments[1:n])
+            variances = last.(moments[1:n])
+            if any(iszero, variances)
+                mean = sum(means) / n
+                scatter = n == 1 ? zero(mean) : sum(m -> abs2(m - mean), means) / n / (n - 1)
+                return mean, max(scatter, sum(variances) / n / n)
+            end
+            weights = inv.(variances)
+            return sum(weights .* means) / sum(weights), inv(sum(weights))
+        end
+    end
+
+    cancellation = (
+        [prevfloat(1.0), prevfloat(1.0), 1.0, 1.0],
+        fill(-1.0, 4), fill(2.0^-54, 4), fill(2.0^-110, 4),
+    )
+    for batches in (cancellation, reverse(cancellation)), scale in (1.0, -1.0, 2.0^200)
+        result, calls = integrate_batches(map(batch -> scale .* batch, batches))
+        @test result.integral_estimate == scale * 2.0^-112
+        @test calls == 4
+    end
+
+    q = nextfloat(0.0)
+    for (seed, side) in ((2028, -1), (2027, 1))
+        rng = Random.MersenneTwister(seed)
+        draws = [q .* rand(rng, (10^11):(10^12), 4) for _ in 1:5]
+        for batches in (draws, reverse(draws)), relative in (false, true)
+            history = reference_history(batches)
+            tolerance, expected = setprecision(BigFloat, 1024) do
+                mean, variance = history[4]
+                target = sqrt(BigFloat(variance))
+                relative && (target /= abs(BigFloat(mean)))
+                tolerance = target * (1 + side * ldexp(BigFloat(1), -200))
+                exact = Rational{BigInt}(tolerance)
+                index = findfirst(history) do (mean, variance)
+                    variance < abs2(exact * (relative ? mean : 1))
+                end
+                return tolerance, something(index, length(batches))
+            end
+            for bits in (24, 1024)
+                _, calls = setprecision(BigFloat, bits) do
+                    relative ? integrate_batches(batches; rtol = tolerance, atol = Inf) :
+                        integrate_batches(batches; rtol = Inf, atol = tolerance)
+                end
+                @test calls == expected
+            end
+        end
+    end
+
+    rng = Random.MersenneTwister(706)
+    delta = 2.0^46 * q
+    equality = [zeros(4)]
+    for i in 2:8
+        spread = rand(rng, (10^11):(10^12)) * q
+        center = i == 8 ? 8delta : 0.0
+        push!(equality, center .+ [-spread, -spread, spread, spread])
+    end
+    _, variance = reference_history(equality)[8]
+    @test variance == Rational{BigInt}(delta)^2
+    for relative in (false, true)
+        batches = [equality; [fill(relative ? 8delta : 0.0, 4)]]
+        exact = relative ? one(Rational{BigInt}) : Rational{BigInt}(delta)
+        tolerances = (exact, BigFloat(exact; precision = 1024))
+        for tolerance in tolerances
+            _, calls = setprecision(BigFloat, 24) do
+                relative ? integrate_batches(batches; rtol = tolerance, atol = Inf) :
+                    integrate_batches(batches; rtol = Inf, atol = tolerance)
+            end
+            @test calls == 9
+        end
+    end
+
+    draws = [q .* rand(rng, (10^11):(10^12), 4) for _ in 1:5]
+    for (power, expected) in ((-100_000, 5), (100_000, 1)), relative in (false, true)
+        tolerance = ldexp(BigFloat(1), power)
+        _, calls = relative ? integrate_batches(draws; rtol = tolerance, atol = Inf) :
+            integrate_batches(draws; rtol = Inf, atol = tolerance)
+        @test calls == expected
+    end
+
+    # The inverse variances sum to 16, but their normalized ratio is not dyadic.
+    unequal_variances = [big(4) // 9, big(4) // 55]
+    for sign in (-1, 1), variances in (unequal_variances, reverse(unequal_variances))
+        means = fill(big(sign) // 1, 2)
+        mean, error, _ = MonteCarloIntegration._combine_bounded_estimates(means, variances, nothing)
+        @test mean == sign
+        @test MonteCarloIntegration._rounded_error(error) == 0.25
+        for tolerance in (big(1) // 4, BigFloat(0.25; precision = 1024))
+            @test !MonteCarloIntegration._meets_error_tolerances(error, mean, tolerance, Inf)
+            @test !MonteCarloIntegration._meets_error_tolerances(error, mean, Inf, tolerance)
+        end
+    end
+end
+
 @testset "VEGAS warm starts with low-precision bounds" begin
     options = (; nbins = 3, ncalls = 32, maxiter = 1)
     previous = vegas(Returns(0), Float32[0], Float32[1]; options...)
