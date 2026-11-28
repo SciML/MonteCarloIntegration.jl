@@ -33,6 +33,24 @@ using MonteCarloIntegration, Random, Test
     end
 end
 
+@testset "Wide means on both sides of a rounding midpoint" begin
+    options = (; batch = true, nbins = 1, alpha = 0.0, rtol = 0.0, atol = 0.0)
+    for sign in (-1, 1), units in (3, 4, 5, 6)
+        values = sign .* [1.0; prevfloat(2.0^-53); fill(2.0^-108, units); zeros(6 - units)]
+        expected = Float64(sum(Rational{BigInt}, values) / length(values))
+        @test expected == sign * (units > 4 ? nextfloat(0.125) : 0.125)
+        for ordered in (values, reverse(values))
+            for iterations in (1, 2)
+                result = vegas(Returns(ordered), [0.0], [1.0]; options..., ncalls = 8, maxiter = iterations)
+                @test result.integral_estimate == expected
+            end
+            iteration = Ref(0)
+            combined = vegas(_ -> fill(ordered[iteration[] += 1], 2), [0.0], [1.0]; options..., ncalls = 2, maxiter = 8)
+            @test combined.integral_estimate == expected
+        end
+    end
+end
+
 @testset "Variance of the integral estimate" begin
     for scale in (1.0, 1.0e-240, 1.0e240)
         samples = scale .* [1, 2, 3, 4]

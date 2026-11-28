@@ -1,12 +1,13 @@
 function _compensated_parts(f, values)
-    total = correction = 0.0
+    total = correction = largest_correction = 0.0
     for value in values
         term = f(value)
         next = total + term
         correction += abs(total) >= abs(term) ? (total - next) + term : (term - next) + total
+        largest_correction = max(largest_correction, abs(correction))
         total = next
     end
-    return total, correction
+    return total, correction, largest_correction
 end
 
 function _compensated_sum(f::F, values) where {F}
@@ -15,19 +16,26 @@ function _compensated_sum(f::F, values) where {F}
 end
 
 function _compensated_average(f::F, values, n) where {F}
-    sum, correction = _compensated_parts(f, values)
+    sum, correction, largest_correction = _compensated_parts(f, values)
     total, tail = _two_sum(sum, correction)
     average = total / n
-    return _two_sum(average, (fma(-average, Float64(n), total) + tail) / n)
+    residual = fma(-average, Float64(n), total)
+    numerator = residual + tail
+    adjustment = numerator / n
+    high, low = _two_sum(average, adjustment)
+    # At most two summands per observation contribute rounding error to the
+    # correction. The bound also covers the residual, division and subnormal scaling.
+    radius = 8eps(max(largest_correction, abs(residual), abs(numerator), abs(adjustment)))
+    return high, low, radius
 end
 
 # Sterbenz's lemma makes subtraction of the first value exact throughout this range.
 _can_center(lo, hi) = 0 < hi / 2 <= lo || hi <= lo / 2 < 0
 
-function _at_rounding_midpoint(value, tail)
-    iszero(tail) && return false
-    spacing = tail > 0 ? nextfloat(value) - value : value - prevfloat(value)
-    return 2abs(tail) == spacing
+function _uncertain_rounding(value, tail, radius)
+    upper = (nextfloat(value) - value) / 2 - tail
+    lower = (value - prevfloat(value)) / 2 + tail
+    return min(lower, upper) <= radius
 end
 
 function _exact_power_of_two_average(values, scale)
@@ -85,15 +93,15 @@ function _iteration_estimate(values::Vector{_IterationMean})
     shifted(value) = value.high / scale - origin
     tail(value) = value.low / scale
     n = length(values)
-    offset, low = if iszero(origin)
+    offset, low, radius = if iszero(origin)
         parts = Iterators.flatten(((shifted(v), tail(v)) for v in values))
         _compensated_average(identity, parts, n)
     else
-        _compensated_sum(shifted, values) / n, _compensated_sum(tail, values) / n
+        _compensated_sum(shifted, values) / n, _compensated_sum(tail, values) / n, 0.0
     end
     high, correction = _two_sum(origin, offset)
     mean = scale * clamp(high + (correction + low), lo / scale, hi / scale)
-    midpoint = iszero(origin) && _at_rounding_midpoint(high, correction + low)
+    midpoint = iszero(origin) && _uncertain_rounding(high, correction + low, radius)
     cancellation = mixed_signs && (
         abs(offset) <= 8eps(Float64) * n || any(
             v -> (!iszero(v.high) && abs(v.high / scale) < floatmin(Float64)) ||
@@ -130,7 +138,7 @@ function _iteration_moments(values, preserve_mean = true)
     origin = _can_center(lo, hi) ? first(values) / scale : 0.0
     n = length(values)
     shifted(v) = v / scale - origin
-    offset, adjustment = iszero(origin) ? _compensated_average(shifted, values, n) : (sum(shifted, values) / n, 0.0)
+    offset, adjustment, radius = iszero(origin) ? _compensated_average(shifted, values, n) : (sum(shifted, values) / n, 0.0, 0.0)
     residual = sum(v -> abs2(shifted(v) - offset), values)
     error = _scaled_error(sqrt(residual / n / (n - 1)), shift)
     if preserve_mean && _needs_extended_error(error)
@@ -142,7 +150,7 @@ function _iteration_moments(values, preserve_mean = true)
     mean = scale * bounded
     tail = preserve_mean && bounded == high ? scale * low : 0.0
     cancellation = mixed_signs && abs(offset) <= 8eps(Float64) * n
-    midpoint = iszero(origin) && _at_rounding_midpoint(high, low) &&
+    midpoint = iszero(origin) && _uncertain_rounding(high, low, radius) &&
         !_exact_power_of_two_average(values, scale)
     if midpoint || cancellation || (preserve_mean && (abs(mean) <= floatmin(Float64) || (!iszero(low) && abs(tail) < floatmin(Float64))))
         total = _binary64_sum_units(values)
