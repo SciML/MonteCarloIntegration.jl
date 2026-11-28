@@ -644,8 +644,18 @@ end
     edges = reshape(Float64[i * width for i in 0:3], :, 1)
     widths = fill(Float64(width), 3, 1)
     historical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
-    reused = vegas(Returns(1), historical; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
-    @test reused.integral_estimate ≈ 1.0
+    visits = zeros(Int, length(widths))
+    Random.seed!(22)
+    reused = vegas(historical; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0) do x
+        cell = min(searchsortedlast(vec(edges), only(x)), length(visits))
+        visits[cell] += 1
+        return 1
+    end
+    # Float32-rounded edges give each visited bin its own sampling Jacobian.
+    spans = diff(vec(edges))
+    @test sum(spans) == 1.0
+    @test all(>(0), visits) && sum(visits) == options.ncalls
+    @test reused.integral_estimate == length(visits) * sum(visits .* spans) / options.ncalls
     @test edges[2] == Float64(width)
     @test reused.adaptive_grid == edges
     @test reused.grid_spacing == diff(edges; dims = 1)

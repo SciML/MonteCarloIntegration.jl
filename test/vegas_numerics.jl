@@ -1,5 +1,38 @@
 using MonteCarloIntegration, Random, Test
 
+@testset "Wide same-sign samples and iteration means" begin
+    samples = [2.0^54; zeros(1023); ones(7168)]
+    for sign in (-1, 1), ordered in (samples, reverse(samples))
+        values = sign .* ordered
+        expected = sum(Rational{BigInt}, values) / length(values)
+        result = vegas(Returns(values), [0.0], [1.0]; batch = true, nbins = 2, ncalls = length(values), maxiter = 1, alpha = 0)
+        @test result.integral_estimate == Float64(expected)
+    end
+
+    batches = [2.0^54; ones(7)]
+    for sign in (-1, 1), ordered in (batches, reverse(batches))
+        values = sign .* ordered
+        iteration = Ref(0)
+        f = _ -> fill(values[iteration[] += 1], 2)
+        result = vegas(f, [0.0], [1.0]; batch = true, nbins = 1, ncalls = 2, maxiter = length(values), alpha = 0, rtol = 0, atol = 0)
+        @test iteration[] == length(values)
+        @test result.integral_estimate == Float64(sum(Rational{BigInt}, values) / length(values))
+    end
+
+    for sign in (-1, 1), tiny in (0.0, 2.0^-200, nextfloat(0.0))
+        values = sign .* [1.0, 2.0^-53, tiny, 0.0]
+        expected = sign * (iszero(tiny) ? 0.25 : nextfloat(0.25))
+        for ordered in (values, reverse(values))
+            result = vegas(Returns(ordered), [0.0], [1.0]; batch = true, nbins = 1, ncalls = 4, maxiter = 1)
+            @test result.integral_estimate == expected
+            iteration = Ref(0)
+            f = _ -> fill(ordered[iteration[] += 1], 2)
+            combined = vegas(f, [0.0], [1.0]; batch = true, nbins = 1, ncalls = 2, maxiter = 4, rtol = 0, atol = 0)
+            @test combined.integral_estimate == expected
+        end
+    end
+end
+
 @testset "Variance of the integral estimate" begin
     for scale in (1.0, 1.0e-240, 1.0e240)
         samples = scale .* [1, 2, 3, 4]

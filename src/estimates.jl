@@ -1,4 +1,4 @@
-function _compensated_sum(f, values)
+function _compensated_parts(f, values)
     total = correction = 0.0
     for value in values
         term = f(value)
@@ -6,7 +6,41 @@ function _compensated_sum(f, values)
         correction += abs(total) >= abs(term) ? (total - next) + term : (term - next) + total
         total = next
     end
-    return total + correction
+    return total, correction
+end
+
+function _compensated_sum(f::F, values) where {F}
+    total, tail = _compensated_parts(f, values)
+    return total + tail
+end
+
+function _compensated_average(f::F, values, n) where {F}
+    sum, correction = _compensated_parts(f, values)
+    total, tail = _two_sum(sum, correction)
+    average = total / n
+    return _two_sum(average, (fma(-average, Float64(n), total) + tail) / n)
+end
+
+# Sterbenz's lemma makes subtraction of the first value exact throughout this range.
+_can_center(lo, hi) = 0 < hi / 2 <= lo || hi <= lo / 2 < 0
+
+function _at_rounding_midpoint(value, tail)
+    iszero(tail) && return false
+    spacing = tail > 0 ? nextfloat(value) - value : value - prevfloat(value)
+    return 2abs(tail) == spacing
+end
+
+function _exact_power_of_two_average(values, scale)
+    ispow2(length(values)) || return false
+    total = correction = 0.0
+    for value in values
+        term = value / scale
+        term * scale == value || return false
+        total, residual = _two_sum(total, term)
+        correction, lost = _two_sum(correction, residual)
+        iszero(lost) || return false
+    end
+    return true
 end
 
 struct _IterationError
@@ -47,24 +81,26 @@ function _iteration_estimate(values::Vector{_IterationMean})
     iszero(magnitude) && return 0.0, 0.0
     scale = ldexp(1.0, exponent(magnitude))
     mixed_signs = lo < 0 < hi
-    origin = mixed_signs ? 0.0 : first(values).high / scale
+    origin = _can_center(lo, hi) ? first(values).high / scale : 0.0
     shifted(value) = value.high / scale - origin
     tail(value) = value.low / scale
     n = length(values)
-    offset, low = if mixed_signs
+    offset, low = if iszero(origin)
         parts = Iterators.flatten(((shifted(v), tail(v)) for v in values))
-        _compensated_sum(identity, parts) / n, 0.0
+        _compensated_average(identity, parts, n)
     else
         _compensated_sum(shifted, values) / n, _compensated_sum(tail, values) / n
     end
     high, correction = _two_sum(origin, offset)
     mean = scale * clamp(high + (correction + low), lo / scale, hi / scale)
-    if mixed_signs && (
-            abs(offset) <= 8eps(Float64) * n || any(
-                v -> (!iszero(v.high) && abs(v.high / scale) < floatmin(Float64)) ||
-                    (!iszero(v.low) && abs(tail(v)) < floatmin(Float64)), values
-            )
+    midpoint = iszero(origin) && _at_rounding_midpoint(high, correction + low)
+    cancellation = mixed_signs && (
+        abs(offset) <= 8eps(Float64) * n || any(
+            v -> (!iszero(v.high) && abs(v.high / scale) < floatmin(Float64)) ||
+                (!iszero(v.low) && abs(tail(v)) < floatmin(Float64)), values
         )
+    )
+    if midpoint || cancellation
         total = sum(v -> _binary64_units(v.high) + _binary64_units(v.low), values; init = big(0))
         mean = _round_binary64_units(total, n)
     end
@@ -91,25 +127,30 @@ function _iteration_moments(values, preserve_mean = true)
     shift = exponent(magnitude)
     scale = ldexp(1.0, shift)
     mixed_signs = lo < 0 < hi
-    origin = mixed_signs ? 0.0 : first(values) / scale
+    origin = _can_center(lo, hi) ? first(values) / scale : 0.0
     n = length(values)
     shifted(v) = v / scale - origin
-    offset = (mixed_signs ? _compensated_sum(shifted, values) : sum(shifted, values)) / n
+    offset, adjustment = iszero(origin) ? _compensated_average(shifted, values, n) : (sum(shifted, values) / n, 0.0)
     residual = sum(v -> abs2(shifted(v) - offset), values)
     error = _scaled_error(sqrt(residual / n / (n - 1)), shift)
     if preserve_mean && _needs_extended_error(error)
         mean, variance = _exact_binary64_moments(values, n)
         return _IterationMean(_rounded_rational(mean), 0.0), error, mean, variance
     end
-    high, low = _two_sum(origin, offset)
+    high, low = iszero(origin) ? (offset, adjustment) : _two_sum(origin, offset)
     bounded = clamp(high, lo / scale, hi / scale)
     mean = scale * bounded
     tail = preserve_mean && bounded == high ? scale * low : 0.0
     cancellation = mixed_signs && abs(offset) <= 8eps(Float64) * n
-    if cancellation || (preserve_mean && (abs(mean) <= floatmin(Float64) || (!iszero(low) && abs(tail) < floatmin(Float64))))
+    midpoint = iszero(origin) && _at_rounding_midpoint(high, low) &&
+        !_exact_power_of_two_average(values, scale)
+    if midpoint || cancellation || (preserve_mean && (abs(mean) <= floatmin(Float64) || (!iszero(low) && abs(tail) < floatmin(Float64))))
         total = _binary64_sum_units(values)
         rounded = _round_binary64_units(total, n)
         preserve_mean || return _IterationMean(rounded, 0.0), error, nothing, nothing
+        if midpoint && rounded == mean && total == n * (_binary64_units(mean) + _binary64_units(tail))
+            return _IterationMean(mean, tail), error, nothing, nothing
+        end
         exact = total // (BigInt(n) << 1074)
         exact == Rational{BigInt}(rounded) && return _IterationMean(rounded, 0.0), error, nothing, nothing
         return _IterationMean(rounded, 0.0), error, exact, nothing
@@ -561,7 +602,7 @@ function _inverse_variance_estimate(estimates, errors, used)
     min_error = minimum(e -> iszero(e) ? Inf : e, errors)
     weight_sum = sum(e -> iszero(e) ? 0.0 : abs2(min_error / e), errors)
     lo, hi = extrema(_rounded_mean, estimates)
-    origin = (0 < hi / 2 <= lo || hi <= lo / 2 < 0) ? _rounded_mean(first(estimates)) : 0.0
+    origin = _can_center(lo, hi) ? _rounded_mean(first(estimates)) : 0.0
     offset = _compensated_sum(eachindex(errors)) do i
         iszero(errors[i]) && return 0.0
         ratio = min_error / errors[i]
