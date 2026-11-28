@@ -285,31 +285,33 @@ function _sample_moments(values, estimate, stderr, exact_mean, exact_variance)
     return _exact_binary64_moments(values, length(values))
 end
 
-function _combine_extended_estimates(means, variances, history = nothing)
+function _combine_extended_estimates(means, variances, history = nothing; equal_weights = false)
     bounds = history === nothing ? nothing : history.bounds
     if bounds !== nothing || !_small_odd_denominators(means, variances)
-        return _combine_bounded_estimates(means, variances, history)
+        return _combine_bounded_estimates(means, variances, history; equal_weights)
     end
-    return _combine_exact_estimates(means, variances)
+    return _combine_exact_estimates(means, variances; equal_weights)
 end
 
-function _combine_exact_estimates(means, variances, calculate_chi_squared = true)
+function _combine_exact_estimates(means, variances, calculate_chi_squared = true; equal_weights = false)
     used = count(!iszero, variances)
     n = length(variances)
     n == 1 && return only(means), only(variances), 0.0
     chi_squared = 0.0
-    if used > 0 && (used == n || calculate_chi_squared)
+    inverse_variance = used == n && !equal_weights
+    if used > 0 && (inverse_variance || calculate_chi_squared)
         weights = map(v -> iszero(v) ? v : inv(v), variances)
         total_weight = sum(weights)
         weighted_mean = sum(i -> weights[i] * means[i], eachindex(weights)) / total_weight
         if used > 1 && calculate_chi_squared
             chi_squared = _rounded_rational(sum(i -> weights[i] * abs2(means[i] - weighted_mean), eachindex(weights)) / (used - 1))
         end
-        used == n && return weighted_mean, inv(total_weight), chi_squared
+        inverse_variance && return weighted_mean, inv(total_weight), chi_squared
     end
     mean = sum(means) / n
-    scatter = sum(m -> abs2(m - mean), means) / n / (n - 1)
     within = sum(variances) / n / n
+    equal_weights && return mean, within, chi_squared
+    scatter = sum(m -> abs2(m - mean), means) / n / (n - 1)
     return mean, max(scatter, within), chi_squared
 end
 
@@ -426,7 +428,7 @@ function _centered_bounds(bounds::_CenteredSums, pivot)
     )
 end
 
-function _update_bounds(previous, means, variances, bits)
+function _update_bounds(previous, means, variances, bits, equal_weights)
     n = length(means)
     old = previous === nothing || previous.bits != bits ?
         _BoundedHistory(0, 0, 0, bits, _CenteredSums(), _CenteredSums(), _BinarySumBounds()) : previous
@@ -450,8 +452,8 @@ function _update_bounds(previous, means, variances, bits)
         end
     end
     uniform, within = old.uniform, old.within
-    if used < n
-        first_unweighted = old.used == old.count ? 1 : start
+    if equal_weights || used < n
+        first_unweighted = !equal_weights && old.used == old.count ? 1 : start
         uniform = _accumulate_centered(uniform, means, nothing, first(means), nothing, bits, first_unweighted)
         for i in first_unweighted:n
             within = _add_binary_bounds(within, variances[i], bits)
@@ -460,7 +462,7 @@ function _update_bounds(previous, means, variances, bits)
     return _BoundedHistory(n, used, pivot, bits, weighted, uniform, within)
 end
 
-function _combination_bounds(bounds, means, variances)
+function _combination_bounds(bounds, means, variances, equal_weights)
     (; used, pivot) = bounds
     n = bounds.count
     chi_squared = (0, 0)
@@ -470,10 +472,11 @@ function _combination_bounds(bounds, means, variances)
         if used > 1
             chi_squared = scatter[1] / scale / (used - 1), scatter[2] / scale / (used - 1)
         end
-        used == n && return mean, (scale / norm[2], scale / norm[1]), chi_squared
+        used == n && !equal_weights && return mean, (scale / norm[2], scale / norm[1]), chi_squared
     end
     mean, _, scatter = _centered_bounds(bounds.uniform, first(means))
     a, b = _rational_bounds(bounds.within)
+    equal_weights && return mean, (a / n / n, b / n / n), chi_squared
     variance = max(scatter[1] / n / (n - 1), a / n / n), max(scatter[2] / n / (n - 1), b / n / n)
     return mean, variance, chi_squared
 end
@@ -488,26 +491,28 @@ struct _BoundedIterationError
     means::Vector{Rational{BigInt}}
     variances::Vector{Rational{BigInt}}
     bits::Int
+    equal_weights::Bool
 end
 
 _rounded_error(error::_BoundedIterationError) = _rounded_error(_midpoint(error.variance))
 
-function _combine_bounded_estimates(means, variances, history)
+function _combine_bounded_estimates(means, variances, history; equal_weights = false)
     length(variances) == 1 && return only(means), only(variances), 0.0
     previous = history === nothing ? nothing : history.bounds
-    bounds = _update_bounds(previous, means, variances, previous === nothing ? 96 : previous.bits)
-    mean, variance, chi_squared = _combination_bounds(bounds, means, variances)
+    bounds = _update_bounds(previous, means, variances, previous === nothing ? 96 : previous.bits, equal_weights)
+    mean, variance, chi_squared = _combination_bounds(bounds, means, variances, equal_weights)
     # Refine only when rounding at the two ends of an interval can differ.
     for bits in _BOUND_REFINEMENTS
         bits <= bounds.bits && continue
         _rounded_rational(mean[1]) == _rounded_rational(mean[2]) &&
             _rounded_error(variance[1]) == _rounded_error(variance[2]) && break
-        bounds = _update_bounds(nothing, means, variances, bits)
-        mean, variance, chi_squared = _combination_bounds(bounds, means, variances)
+        bounds = _update_bounds(nothing, means, variances, bits, equal_weights)
+        mean, variance, chi_squared = _combination_bounds(bounds, means, variances, equal_weights)
     end
     history === nothing || (history.bounds = bounds)
     chi = bounds.used > 1 ? _rounded_rational(_midpoint(chi_squared)) : 0.0
-    return _midpoint(mean), _BoundedIterationError(mean, variance, means, variances, bounds.bits), chi
+    error = _BoundedIterationError(mean, variance, means, variances, bounds.bits, equal_weights)
+    return _midpoint(mean), error, chi
 end
 
 function _rounded_error(variance::Rational{BigInt})
@@ -532,6 +537,19 @@ function _meets_error_tolerances(error::Float64, mean, rtol, atol)
         error == relative || return error < relative
     end
     return _meets_error_tolerances(abs2(Rational{BigInt}(error)), mean, rtol, atol)
+end
+
+# Rounding in the Float64 stratified error and mean stays within `slack`, relative to the
+# error and to the largest sample, and grows at most linearly with the terms summed.
+function _ambiguous_stop(error, mean, largest, terms, rtol, atol)
+    slack = 4eps(Float64) * terms
+    low_error, high_error = prevfloat(error * (1 - slack)), nextfloat(error * (1 + slack))
+    # A rational mean mixed with Float64 would round to the caller's BigFloat precision.
+    magnitude = abs(_rounded_mean(mean))
+    low_mean = max(prevfloat(magnitude - slack * largest), 0.0)
+    high_mean = min(nextfloat(magnitude + slack * largest), largest)
+    return _meets_error_tolerances(low_error, high_mean, rtol, atol) &&
+        !_meets_error_tolerances(high_error, low_mean, rtol, atol)
 end
 
 _rational_tolerance(x::Union{Integer, Rational, AbstractFloat}) = Rational{BigInt}(x)
@@ -583,26 +601,26 @@ function _meets_error_tolerances(error::_BoundedIterationError, mean, rtol, atol
     decision === nothing || return decision
     for bits in _BOUND_REFINEMENTS
         bits <= error.bits && continue
-        bounds = _update_bounds(nothing, error.means, error.variances, bits)
-        mean, variance, _ = _combination_bounds(bounds, error.means, error.variances)
+        bounds = _update_bounds(nothing, error.means, error.variances, bits, error.equal_weights)
+        mean, variance, _ = _combination_bounds(bounds, error.means, error.variances, error.equal_weights)
         decision = _certify_error_tolerances(variance, mean, rtol, atol)
         decision === nothing || return decision
     end
-    mean, variance, _ = _combine_exact_estimates(error.means, error.variances, false)
+    mean, variance, _ = _combine_exact_estimates(error.means, error.variances, false; error.equal_weights)
     return _meets_error_tolerances(variance, mean, rtol, atol)
 end
 
-function _combine_estimates(estimates, errors)
+function _combine_estimates(estimates, errors; equal_weights = false)
     n = length(errors)
     n == 1 && return _rounded_mean(first(estimates)), first(errors), 0.0
     used = count(!iszero, errors)
-    if used < n
+    if equal_weights || used < n
         mean, scatter = _iteration_estimate(estimates)
         scale = maximum(errors)
-        iszero(scale) && return mean, scatter, 0.0
+        iszero(scale) && return mean, equal_weights ? 0.0 : scatter, 0.0
         within = scale * (sqrt(sum(e -> abs2(e / scale), errors)) / n)
         _, _, chi_squared = _inverse_variance_estimate(estimates, errors, used)
-        return mean, max(scatter, within), chi_squared
+        return mean, equal_weights ? within : max(scatter, within), chi_squared
     end
     return _inverse_variance_estimate(estimates, errors, used)
 end

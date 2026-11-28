@@ -12,11 +12,12 @@ end
 
 include("estimates.jl")
 include("grid.jl")
+include("stratified.jl")
 
 """
     vegas(f, lb = zeros(2), ub = ones(2); maxiter = 10, nbins = 1000,
           ncalls = 10000, rtol = 1e-4, atol = 1e-4, debug = false, batch = false,
-          alpha = 1.5)
+          alpha = 1.5, stratified = false)
 
 Estimate the integral of a real scalar function over the box from `lb` to `ub`
 using adaptive importance sampling. Each of up to `maxiter` iterations draws
@@ -36,6 +37,12 @@ bounds or use fewer bins. Estimates and standard errors use Float64.
 For Float16 and Float32 grids, integration and sampling compute signed bin spans
 from the stored edges in Float64.
 
+With `stratified = true`, VEGAS+ partitions the transformed unit box into
+equal-volume strata, samples at least twice per stratum, and uses the previous
+iteration's variation to allocate additional samples. Each stratum contributes
+its volume-weighted mean, and the iteration variance sums the variances of these
+contributions.
+
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
 bin edges and widths in `adaptive_grid` and `grid_spacing`. Early stopping
@@ -44,12 +51,24 @@ requires a positive standard error below both `atol` and
 and the budget allows.
 Use `debug = true` to print the relative standard error each iteration.
 
-Iterations use inverse-variance weights when every sample variance is positive.
-If a batch has zero sample variance, all iteration estimates receive equal weight
-and the reported error is the larger of the propagated within-iteration error and
-the standard error across iterations. Reduced chi-squared uses the positive-variance
-iterations and is zero with fewer than two. A sample that misses a narrow peak can have
-zero estimated error.
+- With `stratified = false`, iterations use inverse-variance weights when every
+  sample variance is positive. If a batch has zero sample variance, all iteration
+  estimates receive equal weight and the reported error is the larger of the
+  propagated within-iteration error and the standard error across iterations.
+- With `stratified = true`, all iterations receive equal weight. For `n` iteration
+  variances `v`, the reported error is `sqrt(sum(v)) / n`. Iterations whose samples
+  miss part of the variation can report both a poor estimate and a small variance,
+  so weights based on observed variance would bias the result toward them. The
+  error uses within-iteration variation only and is zero when every iteration
+  variance is zero, even if the iteration estimates differ. The weights are
+  independent of the samples at a fixed iteration count, but tolerance-based early
+  stopping chooses that count from the observations. Stopping decisions agree with
+  the exact standard error and mean of the stored weighted samples.
+
+In both modes, reduced chi-squared measures the inverse-variance weighted scatter
+of the positive-variance iterations about their inverse-variance weighted mean,
+divided by one less than their number. It is zero with fewer than two such
+iterations. A sample that misses a narrow peak can have zero estimated error.
 
 See G. P. Lepage, *Adaptive multidimensional integration: VEGAS enhanced*,
 [Journal of Computational Physics 439 (2021) 110386](https://doi.org/10.1016/j.jcp.2021.110386).
@@ -60,7 +79,7 @@ end
 
 function _vegas(
         func, lb, ub, initial_grid; maxiter = 10, nbins = 1000, ncalls = 10000,
-        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5,
+        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5, stratified = false,
     )
     _check_vegas_batch(batch)
     maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
@@ -71,14 +90,18 @@ function _vegas(
         T, bits = _vegas_bounds_type(lb, ub, nbins)
         return _with_vegas_precision(bits) do
             grid, widths = _uniform_vegas_grid(T, lb, ub, nbins)
-            _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, T)
+            strata = stratified ? _VegasStrata(size(grid, 2), ncalls) : nothing
+            _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata, T)
         end
     end
     grid, widths = initial_grid
-    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, eltype(grid))
+    strata = stratified ? _VegasStrata(size(grid, 2), ncalls) : nothing
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata, eltype(grid))
 end
 
-function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, ::Type{T}) where {T}
+function _integrate_vegas(
+        func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata, ::Type{T}
+    ) where {T}
     nbins = size(widths, 1)
     ndim = size(grid, 2)
     points = Matrix{T}(undef, ndim, ncalls)
@@ -87,48 +110,73 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     values = Vector{Float64}(undef, ncalls)
     jacobians = _vegas_weight_buffer(values, T)
     mass = similar(widths, Float64)
-    counts = similar(bins, nbins, ndim)
+    counts = isnothing(strata) ? similar(bins, nbins, ndim) : nothing
     scratch = zeros(nbins)
     proposed = T === BigFloat ? similar(widths, nbins) : nothing
     exponents = _vegas_jacobian_exponents(grid, widths, ncalls)
     estimates = _IterationMean[]
     errors = _IterationError[]
     history = _ExactHistory()
+    pending = strata === nothing ? nothing : _deferred_stratum_history(strata.counts, values)
     extended = false
     lowest = highest = 0.0
     mean = error = chi_squared = 0.0
+    # Stratum allocation follows earlier samples, so weighting by observed variance would favor
+    # the iterations that missed the variation.
+    equal_weights = strata !== nothing
+    largest = 0.0
     for iter in 1:maxiter
-        _sample_vegas_iteration!(points, unit_points, bins, jacobians, exponents, grid, widths)
+        _sample_vegas_iteration!(points, unit_points, bins, jacobians, exponents, grid, widths, strata)
         _evaluate!(values, func, points, batch, exponents, jacobians)
-        estimate, stderr, exact_mean, exact_variance = _iteration_moments(values)
+        equal_weights && (largest = max(largest, maximum(abs, values)))
+        estimate, stderr, exact_mean, exact_variance = isnothing(strata) ? _iteration_moments(values) : _stratified_estimate!(strata, values)
         if maxiter > 1
             push!(estimates, estimate)
             push!(errors, stderr)
             lowest, highest = min(lowest, estimate.high), max(highest, estimate.high)
             extended |= exact_mean !== nothing || exact_variance !== nothing || lowest < 0 < highest
-            if iter < maxiter || extended
-                sample_mean, sample_variance = _sample_moments(values, estimate, stderr, exact_mean, exact_variance)
-                push!(history.means, sample_mean)
-                push!(history.variances, sample_variance)
+            if strata === nothing
+                if iter < maxiter || extended
+                    sample_mean, sample_variance = _sample_moments(values, estimate, stderr, exact_mean, exact_variance)
+                    push!(history.means, sample_mean)
+                    push!(history.variances, sample_variance)
+                end
+            elseif extended
+                _record_stratified_moments!(history, pending, strata.counts, values, iszero(stderr), exact_mean, exact_variance, true)
             end
         end
-        if !iszero(stderr)
-            _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, proposed)
+        adapt_grid = !iszero(stderr) && !iszero(alpha) && nbins > 1
+        if adapt_grid
+            training_weights = isnothing(strata) ? nothing : _stratified_training_weights!(strata)
+            _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, proposed, training_weights)
         end
         if maxiter == 1
             mean = exact_mean === nothing ? _rounded_mean(estimate) : exact_mean
             error = exact_variance === nothing ? _rounded_error(stderr) : exact_variance
         elseif extended
-            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history)
+            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history; equal_weights)
         else
-            mean, error, chi_squared = _combine_estimates(estimates, _RoundedIterationErrors(errors))
+            mean, error, chi_squared = _combine_estimates(estimates, _RoundedIterationErrors(errors); equal_weights)
+        end
+        if equal_weights && !extended && error isa Float64 &&
+                _ambiguous_stop(error, mean, largest, ncalls + iter + 8, rtol, atol)
+            # The rounded values cannot decide the stop, so switch to the exact history.
+            _record_stratified_moments!(history, pending, strata.counts, values, iszero(stderr), exact_mean, exact_variance, true)
+            extended = true
+            mean, error, chi_squared = _combine_extended_estimates(history.means, history.variances, history; equal_weights)
         end
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(_rounded_error(error) / _rounded_mean(mean)))")
         if _meets_error_tolerances(error, mean, rtol, atol)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
-        if exponents === nothing && !iszero(stderr) && !iszero(alpha) && nbins > 1 && iter < maxiter
+        if !isnothing(strata) && iter < maxiter
+            if !extended
+                _record_stratified_moments!(history, pending, strata.counts, values, iszero(stderr), exact_mean, exact_variance, false)
+            end
+            _redistribute_strata!(strata)
+        end
+        if exponents === nothing && adapt_grid && iter < maxiter
             exponents = _vegas_jacobian_exponents(grid, widths, ncalls)
         end
     end
@@ -138,9 +186,13 @@ end
 _vegas_weight_buffer(values, ::Type) = values
 _vegas_weight_buffer(values, ::Type{BigFloat}) = similar(values, BigFloat)
 
-function _sample_vegas_iteration!(points, unit_points, bins, weights, exponents, grid, widths)
+function _sample_vegas_iteration!(points, unit_points, bins, weights, exponents, grid, widths, strata)
     return _with_vegas_mapping(grid, widths) do working_widths, bits
-        rand!(unit_points)
+        if isnothing(strata)
+            rand!(unit_points)
+        else
+            _sample_strata!(unit_points, strata)
+        end
         _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, working_widths, bits)
     end
 end
