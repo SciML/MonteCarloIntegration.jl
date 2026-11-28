@@ -73,24 +73,17 @@ second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 `vegas(f, trained)` starts a new estimate using a copy of the adaptive grid and
 the bounds stored in `trained`.
 
-VEGAS rounds non-dyadic rational bounds and built-in irrational constants inward
-for intervals of nonzero width. VEGAS computes the grid in `BigFloat` when its bounds
-or bin widths require extra precision. The active precision must preserve
-binary-exact bounds and the signed span to `Float64` accuracy and resolve the
-bins. Set it around the call with `setprecision(BigFloat, bits)` if needed.
-Scalar, vector-batch, and matrix-batch callbacks receive inward-clamped `Float64`
-coordinates by default when they accept that type and each axis contains a
-finite `Float64` value. VEGAS supplies `BigFloat` coordinates when the Float64
-path is unavailable and the callback accepts `BigFloat`. Narrow intervals can
-produce repeated points or a single representable value. With default `Float64`
-coordinates on widened grids, VEGAS warns once per call when coordinate spacing
-exceeds `sqrt(eps(Float64))` of a nominal bin width or inward rounding removes
-more than that fraction of an axis's span. The reported standard error excludes
-coordinate-rounding bias. Use `callback_type = BigFloat` when the integrand needs
-interior coordinates from a widened grid. Reusing a `BigFloat` grid requires
-active precision at least as high as the precision stored in its edges or widths.
-The result displays `Float64` grid matrices when this retains usable axis bounds.
-Use `grid_precision = :native` to inspect or edit the precise grid.
+The bounds determine the type of callback coordinates, grid matrices, and
+samples from the adaptive grid. Floating bounds follow Julia's promotion
+rules. When exact and floating bounds mix, the floating bounds select the
+type and the exact bounds must fit it. BigFloat bounds select the greatest
+precision recorded in their values, and a grid retains that precision for
+reuse. Exact-only bounds can select BigFloat when Float64 lacks resolution.
+The estimate and standard error use Float64.
+
+VEGAS rounds non-dyadic rational and built-in irrational bounds inward on
+nonzero intervals. Provide higher-precision bounds or use fewer bins when the
+selected type cannot hold the requested bin geometry.
 
 ### Roadmap 
 - Supporting vector valued functions

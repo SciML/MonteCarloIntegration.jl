@@ -128,8 +128,9 @@ end
     widths = fill((ub - lb) / nbins, nbins, 1)
     @test any(iszero, diff(edges; dims = 1))
     previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
-    result = vegas(Returns(1), previous; ncalls = 32, maxiter = 1, alpha = 0.0)
-    @test result.integral_estimate ≈ ub - lb
+    @test_throws ArgumentError vegas(Returns(1), previous; ncalls = 32, maxiter = 1, alpha = 0.0)
+    resolved = vegas(Returns(1), [BigFloat(lb)], [BigFloat(ub)]; nbins, ncalls = 32, maxiter = 1, alpha = 0.0)
+    @test resolved.integral_estimate ≈ ub - lb
 
     inconsistent = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, 2 .* widths)
     @test_throws ArgumentError vegas(Returns(1), inconsistent; ncalls = 32)
@@ -157,10 +158,9 @@ end
     nbins = 9
     peak(x) = x[1] == lower + 4.0 ? 1.0e6 : 1.0
     for (lb, ub) in ((lower, upper), (upper, lower))
-        edges = reshape(collect(range(lb, ub; length = nbins + 1)), :, 1)
-        widths = fill((ub - lb) / nbins, nbins, 1)
-        previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
-        for domain in (([lb], [ub]), (previous,))
+        lower_bound, upper_bound = BigFloat(lb), BigFloat(ub)
+        previous = vegas(Returns(0), [lower_bound], [upper_bound]; nbins, ncalls = 32, maxiter = 1)
+        for domain in (([lower_bound], [upper_bound]), (previous,))
             @testset "Reversed: $(lb > ub), reused: $(length(domain) == 1)" begin
                 Random.seed!(1)
                 trained = vegas(peak, domain...; nbins, ncalls = 128, maxiter = 1)
@@ -178,10 +178,8 @@ end
     lower, upper = prevfloat(-2.0^53), -2.0^53
     for (lb, ub) in ((lower, upper), (upper, lower))
         @testset "Reversed: $(lb > ub)" begin
-            fresh = vegas(Returns(0.0), [lb], [ub]; nbins = 3, ncalls = 16, maxiter = 1)
-            width = (ub - lb) / 3
-            edges = reshape([fma(i, width, lb) for i in 0:3], :, 1)
-            historical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, fill(width, 3, 1))
+            fresh = vegas(Returns(0.0), [BigFloat(lb)], [BigFloat(ub)]; nbins = 3, ncalls = 16, maxiter = 1)
+            historical = deepcopy(fresh)
             function bounded(p)
                 x = only(p)
                 return sqrt(x - lower) + sqrt(upper - x)
@@ -609,7 +607,8 @@ end
     previous = vegas(Returns(0), Float32[0], Float32[1]; options...)
     @test sum(previous.grid_spacing) ≈ 1.0
     result = vegas(Returns(1), previous; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
-    @test result.integral_estimate ≈ 1.0
+    # The nominal width 1/3 is stored as Float32 on this grid.
+    @test result.integral_estimate ≈ 1.0 rtol = eps(Float32)
 
     width = 1.0f0 / 3
     edges = reshape(Float64[i * width for i in 0:3], :, 1)

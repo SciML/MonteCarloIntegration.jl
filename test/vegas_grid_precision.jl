@@ -2,7 +2,10 @@ using MonteCarloIntegration: MonteCarloIntegration, vegas
 using Random: seed!
 using Test: @test, @testset, @test_throws
 
-@testset "VEGAS checks fresh BigFloat bounds at the active precision" begin
+bound_ratio(x) = Rational{BigInt}(x)
+bound_ratio(x::BigFloat) = setprecision(() -> Rational{BigInt}(x), BigFloat, precision(x))
+
+@testset "VEGAS preserves exact and BigFloat bounds across ambient precisions" begin
     medium = big(2)^270
     large = big(2)^1100
     dyadic = (2 * big(2)^53 + 1) // 2
@@ -29,33 +32,26 @@ using Test: @test, @testset, @test_throws
                         batch === false && return 1.0
                         return ones(batch === true ? length(points) : size(points, 2))
                     end
-                    options = (; nbins = 2, ncalls = 16, maxiter = 1, alpha = 0.0, batch, grid_precision = :native)
-                    setprecision(BigFloat, low) do
-                        seed!(522)
-                        next_draw = rand(UInt64)
-                        seed!(522)
-                        @test_throws ArgumentError vegas(integrand, [a], [b]; options...)
-                        @test calls[] == 0
-                        @test rand(UInt64) == next_draw
-                    end
-
-                    setprecision(BigFloat, high) do
-                        fresh = vegas(integrand, [a], [b]; options...)
-                        reused = vegas(integrand, fresh; options...)
-                        for result in (fresh, reused)
-                            @test result.integral_estimate == Float64(expected)
-                            @test result.standard_deviation == 0.0
-                            for (bound, edge) in ((a, first(result.adaptive_grid)), (b, last(result.adaptive_grid)))
-                                if bound isa Rational && !ispow2(denominator(bound))
-                                    @test lo <= Rational{BigInt}(edge) <= hi
-                                else
-                                    @test edge == BigFloat(bound)
+                    options = (; nbins = 2, ncalls = 16, maxiter = 1, alpha = 0.0, batch)
+                    for ambient in (low, high)
+                        setprecision(BigFloat, ambient) do
+                            fresh = vegas(integrand, [a], [b]; options...)
+                            reused = vegas(integrand, fresh; options...)
+                            for result in (fresh, reused)
+                                @test result.integral_estimate == Float64(expected)
+                                @test result.standard_deviation == 0.0
+                                for (bound, edge) in ((a, first(result.adaptive_grid)), (b, last(result.adaptive_grid)))
+                                    if bound isa Rational && !ispow2(denominator(bound))
+                                        @test lo <= bound_ratio(edge) <= hi
+                                    else
+                                        @test bound_ratio(edge) == bound_ratio(bound)
+                                    end
                                 end
                             end
+                            @test eltype(fresh.adaptive_grid) === BigFloat
+                            samples = MonteCarloIntegration.sample_from_adaptive_grid(reused, 32)
+                            @test samples isa Vector{Tuple{BigFloat}}
                         end
-                        @test eltype(fresh.adaptive_grid) === BigFloat
-                        samples = MonteCarloIntegration.sample_from_adaptive_grid(reused, 32)
-                        @test samples isa Vector{Tuple{BigFloat}}
                     end
                 end
             end
@@ -97,8 +93,8 @@ end
 @testset "VEGAS keeps a wide rational grid inside the requested interval" begin
     lo = big(2)^64 + 1 // 3
     hi = lo + 102
-    options = (; nbins = 2, ncalls = 4096, maxiter = 1, alpha = 0.0, grid_precision = :native)
-    inside(x) = lo <= Rational{BigInt}(x) <= hi
+    options = (; nbins = 2, ncalls = 4096, maxiter = 1, alpha = 0.0)
+    inside(x) = lo <= bound_ratio(x) <= hi
 
     for (a, b, width) in ((lo, hi, 102.0), (hi, lo, -102.0))
         @testset "$a → $b" begin
@@ -107,15 +103,6 @@ end
                 calls[] += 1
                 outside[] += !inside(only(point))
                 return 1.0
-            end
-
-            setprecision(BigFloat, 64) do
-                seed!(13)
-                next_draw = rand(UInt64)
-                seed!(13)
-                @test_throws ArgumentError vegas(integrand, [a], [b]; options...)
-                @test calls[] == 0
-                @test rand(UInt64) == next_draw
             end
 
             calls[] = outside[] = 0
@@ -131,18 +118,7 @@ end
                 result
             end
 
-            setprecision(BigFloat, 64) do
-                calls[] = 0
-                seed!(13)
-                next_draw = rand(UInt64)
-                seed!(13)
-                @test_throws ArgumentError vegas(integrand, fresh; options...)
-                @test_throws ArgumentError MonteCarloIntegration.sample_from_adaptive_grid(fresh, options.ncalls)
-                @test calls[] == 0
-                @test rand(UInt64) == next_draw
-            end
-
-            for bits in (128, 256)
+            for bits in (64, 128, 256)
                 setprecision(BigFloat, bits) do
                     calls[] = outside[] = 0
                     seed!(13)
@@ -164,7 +140,7 @@ end
 @testset "VEGAS bounds the final floating-point interpolation" begin
     lo, hi = 2 // 107, 3 // 1
     for (a, b) in ((lo, hi), (hi, lo))
-        grid, widths = MonteCarloIntegration._initialize_vegas_grid([a], [b], 7, nothing)
+        grid, widths = MonteCarloIntegration._uniform_vegas_grid(Float64, [a], [b], 7)
         @test eltype(grid) === Float64
         points, unit_points = zeros(1, 2), reshape([0.0, prevfloat(1.0)], 1, 2)
         MonteCarloIntegration._map_vegas_points!(points, unit_points, zeros(Int, 1, 2), zeros(2), nothing, grid, widths)
@@ -176,7 +152,7 @@ end
     q = 1 // (big(2)^1100 + 1)
     lo, hi = -102q, -q
     options = (; nbins = 2, ncalls = 32, maxiter = 1, alpha = 0.0)
-    inside(p) = lo <= Rational{BigInt}(p) <= hi
+    inside(p) = lo <= bound_ratio(p) <= hi
     setprecision(BigFloat, 128) do
         for (a, b, width) in ((lo, hi, 101.0), (hi, lo, -101.0))
             outside = Ref(0)
@@ -215,7 +191,7 @@ end
         @test precision(BigFloat) == 64
     end
     setprecision(BigFloat, 128) do
-        result = vegas(Returns(1), [π], [hi]; options..., grid_precision = :native)
+        result = vegas(Returns(1), [π], [BigFloat(hi; precision = 128)]; options...)
         @test eltype(result.adaptive_grid) === BigFloat
         @test result.integral_estimate ≈ expected rtol = 2eps(Float64)
         @test precision(BigFloat) == 128
@@ -233,31 +209,21 @@ end
             calls = Ref(0)
             integrand(_) = (calls[] += 1; 1.0)
             options = (; nbins, ncalls = 16, maxiter = 1, alpha = 0.0)
-            width = (b - a) / nbins
-            edges = reshape([i == nbins ? b : fma(i, width, a) for i in 0:nbins], :, 1)
-            widths = fill(width, nbins, 1)
-            historical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
+            lo_native = BigFloat(a; precision = 64)
+            hi_native = BigFloat(b; precision = 64)
             setprecision(BigFloat, 8) do
-                @test BigFloat(a) == a && BigFloat(b) == b
-                seed!(341)
-                next_draw = rand(UInt64)
-                seed!(341)
-                @test_throws ArgumentError vegas(integrand, [a], [b]; options...)
-                @test_throws ArgumentError vegas(integrand, historical; options...)
-                @test calls[] == 0
-                @test rand(UInt64) == next_draw
-            end
-            setprecision(BigFloat, 64) do
-                fresh = vegas(integrand, [a], [b]; options...)
+                fresh = vegas(integrand, [lo_native], [hi_native]; options...)
                 @test fresh.integral_estimate == b - a
                 @test vegas(integrand, fresh; options...).integral_estimate == b - a
-                @test vegas(integrand, historical; options...).integral_estimate == b - a
+                @test calls[] == 2options.ncalls
+                @test precision(first(fresh.adaptive_grid)) == 64
+                @test precision(BigFloat) == 8
             end
         end
     end
 end
 
-@testset "VEGAS checks nonuniform widths when widening a historical grid" begin
+@testset "VEGAS keeps nonuniform stored Float64 widths" begin
     q = nextfloat(0.0)
     edges = [0.0 1.0; 512q 2.0; 1024q 1024.0]
     widths = [512q 1.0; 512q 1022.0]
@@ -265,20 +231,13 @@ end
     calls = Ref(0)
     integrand(_) = (calls[] += 1; 1.0)
     options = (; ncalls = 16, maxiter = 1, alpha = 0.0)
-    setprecision(BigFloat, 8) do
-        seed!(342)
-        next_draw = rand(UInt64)
-        seed!(342)
-        @test_throws ArgumentError vegas(integrand, historical; options...)
-        @test_throws ArgumentError MonteCarloIntegration.sample_from_adaptive_grid(historical, 16)
-        @test calls[] == 0
-        @test rand(UInt64) == next_draw
-    end
-    setprecision(BigFloat, 64) do
-        result = vegas(integrand, historical; options...)
-        @test result.adaptive_grid == edges
-        @test result.grid_spacing == widths
-        points = MonteCarloIntegration.sample_from_adaptive_grid(historical, 16)
-        @test all(p -> 0 <= p[1] <= 1024q && 1 <= p[2] <= 1024, points)
+    for bits in (8, 64)
+        setprecision(BigFloat, bits) do
+            result = vegas(integrand, historical; options...)
+            @test result.adaptive_grid == edges
+            @test result.grid_spacing == widths
+            points = MonteCarloIntegration.sample_from_adaptive_grid(historical, 16)
+            @test all(p -> 0 <= p[1] <= 1024q && 1 <= p[2] <= 1024, points)
+        end
     end
 end

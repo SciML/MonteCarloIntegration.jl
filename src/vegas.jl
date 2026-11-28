@@ -2,32 +2,12 @@ using Random: rand!
 using Distributions: Uniform
 import QuasiMonteCarlo
 
-struct _ProjectedVEGASGrid
-    rounded::Matrix{Float64}
-    native::Tuple{Matrix{BigFloat}, Matrix{BigFloat}}
-end
-
 struct VEGASResult{T1, T2, T3, T4, T5}
     integral_estimate::T1
     standard_deviation::T2
     chi_squared_average::T3
-    adaptive_grid::Union{T4, _ProjectedVEGASGrid}
+    adaptive_grid::T4
     grid_spacing::T5
-
-    function VEGASResult{T1, T2, T3, T4, T5}(estimate, error, chi, edges, widths) where {T1, T2, T3, T4, T5}
-        grid = edges isa _ProjectedVEGASGrid ? edges : convert(T4, edges)
-        return new{T1, T2, T3, T4, T5}(estimate, error, chi, grid, widths)
-    end
-end
-
-function VEGASResult(estimate::A, error::B, chi::C, edges::E, widths::W) where {A, B, C, E, W}
-    return VEGASResult{A, B, C, E, W}(estimate, error, chi, edges, widths)
-end
-
-function Base.getproperty(result::VEGASResult{A, B, C, E}, name::Symbol) where {A, B, C, E}
-    name === :adaptive_grid || return getfield(result, name)
-    grid = getfield(result, :adaptive_grid)
-    return (grid isa _ProjectedVEGASGrid ? grid.rounded : grid)::E
 end
 
 include("estimates.jl")
@@ -36,7 +16,7 @@ include("grid.jl")
 """
     vegas(f, lb = zeros(2), ub = ones(2); maxiter = 10, nbins = 1000,
           ncalls = 10000, rtol = 1e-4, atol = 1e-4, debug = false, batch = false,
-          alpha = 1.5, callback_type = nothing, grid_precision = :float64)
+          alpha = 1.5)
 
 Estimate the integral of a real scalar function over the box from `lb` to `ub`
 using adaptive importance sampling. Each of up to `maxiter` iterations draws
@@ -45,37 +25,14 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 `f` receives a vector of `ncalls` coordinate vectors. With `batch = :matrix`, it
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
-Grid coordinates normally use `Float64`. Non-dyadic rational
-bounds and built-in irrational constants are rounded inward for intervals of
-nonzero width. VEGAS uses `BigFloat` when bin widths are subnormal or approach
-the spacing between adjacent `Float64` values, a bound or span overflows, a
-binary-exact bound is rounded, or rounding materially changes the signed span.
-The active `BigFloat` precision must preserve binary-exact bounds and the signed
-span to `Float64` accuracy and resolve the bins. Increase it around the call
-with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
-errors use `Float64`.
-
-With `callback_type = nothing`, VEGAS uses `Float64` when the integrand accepts
-the selected argument shape and each axis contains a finite `Float64` value.
-Otherwise it uses `BigFloat` when the integrand accepts that shape. This rule
-applies to a scalar coordinate view, a vector of views, and a matrix batch.
-Float64 coordinates are clamped inward, while grid edges and weights retain their
-precision. Narrow intervals can produce repeated coordinates, including a single
-representable value. Use `callback_type = BigFloat` to receive interior coordinates
-from a widened grid. On a `Float64` grid, this converts existing coordinates at
-the active `BigFloat` precision, which must preserve the bounds. With default
-`Float64` coordinates on widened grids, VEGAS warns once per call if coordinate
-spacing exceeds `sqrt(eps(Float64))` of a nominal bin width or inward rounding
-removes more than that fraction of an axis's span. The standard error estimates
-sampling uncertainty and excludes coordinate-rounding bias. An explicit
-`callback_type = Float64` selects those coordinates without the warning and
-requires a finite `Float64` value inside every axis.
-
-With `grid_precision = :float64`, the result exposes `Float64` grid matrices when
-each axis has finite, usable `Float64` bounds and the widths round to finite values.
-Widened grids retain their native precision for reuse and sampling. Use
-`grid_precision = :native` to inspect or edit the full-precision grid directly.
-This option is independent of the callback coordinate type.
+The bounds determine the floating-point type of callback coordinates, grid
+edges, and bin widths. If any bounds are floating-point, their promoted type
+also applies to exact inputs. BigFloat bounds select the largest precision
+recorded in those values. Exact-only bounds can select BigFloat when Float64
+cannot represent the requested grid. Non-dyadic rational and irrational bounds
+round inward on intervals of nonzero width. If the selected type cannot
+preserve the bounds or resolve the requested bins, provide higher-precision
+bounds or use fewer bins. Estimates and standard errors use Float64.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
@@ -102,26 +59,28 @@ end
 function _vegas(
         func, lb, ub, initial_grid; maxiter = 10, nbins = 1000, ncalls = 10000,
         rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5,
-        callback_type = nothing, grid_precision = :float64
     )
     _check_vegas_batch(batch)
     maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
     nbins >= 1 || throw(ArgumentError("nbins must be positive"))
     ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
-    (grid_precision === :float64 || grid_precision === :native) ||
-        throw(ArgumentError("grid_precision must be :float64 or :native"))
-    grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    coordinates, callback_bounds = _vegas_callback_coordinates(func, grid, batch, callback_type)
-    result = _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, coordinates, callback_bounds)
-    return grid_precision === :float64 ? _float64_grid_result(result) : result
+    if initial_grid === nothing
+        T, bits = _vegas_bounds_type(lb, ub, nbins)
+        return _with_vegas_precision(bits) do
+            grid, widths = _uniform_vegas_grid(T, lb, ub, nbins)
+            _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, T)
+        end
+    end
+    grid, widths = initial_grid
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, eltype(grid))
 end
 
-function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, ::Type{T}, callback_bounds) where {T}
+function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, ::Type{T}) where {T}
     nbins = size(widths, 1)
     ndim = size(grid, 2)
     points = Matrix{T}(undef, ndim, ncalls)
-    unit_points = T === Float64 ? points : similar(points, Float64)
+    unit_points = T in (Float64, BigFloat) ? points : similar(points, Float64)
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     proposed = similar(widths, nbins)
@@ -132,7 +91,7 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
         rand!(unit_points)
-        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths, callback_bounds)
+        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
         _evaluate!(values, func, points, batch, exponents)
         estimate, stderr, exact_mean, exact_variance = _iteration_moments(values)
         exact_means = _record_iteration_mean!(estimates, exact_means, estimate, exact_mean)
@@ -161,8 +120,8 @@ function _requires_scaled_jacobian(widths)
     lower = upper = 1.0
     for axis in eachcol(widths)
         smallest, largest = extrema(abs, axis)
-        small_factor = Float64(nbins * smallest)
-        large_factor = Float64(nbins * largest)
+        small_factor = _vegas_bin_factor(smallest, nbins)
+        large_factor = _vegas_bin_factor(largest, nbins)
         lower *= small_factor
         upper *= large_factor
         min(small_factor, lower) >= floatmin(Float64) && isfinite(max(large_factor, upper)) || return true
@@ -170,19 +129,22 @@ function _requires_scaled_jacobian(widths)
     return false
 end
 
-function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths, callback_bounds = nothing)
+_vegas_bin_factor(width, nbins) = Float64(nbins * width)
+_vegas_bin_factor(width::Union{Float16, Float32}, nbins) = nbins * Float64(width)
+
+function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths)
     nbins = size(widths, 1)
     for j in axes(points, 2)
         jacobian, exponent = 1.0, 0
         for dim in axes(points, 1)
             y = unit_points[dim, j] * nbins
-            bin = floor(Int, y) + 1
+            bin = min(nbins, floor(Int, y) + 1)
             bins[dim, j] = bin
             width = widths[bin, dim]
             point = muladd(y - (bin - 1), width, grid[bin, dim])
-            points[dim, j] = _callback_grid_point(point, grid, dim, callback_bounds)
+            points[dim, j] = _bound_grid_point(point, grid, dim)
             if exponents === nothing
-                jacobian *= Float64(nbins * width)
+                jacobian *= _vegas_bin_factor(width, nbins)
             else
                 mantissa, shift = frexp(width)
                 jacobian, step = frexp(jacobian * (Float64(mantissa) * nbins))
@@ -198,34 +160,27 @@ end
 """
     sample_from_adaptive_grid(res, ncalls)
 
-Sample within the bounds stored in the adaptive grid. Sample coordinates
-use the grid's native precision for a native result. A rounded result
-samples the retained precise geometry and converts the coordinates to
-inward-clamped `Float64` values. Samples use the displayed edges and widths
-for any axis edited in a rounded result. Uniform grids with bins too narrow
-for `Float64` are reconstructed at the active `BigFloat` precision. For a
-`BigFloat` grid, the active precision must be at least the largest precision
-stored in its edges or widths.
+Sample within the bounds stored in the adaptive grid. Coordinates use the
+stored coordinate type and BigFloat precision.
 """
 function sample_from_adaptive_grid(res, ncalls)
     x, delx = _sampling_grid(res)
-    if _has_projected_grid(res)
-        return _sample_adaptive_grid(x, delx, ncalls, Float64, _inward_float64_callback_bounds(x))
+    return _with_vegas_precision(_stored_grid_precision(x, delx)) do
+        _sample_adaptive_grid(x, delx, ncalls, _grid_coordinate_type(x, delx))
     end
-    return _sample_adaptive_grid(x, delx, ncalls, _grid_coordinate_type(x, delx), nothing)
 end
 
-function _sample_adaptive_grid(x, delx, ncalls, ::Type{T}, bounds) where {T}
+function _sample_adaptive_grid(x, delx, ncalls, ::Type{T}) where {T}
     nbins = size(delx, 1)
     ndim = size(x, 2)
 
     # Sample `ncalls` points from this grid
     # Uniform sampling in `y` space
-    ymat = QuasiMonteCarlo.sample(ncalls, zeros(ndim), ones(ndim), Uniform())
+    ymat = T === BigFloat ? rand(BigFloat, ndim, ncalls) : QuasiMonteCarlo.sample(ncalls, zeros(ndim), ones(ndim), Uniform())
 
-    from_y_to_i(y) = floor(Int, nbins * y) + 1
+    from_y_to_i(y) = min(nbins, floor(Int, nbins * y) + 1)
     delta(y) = y * nbins + 1 - from_y_to_i(y)
-    from_y_to_x(y, dim) = _callback_grid_point(x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y), x, dim, bounds)
+    from_y_to_x(y, dim) = _bound_grid_point(x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y), x, dim)
 
     xmat = similar(ymat, T)
     for dim in 1:ndim
