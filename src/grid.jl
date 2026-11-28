@@ -153,12 +153,16 @@ function _grid_bounds_fit(lo, hi, a, b)
     _binary_bound_rounded(hi, b) && return false
     lo == hi && return a == b
     a == b && return false
-    actual = _exact_bound(b) - _exact_bound(a)
     scale = big(1) << max(0, min(precision(a), precision(b), 53) - 2)
     if !(lo isa Irrational || hi isa Irrational)
+        if a isa BigFloat && b isa BigFloat
+            return _bigfloat_grid_span_fits(lo, hi, a, b, scale)
+        end
+        actual = _exact_bound(b) - _exact_bound(a)
         expected = _exact_bound(hi) - _exact_bound(lo)
         return sign(expected) == sign(actual) && abs(expected - actual) * scale <= max(abs(expected), abs(actual))
     end
+    actual = _exact_bound(b) - _exact_bound(a)
     bits = max(64, precision(a), precision(b)) + 32
     magnitude = abs(actual)
     while true
@@ -170,6 +174,18 @@ function _grid_bounds_fit(lo, hi, a, b)
         bits *= 2
     end
     return
+end
+
+_grid_bound_error(original, rounded) = original == rounded ? 0 : _exact_bound(original) - _exact_bound(rounded)
+
+function _bigfloat_grid_span_fits(lo, hi, a, b, scale)
+    direction = cmp(b, a)
+    cmp(hi, lo) == direction || return false
+    error = _grid_bound_error(hi, b) - _grid_bound_error(lo, a)
+    # The larger of the two signed magnitudes is the stored span plus any outward error.
+    minimum_span = abs(error) * scale - max(0, direction * error)
+    return direction > 0 ? _compare_grid_span(b, a, minimum_span) >= 0 :
+        _compare_grid_span(a, b, minimum_span) >= 0
 end
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}

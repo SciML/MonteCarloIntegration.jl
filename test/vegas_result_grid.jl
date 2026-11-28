@@ -933,3 +933,56 @@ end
         end
     end
 end
+
+@testset "Mixed rational edges at wide BigFloat exponents" begin
+    options = (; ncalls = 16, maxiter = 1, alpha = 0.0)
+    sample(grid) = MonteCarloIntegration.sample_from_adaptive_grid(grid, 8)
+    stored(edges, widths) = VEGASResult(0.0, 0.0, 0.0, reshape(edges, :, 1), reshape(widths, :, 1))
+    function rejects(f, grid)
+        try
+            f(grid)
+            return false
+        catch error
+            error isa ArgumentError || rethrow()
+            return true
+        end
+    end
+
+    setprecision(BigFloat, 128) do
+        for exponent in (-2_000_000, 2_000_000), sign in (1, -1), orient in (identity, reverse)
+            b = ldexp(BigFloat(sign), exponent)
+            a = sign // 3
+            edges = orient(Real[a, b])
+            physical_edges = orient(BigFloat[a, b])
+            direction = cmp(last(physical_edges), first(physical_edges))
+            invalid = stored(edges, [direction])
+            calls = Ref(0)
+            observe(_) = (calls[] += 1; 0)
+            warm(grid) = vegas(observe, grid; options...)
+            seed!(3718)
+            suffix = rand(UInt64)
+            seed!(3718)
+            for f in (warm, sample)
+                @test rejects(f, invalid)
+                @test (@allocated rejects(f, invalid)) < 512 * 1024
+            end
+            @test calls[] == 0 && rand(UInt64) == suffix
+
+            widths = diff(physical_edges)
+            raw_edges = push!(copy(edges), last(edges))
+            raw = stored(raw_edges, Real[only(widths), 0])
+            integrate(grid) = vegas(Returns(0), grid; options...)
+            accepted = integrate(raw)
+            @test accepted.adaptive_grid == reshape([physical_edges; last(physical_edges)], :, 1)
+            @test accepted.grid_spacing == reshape([widths; BigFloat(0)], :, 1)
+            seed!(133)
+            actual = sample(raw)
+            suffix = rand(UInt64)
+            seed!(133)
+            @test actual == sample(accepted)
+            @test rand(UInt64) == suffix
+            @test (@allocated sample(raw)) < 512 * 1024
+            @test (@allocated integrate(raw)) < 512 * 1024
+        end
+    end
+end
