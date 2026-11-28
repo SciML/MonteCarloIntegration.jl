@@ -82,13 +82,13 @@ using Test
         @test abs(step.integral_estimate - 0.3) < 5 * step.standard_deviation
         @test step.standard_deviation > 0
 
-        for (stratified, expected_calls) in ((false, 100), (true, 500))
+        for stratified in (false, true)
             calls[] = 0
             constant = vegas([0.0], [1.0]; options..., stratified) do x
                 calls[] += 1
                 2.0
             end
-            @test calls[] == expected_calls
+            @test calls[] == options.ncalls * options.maxiter
             @test constant.integral_estimate == 2.0
             @test constant.standard_deviation == 0.0
         end
@@ -112,6 +112,26 @@ using Test
         @test calls[] == 80
         @test abs(sparse.integral_estimate - 0.3) < 5 * sparse.standard_deviation
         @test sparse.standard_deviation > 0
+
+        calls[] = 0
+        hits, initial_hits = Ref(0), Ref(0)
+        seed!(42)
+        background = 1.0e-8
+        width = 1 / 256
+        ncalls, maxiter = 64, 20
+        rare = vegas([0.0], [1.0]; stratified = true, ncalls, nbins = 2, maxiter, alpha = 0) do x
+            calls[] += 1
+            hit = x[1] < width
+            hits[] += hit
+            initial_hits[] += hit && calls[] <= ncalls
+            return background + hit
+        end
+        @test calls[] == ncalls * maxiter
+        @test iszero(initial_hits[])
+        @test hits[] > 0
+        @test rare.integral_estimate > background
+        @test rare.standard_deviation > 0
+        @test abs(rare.integral_estimate - (background + width)) < 5 * rare.standard_deviation
     end
 
     @testset "Stratum allocation and estimation" begin

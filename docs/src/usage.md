@@ -38,9 +38,11 @@ single classic VEGAS iteration, it is the sample standard deviation of the
 Jacobian-weighted samples divided by the square root of the sample count.
 VEGAS uses inverse-variance weights when all iteration variances are positive.
 If any iteration has zero variance, it keeps every estimate with equal weight
-and also accounts for the scatter between iterations. A rare peak can escape
-every sample. Increase the budget and compare independent runs when the integral
-is dominated by a small region.
+and also accounts for the scatter between iterations. Early stopping requires
+a positive estimated error below both tolerance thresholds. Runs whose estimated
+error stays zero use all `maxiter` iterations. A rare peak can escape every
+sample. Increase the budget and compare independent runs when the integral is
+dominated by a small region.
 
 ## Adaptive stratification
 
@@ -59,6 +61,3 @@ result.integral_estimate, result.standard_deviation
 Each iteration uses a volume-weighted sum of the stratum means and adds the
 estimated variances of the individual stratum contributions. Each iteration
 after the first uses the grid and allocation learned from earlier iterations.
-
-Stratified runs require a positive estimated error for tolerance-based stopping.
-A sampled stratum can appear flat when all of its draws miss a feature.

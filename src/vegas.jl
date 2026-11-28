@@ -40,10 +40,10 @@ contributions.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
-bin edges and widths in `adaptive_grid` and `grid_spacing`. The standard error
-must satisfy both `atol` and `rtol * abs(integral_estimate)` for early stopping.
-With `stratified = true`, early stopping requires a positive standard error.
-Flat integrands with zero estimated error run for all `maxiter` iterations.
+bin edges and widths in `adaptive_grid` and `grid_spacing`. Early stopping
+requires a positive standard error below both `atol` and
+`rtol * abs(integral_estimate)`. Runs whose estimated error stays zero use all
+`maxiter` iterations.
 Use `debug = true` to print the relative standard error each iteration.
 
 Iterations use inverse-variance weights when every sample variance is positive.
@@ -115,7 +115,7 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
         end
         mean, error, chi_squared = _combine_estimates(estimates, errors)
         debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
-        if error < atol && error < rtol * abs(mean) && (isnothing(strata) || error > 0)
+        if 0 < error < atol && error < rtol * abs(mean)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
