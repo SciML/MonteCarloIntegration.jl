@@ -3,7 +3,7 @@ function _check_vegas_batch(batch)
     throw(ArgumentError("batch must be false, true, or :matrix"))
 end
 
-function _vegas_callback_coordinates(grid, requested)
+function _vegas_callback_coordinates(func, grid, batch, requested)
     if requested === BigFloat
         (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat, nothing
         throw(ArgumentError("active BigFloat precision cannot preserve the callback bounds; increase it with setprecision"))
@@ -11,10 +11,31 @@ function _vegas_callback_coordinates(grid, requested)
     (requested === nothing || requested === Float64) ||
         throw(ArgumentError("callback_type must be nothing, Float64, or BigFloat"))
     (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64, nothing
+    if requested === nothing
+        wide = _vegas_callback_argument(BigFloat, batch)
+        narrow = _vegas_callback_argument(Float64, batch)
+        if applicable(func, wide)
+            applicable(func, narrow) || return BigFloat, nothing
+            bounds = _inward_float64_callback_bounds(grid)
+            if bounds !== nothing && _float64_callback_geometry_is_fine(grid, bounds) &&
+                    which(func, (typeof(wide),)) === which(func, (typeof(narrow),))
+                return Float64, bounds
+            end
+            return BigFloat, nothing
+        end
+        applicable(func, narrow) ||
+            throw(ArgumentError("the integrand must accept BigFloat or Float64 coordinates in the selected batch mode"))
+    end
     bounds = _inward_float64_callback_bounds(grid)
     bounds !== nothing && return Float64, bounds
-    requested === nothing && return BigFloat, nothing
-    throw(ArgumentError("callback_type = Float64 requires a finite Float64 interval that resolves the grid bins"))
+    throw(ArgumentError("Float64 callback coordinates require at least one finite Float64 value within every axis"))
+end
+
+_vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points)) : points
+
+function _vegas_callback_argument(::Type{T}, batch) where {T}
+    points = Matrix{T}(undef, 1, 1)
+    return batch === false ? first(eachcol(points)) : _vegas_batch_argument(points, batch)
 end
 
 function _callback_bounds_fit(::Type{T}, grid) where {T}
@@ -27,23 +48,32 @@ function _callback_bounds_fit(::Type{T}, grid) where {T}
 end
 
 function _inward_float64_callback_bounds(grid)
-    nbins = size(grid, 1) - 1
     lower = Vector{Float64}(undef, size(grid, 2))
     upper = similar(lower)
     for dim in axes(grid, 2)
         a, b = minmax(grid[begin, dim], grid[end, dim])
         lo, hi = Float64(a, RoundUp), Float64(b, RoundDown)
-        isfinite(lo) && isfinite(hi) || return nothing
-        if lo != a || hi != b
-            isfinite(Float64(a)) && isfinite(Float64(b)) && lo < hi || return nothing
-            bin_width = (BigFloat(hi) - BigFloat(lo)) / nbins
-            spacing = max(nextfloat(lo) - lo, hi - prevfloat(hi))
-            removed = (BigFloat(lo) - a) + (b - BigFloat(hi))
-            spacing <= bin_width && removed < bin_width || return nothing
-        end
+        isfinite(lo) && isfinite(hi) && lo <= hi || return nothing
         lower[dim], upper[dim] = lo, hi
     end
     return lower, upper
+end
+
+function _float64_callback_geometry_is_fine(grid, bounds)
+    lower, upper = bounds
+    nbins = size(grid, 1) - 1
+    for dim in axes(grid, 2)
+        a, b = minmax(grid[begin, dim], grid[end, dim])
+        a == b && continue
+        lo, hi = lower[dim], upper[dim]
+        lo < hi || return false
+        inward_span = BigFloat(hi) - BigFloat(lo)
+        removed = (BigFloat(lo) - a) + (b - BigFloat(hi))
+        spacing = max(nextfloat(lo) - lo, hi - prevfloat(hi))
+        removed <= 2eps(Float64) * inward_span || return false
+        spacing <= sqrt(eps(Float64)) * (inward_span / nbins) || return false
+    end
+    return true
 end
 
 _callback_grid_point(point, grid, dim, ::Nothing) = _bound_grid_point(point, grid, dim)
@@ -68,12 +98,9 @@ function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
         return weighted_values
     end
 
-    if batch === :matrix
-        values = func(xmat)
-        values isa AbstractVector || throw(ArgumentError("batch = :matrix requires the integrand to return a vector"))
-    else
-        values = func(collect(eachcol(xmat)))
-    end
+    values = func(_vegas_batch_argument(xmat, batch))
+    batch === :matrix && !(values isa AbstractVector) &&
+        throw(ArgumentError("batch = :matrix requires the integrand to return a vector"))
     ncalls = length(weighted_values)
     length(values) == ncalls || throw(DimensionMismatch("the integrand must return $ncalls values per batch"))
     for (j, value) in enumerate(values)
@@ -113,7 +140,8 @@ call. The number of bins comes from the grid. If supplied, `nbins` must match
 that number. Uniform grids with bins too narrow for `Float64` are reconstructed
 at the active `BigFloat` precision. Reusing a `BigFloat` grid requires active
 precision at least as high as the largest precision stored in its edges or
-widths. The default `callback_type` uses the stored bounds and bin count.
+widths. The default `callback_type` uses the stored bounds and the integrand's
+supported coordinate type in the selected batch mode.
 Other keywords have the same meaning as in [`vegas`](@ref).
 """
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)

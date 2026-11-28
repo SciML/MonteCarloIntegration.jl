@@ -36,17 +36,20 @@ with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
 errors use `Float64`.
 
 With `callback_type = nothing`, the integrand receives `Float64` coordinates when
-every axis has exact finite `Float64` bounds or a usable inward `Float64` interval.
-On each inexact axis, the nominal inward bins must be at least as wide as the
-largest inward `Float64` spacing at its two bounds. Inward rounding must exclude
-less than one nominal bin in total. A box that needs finer coordinates uses
-`BigFloat` for the callback. This applies to all batch modes. Float64 callbacks
-can receive repeated coordinates or only endpoints on narrow intervals. Use
-`callback_type = BigFloat` when the integrand needs interior samples from a
-widened grid. On a `Float64` grid this converts the existing coordinates at the
-active `BigFloat` precision, which must preserve the bounds. An explicit
-`callback_type = Float64` requires the same finite, resolvable domain as the
-default Float64 mode.
+all stored bounds are exactly representable as finite `Float64` values. For
+inexact bounds on a widened grid, VEGAS prefers an applicable `BigFloat` method.
+A method shared by both coordinate types keeps `Float64` when inward rounding
+preserves the span to `Float64` accuracy and the spacing is small relative to the
+nominal bin widths. A `Float64`-only callback receives inward-clamped coordinates
+if each axis contains a finite `Float64` value. Narrow intervals can produce
+repeated coordinates, including a single representable value. The grid and
+weights keep their precision.
+
+Use `callback_type = Float64` for a generic wrapper around a Float64-only function
+when the wrapper needs to receive `Float64` regardless of the grid spacing.
+Use `callback_type = BigFloat` to receive interior coordinates from a widened grid.
+On a `Float64` grid, this converts the existing coordinates at the active
+`BigFloat` precision, which must preserve the bounds.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the
@@ -81,7 +84,7 @@ function _vegas(
     ncalls >= 2 || throw(ArgumentError("ncalls must be at least two"))
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
     grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
-    coordinates, callback_bounds = _vegas_callback_coordinates(grid, callback_type)
+    coordinates, callback_bounds = _vegas_callback_coordinates(func, grid, batch, callback_type)
     return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, coordinates, callback_bounds)
 end
 

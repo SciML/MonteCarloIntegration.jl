@@ -29,6 +29,83 @@ using Test: @test, @testset, @test_throws
     end
 end
 
+@testset "VEGAS resolves a polynomial on an inexact offset interval" begin
+    offset = BigFloat(2)^53
+    lo, hi = offset + 1 // 8, offset + 63 // 8
+    function polynomial(x)
+        t = only(x) - offset - 4
+        return abs2(t * (t * t - 4))
+    end
+    t = big(31) // 8
+    exact = Float64(2 * (t^7 / 7 - 8t^5 / 5 + 16t^3 / 3))
+    options = (; nbins = 1, ncalls = 32_768, maxiter = 1, alpha = 0.0)
+    seed!(440)
+    fresh = vegas(polynomial, [lo], [hi]; options...)
+    seed!(440)
+    reused = vegas(polynomial, fresh; options...)
+    seed!(440)
+    explicit = vegas(polynomial, [lo], [hi]; options..., callback_type = BigFloat)
+    @test fresh.standard_deviation > 0
+    @test abs(fresh.integral_estimate - exact) < 4 * fresh.standard_deviation
+    @test fresh.integral_estimate == reused.integral_estimate == explicit.integral_estimate
+    @test fresh.standard_deviation == reused.standard_deviation == explicit.standard_deviation
+end
+
+@testset "VEGAS dispatches on the callback argument shape" begin
+    offset = BigFloat(2)^53
+    lo, hi = offset + 1 // 8, offset + 63 // 8
+    seen = Float64[]
+    wide = BigFloat[]
+    point64 = typeof(first(eachcol(zeros(1, 1))))
+    views64 = typeof(collect(eachcol(zeros(1, 1))))
+    scalar64(x::point64) = (push!(seen, only(x)); 1.0)
+    batch64(x::views64) = map(scalar64, x)
+    options = (; nbins = 4, ncalls = 64, maxiter = 2, alpha = 0.0)
+    output = zeros(options.ncalls)
+    matrix64(x::Matrix{Float64}) = map!(scalar64, output, eachcol(x))
+    scalar_dual(x::point64) = scalar64(x)
+    scalar_dual(x::AbstractVector{BigFloat}) = (push!(wide, only(x)); 2.0)
+    batch_dual(x::views64) = batch64(x)
+    batch_dual(x::Vector{<:AbstractVector{BigFloat}}) = map(scalar_dual, x)
+    matrix_dual(x::Matrix{Float64}) = matrix64(x)
+    matrix_dual(x::Matrix{BigFloat}) = map!(scalar_dual, output, eachcol(x))
+
+    for (a, b) in ((lo, hi), (hi, lo)), (batch, narrow, dual) in ((false, scalar64, scalar_dual), (true, batch64, batch_dual), (:matrix, matrix64, matrix_dual))
+        @testset "$batch, $a → $b" begin
+            expected = Float64(b - a)
+            empty!(seen)
+            empty!(wide)
+            fresh = vegas(narrow, [a], [b]; options..., batch)
+            @test fresh.integral_estimate == expected
+            @test eltype(fresh.adaptive_grid) === BigFloat
+            @test vegas(narrow, fresh; options..., batch).integral_estimate == expected
+            wrapper(x) = narrow(x)
+            @test vegas(wrapper, [a], [b]; options..., batch, callback_type = Float64).integral_estimate == expected
+            @test vegas(wrapper, fresh; options..., batch, callback_type = Float64).integral_estimate == expected
+            @test length(seen) == 4 * options.ncalls * options.maxiter
+            @test all(p -> lo <= p <= hi, seen)
+            @test vegas(dual, [a], [b]; options..., batch).integral_estimate == 2expected
+            @test vegas(dual, fresh; options..., batch).integral_estimate == 2expected
+            @test length(wide) == 2 * options.ncalls * options.maxiter
+            @test all(p -> lo <= p <= hi, wide)
+        end
+    end
+
+    seed!(441)
+    next_draw = rand(UInt64)
+    seed!(441)
+    @test_throws ArgumentError vegas(matrix64, [lo], [hi]; options..., batch = false)
+    @test rand(UInt64) == next_draw
+
+    calls = Ref(0)
+    function wrapper_needing_float64(x)
+        calls[] += 1
+        return scalar64(x)
+    end
+    @test_throws MethodError vegas(wrapper_needing_float64, [lo], [hi]; options...)
+    @test calls[] == 1
+end
+
 @testset "VEGAS preserves Float64 callbacks on resolvable inexact bounds" begin
     offset = BigFloat(2)^-60
     q = BigFloat(nextfloat(0.0))
@@ -59,6 +136,30 @@ end
             @test length(seen) == 3 * options.ncalls
             @test all(p -> Rational{BigInt}(lo) <= Rational{BigInt}(p) <= Rational{BigInt}(hi), seen)
         end
+    end
+end
+
+@testset "VEGAS keeps well-resolved Float64 defaults for shared methods" begin
+    lo, hi = BigFloat(0), BigFloat(1) + BigFloat(2)^-60
+    scalar64(::AbstractVector{Float64}) = 1.0
+    views64(x::Vector{<:AbstractVector{Float64}}) = map(scalar64, x)
+    matrix64(x::Matrix{Float64}) = map(scalar64, eachcol(x))
+    scalar_dual(::AbstractVector{Float64}) = 1.0
+    scalar_dual(::AbstractVector{BigFloat}) = 2.0
+    views_dual(x::Vector{<:AbstractVector{Float64}}) = map(scalar_dual, x)
+    views_dual(x::Vector{<:AbstractVector{BigFloat}}) = map(scalar_dual, x)
+    matrix_dual(x::Matrix{Float64}) = map(scalar_dual, eachcol(x))
+    matrix_dual(x::Matrix{BigFloat}) = map(scalar_dual, eachcol(x))
+
+    for (a, b) in ((lo, hi), (hi, lo)), (batch, narrow, dual) in ((false, scalar64, scalar_dual), (true, views64, views_dual), (:matrix, matrix64, matrix_dual)), nbins in (4, 1_000)
+        options = (; batch, nbins, ncalls = 64, maxiter = 1, alpha = 0.0)
+        expected = Float64(b - a)
+        @test vegas(narrow, [a], [b]; options...).integral_estimate == expected
+        wrapper(x) = narrow(x)
+        fresh = vegas(wrapper, [a], [b]; options...)
+        @test fresh.integral_estimate == expected
+        @test vegas(wrapper, fresh; options...).integral_estimate == expected
+        @test vegas(dual, fresh; options...).integral_estimate == 2expected
     end
 end
 
@@ -108,7 +209,7 @@ end
 
     for (lo, hi, expected) in ((a, b, [nextfloat(1.0), prevfloat(1.5)]), (b, a, [prevfloat(1.5), nextfloat(1.0)]))
         grid, widths = MonteCarloIntegration._initialize_vegas_grid(lo, hi, settings.nbins, nothing)
-        coordinate_type, bounds = MonteCarloIntegration._vegas_callback_coordinates(grid, nothing)
+        coordinate_type, bounds = MonteCarloIntegration._vegas_callback_coordinates(f, grid, false, Float64)
         @test coordinate_type === Float64
         points = zeros(2, 2)
         unit_points = [0.0 prevfloat(1.0); 0.0 prevfloat(1.0)]
@@ -119,17 +220,18 @@ end
     end
 end
 
-@testset "VEGAS requires useful inward Float64 coverage" begin
+@testset "VEGAS preserves containment with thin Float64 coverage" begin
     a = BigFloat(2)^53
     q = BigFloat(nextfloat(0.0))
     largest = BigFloat(floatmax(Float64))
     cases = (
-        (a + 1 // 8, a + 23 // 4, 1),
-        (a + 1 // 8, a + 8 + 1 // 8, 4),
-        (q / 4, q / 2, 1),
-        (2largest, 2largest + largest / 8, 4),
+        (a + 1 // 8, a + 23 // 4, 1, true),
+        (a + 1 // 8, a + 8 + 1 // 8, 4, true),
+        (a + 1, a + 3, 2, true),
+        (q / 4, q / 2, 1, false),
+        (2largest, 2largest + largest / 8, 4, false),
     )
-    for (lo, hi, nbins) in cases, (first, last) in ((lo, hi), (hi, lo))
+    for (lo, hi, nbins, has_float64) in cases, (first, last) in ((lo, hi), (hi, lo))
         seen = BigFloat[]
         function inspect(x::AbstractVector{BigFloat})
             push!(seen, only(x))
@@ -141,11 +243,27 @@ end
         @test stored.integral_estimate == Float64(last - first)
         @test all(p -> lo <= p <= hi, seen)
 
+        seen64 = Float64[]
+        narrow(x::AbstractVector{Float64}) = (push!(seen64, only(x)); 1.0)
+        if has_float64
+            @test vegas(narrow, [first], [last]; settings...).integral_estimate == stored.integral_estimate
+            @test vegas(narrow, stored; settings..., callback_type = Float64).integral_estimate == stored.integral_estimate
+            @test length(seen64) == 2 * settings.ncalls
+            @test all(p -> lo <= p <= hi, seen64)
+            if Float64(lo, RoundUp) == Float64(hi, RoundDown)
+                @test allequal(seen64)
+            end
+            continue
+        end
+
         seed!(707)
         next_draw = rand(UInt64)
         seed!(707)
-        @test_throws ArgumentError vegas(inspect, [first], [last]; settings..., callback_type = Float64)
-        @test_throws ArgumentError vegas(inspect, stored; settings..., callback_type = Float64)
+        @test_throws ArgumentError vegas(narrow, [first], [last]; settings...)
+        @test_throws ArgumentError vegas(narrow, stored; settings...)
+        @test_throws ArgumentError vegas(narrow, [first], [last]; settings..., callback_type = Float64)
+        @test_throws ArgumentError vegas(narrow, stored; settings..., callback_type = Float64)
+        @test isempty(seen64)
         @test rand(UInt64) == next_draw
     end
 end
@@ -217,7 +335,7 @@ end
 end
 
 @testset "VEGAS rejects unrepresentable callback bounds before drawing samples" begin
-    lo, hi = big(2)^53 + 1, big(2)^53 + 3
+    lo, hi = big(2)^53 + 1 // 4, big(2)^53 + 3 // 4
     options = (; nbins = 2, ncalls = 64, maxiter = 1, alpha = 0.0)
     typed_wide(point::AbstractVector{BigFloat}) = lo <= only(point) <= hi
     exact = vegas(typed_wide, [lo], [hi]; options...)

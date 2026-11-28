@@ -78,12 +78,16 @@ for intervals of nonzero width. VEGAS stores the grid in `BigFloat` when its bou
 or bin widths require extra precision. The active precision must preserve
 binary-exact bounds and the signed span to `Float64` accuracy and resolve the
 bins. Set it around the call with `setprecision(BigFloat, bits)` if needed.
-Scalar and batch callbacks receive `Float64` coordinates by default when each
-axis has exact finite `Float64` bounds or inward `Float64` bounds that resolve
-the nominal bins. Float64 callbacks can receive repeated coordinates or only
-endpoints on narrow intervals. Use `callback_type = BigFloat` when the integrand
-needs interior samples. Reusing a `BigFloat` grid requires active precision at
-least as high as the precision stored in its edges or widths.
+When the stored bounds fit `Float64` exactly, scalar and batch callbacks receive
+`Float64` coordinates by default. For inexact bounds on a widened grid, VEGAS
+prefers a supported `BigFloat` method. A method shared by both types keeps
+`Float64` on well-resolved intervals where inward rounding preserves the span.
+Float64-only callbacks receive inward-clamped coordinates when each axis contains
+a finite `Float64` value. Narrow intervals can produce repeated coordinates.
+Pass `callback_type = Float64` when a generic wrapper requires Float64 inputs,
+or `callback_type = BigFloat` to receive interior coordinates on widened grids.
+Reusing a `BigFloat` grid requires active precision at least as high as the
+precision stored in its edges or widths.
 
 ### Roadmap 
 - Supporting vector valued functions

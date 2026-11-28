@@ -27,18 +27,33 @@ and the signed span to `Float64` accuracy and resolve the bins. If needed, use
 integrand can accept both coordinate types by preserving the element type of
 its inputs.
 
-The default `callback_type = nothing` passes `Float64` coordinates to scalar and
-batch integrands when each axis has exact finite `Float64` bounds or its inward
-`Float64` bounds resolve the nominal bins. Each inexact axis must have a finite
-inward interval whose nominal bins are at least as wide as the largest inward
-`Float64` spacing at its two bounds. Inward rounding must exclude less than one
-nominal bin in total. A box that needs finer coordinates uses `BigFloat` for the
-callback. The grid and its weights retain their precision. Float64 callbacks can
-receive repeated coordinates or only endpoints on narrow intervals. Use `callback_type = BigFloat`
-when the integrand needs interior samples. On a `Float64` grid this converts the
-existing coordinates at the active `BigFloat` precision, which must preserve the
-bounds. Explicit `callback_type = Float64` requires the same resolution as the
-default Float64 mode.
+The default `callback_type = nothing` passes `Float64` coordinates when all
+stored bounds are exactly representable as finite `Float64` values. When a widened
+grid has inexact `Float64` bounds, VEGAS looks for an applicable `BigFloat`
+method for the scalar view, vector of views, or matrix in the selected batch
+mode. When both coordinate types select the same method, VEGAS keeps `Float64`
+if inward rounding removes at most `2eps(Float64)` of each interval's inward
+span and the `Float64` spacing is at most `sqrt(eps(Float64))` of a nominal bin
+width on each axis. Float64-only callbacks receive inward-clamped values if
+each axis contains a finite `Float64` coordinate. They can receive repeated
+values on narrow intervals, including the same value for every sample. The grid
+and its weights retain their precision.
+
+VEGAS checks which argument types the callable accepts through Julia dispatch.
+For a generic wrapper around a Float64-only function, select `callback_type = Float64`
+explicitly.
+
+```@example matrix_batch
+float64_only(x::AbstractVector{Float64}) = 1.0
+offset = BigFloat(2)^53
+lower, upper = offset + 1 // 8, offset + 63 // 8
+legacy = vegas(x -> float64_only(x), [lower], [upper]; nbins = 4, callback_type = Float64)
+legacy.integral_estimate
+```
+
+Use `callback_type = BigFloat` to receive interior points from a widened grid.
+On a `Float64` grid this converts the existing coordinates at the active
+`BigFloat` precision, which must preserve the grid bounds.
 
 The function below ranges from 1 to 3 between its bounds and integrates to 4.
 The widened callback coordinates let it evaluate at points between those bounds.
@@ -56,7 +71,8 @@ Pass a previous result to start a fresh estimate on its stored bounds and grid.
 For example, reuse the Gaussian's grid to compute its second radial moment.
 When reusing or sampling a `BigFloat` grid, set the active precision to at
 least the largest precision stored in the grid's edges or widths. The default
-`callback_type` is selected from the stored bounds and bin count when reusing a grid.
+`callback_type` uses the stored bounds and the integrand's supported coordinate
+type in the selected batch mode when reusing a grid.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))
