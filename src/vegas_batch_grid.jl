@@ -185,6 +185,7 @@ function _sampling_grid(result)
             width = widths[1, dim]
             if a != b &&
                     _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width) &&
+                    any(i -> edges[i, dim] == edges[i + 1, dim], 1:nbins) &&
                     _is_uniform_grid_axis(view(edges, :, dim), view(widths, :, dim))
                 return _copy_vegas_grid(edges, widths)
             end
@@ -210,8 +211,14 @@ end
 function _may_have_collapsed_uniform_axis(edges, dim, nbins, a, b, width, ::Type{T}) where {T}
     lo, hi, step = T(a), T(b), T(width)
     lo == a && hi == b && step == width || return false
-    abs(step) <= 2eps(max(abs(lo), abs(hi))) &&
+    spacing = eps(max(abs(lo), abs(hi)))
+    abs(step) <= 2spacing &&
         isapprox(step, (hi - lo) / nbins; rtol = 2eps(T)) || return false
+    # In one spacing region, integer multiples of the spacing are exact throughout the axis.
+    if abs(step) in (spacing, 2spacing) && signbit(lo) == signbit(hi) && eps(min(abs(lo), abs(hi))) == spacing
+        count = T(nbins)
+        count == nbins && hi - lo == count * step && return false
+    end
     T === Float64 && return true
     left, right = edges[2, dim], edges[nbins, dim]
     return T(left) == left && T(right) == right

@@ -288,3 +288,47 @@ end
         @test rand(UInt64) == next_draw
     end
 end
+
+@testset "Sparse sampling on a one-ULP lattice" begin
+    nbins = 32768
+    for origin in (1.0e12, 2.0^40), sign in (1, -1), direction in (identity, reverse)
+        raw_edges = reshape(direction(sign .* [nextfloat(origin, i) for i in 0:nbins]), :, 1)
+        raw_widths = diff(raw_edges; dims = 1)
+        edges = ReadCountingSamplingMatrix(raw_edges, 0)
+        widths = ReadCountingSamplingMatrix(raw_widths, 0)
+        grid = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        seed!(56602)
+        points = sample_from_adaptive_grid(grid, 4)
+        next_draw = rand(UInt64)
+        @test edges.reads <= 20
+        @test widths.reads <= 2
+        seed!(56602)
+        expected = map(1:4) do _
+            scaled = nbins * rand()
+            bin = floor(Int, scaled) + 1
+            (raw_edges[bin] + raw_widths[bin] * (scaled + 1 - bin),)
+        end
+        @test points == expected
+        @test rand(UInt64) == next_draw
+    end
+end
+
+@testset "Direct sampling reconstructs historical cells across a binade" begin
+    a, b = prevfloat(Float16(1)), nextfloat(Float16(1), 511)
+    nbins = 512
+    for sign in (1, -1), (lo, hi, step) in ((a, b, eps(b)), (b, a, (a - b) / nbins))
+        lo, hi, step = sign * lo, sign * hi, sign * step
+        stored = reshape(Float64[lo + i * step for i in 0:nbins], :, 1)
+        stored[end] = hi
+        @test any(iszero, diff(stored; dims = 1))
+        legacy = VEGASResult(0.0, 0.0, 0.0, stored, fill(Float64(step), nbins, 1))
+        rebuilt = reshape(collect(range(Float64(lo), Float64(hi); length = nbins + 1)), :, 1)
+        physical = VEGASResult(0.0, 0.0, 0.0, rebuilt, diff(rebuilt; dims = 1))
+        seed!(74871)
+        expected = sample_from_adaptive_grid(physical, 16)
+        next_draw = rand(UInt64)
+        seed!(74871)
+        @test sample_from_adaptive_grid(legacy, 16) == expected
+        @test rand(UInt64) == next_draw
+    end
+end
