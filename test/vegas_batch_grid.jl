@@ -399,6 +399,101 @@ end
     @test result.chi_squared_average == 0.0
 end
 
+@testset "VEGAS long histories with zero or subnormal errors" begin
+    function integration(batches; tolerance = 0.0)
+        step = Ref(0)
+        result = vegas(
+            _ -> batches[step[] += 1], [0.0], [1.0];
+            nbins = 1, ncalls = 4, maxiter = length(batches),
+            batch = :matrix, alpha = 0.0, rtol = tolerance, atol = tolerance,
+        )
+        return result, step[]
+    end
+
+    function reference(batches)
+        return setprecision(BigFloat, 4096) do
+            means = map(batches) do batch
+                sum(BigFloat, batch) / length(batch)
+            end
+            variances = map(batches, means) do batch, mean
+                sum(x -> abs2(BigFloat(x) - mean), batch) / (length(batch) * (length(batch) - 1))
+            end
+            weights = map(v -> iszero(v) ? zero(v) : inv(v), variances)
+            n = length(batches)
+            center = sum(weights .* means) / sum(weights)
+            chi_squared = sum(weights .* abs2.(means .- center)) / (count(>(0), weights) - 1)
+            if any(iszero, variances)
+                mean = sum(means) / n
+                scatter = sum(abs2, means .- mean) / (n * (n - 1))
+                error = sqrt(max(scatter, sum(variances) / n^2))
+                return Float64.((mean, error, chi_squared))
+            end
+            return Float64.((center, inv(sqrt(sum(weights))), chi_squared))
+        end
+    end
+
+    q = nextfloat(0.0)
+    for (first_batch, bytes_per_iteration) in ((zeros(4), 4096), ([-q, q, q, q], 65536))
+        rng = Random.MersenneTwister(2026)
+        batches = [first_batch, [1 .+ rand(rng, 4) for _ in 2:240]...]
+        integration(batches[1:32]; tolerance = q)
+        for (n, tolerance) in ((120, 0.0), (240, 0.0), (120, q))
+            history = batches[1:n]
+            expected_mean, expected_error, expected_chi_squared = reference(history)
+            measured = @timed integration(history; tolerance)
+            result, evaluated = measured.value
+            @test evaluated == n
+            if iszero(first_batch[2])
+                @test result.integral_estimate ≈ expected_mean rtol = 16eps()
+            else
+                @test result.integral_estimate == expected_mean == q
+            end
+            @test result.standard_deviation ≈ expected_error rtol = 16eps()
+            @test result.chi_squared_average ≈ expected_chi_squared rtol = 32eps()
+            @test measured.bytes < bytes_per_iteration * n
+        end
+    end
+
+    history = [
+        [-1.0, 1.0, 0.0, q],
+        [(isodd(i) ? 0.5 : 1.0) .+ [0.0, 1.0, 3.0, 5.0] ./ (i + 1) for i in 2:240]...,
+    ]
+    expected_mean, expected_error, expected_chi_squared = reference(history)
+    integration(history[1:32]; tolerance = q)
+    measured = @timed integration(history; tolerance = q)
+    result, evaluated = measured.value
+    @test evaluated == length(history)
+    @test result.integral_estimate ≈ expected_mean rtol = 16eps()
+    @test result.standard_deviation ≈ expected_error rtol = 16eps()
+    @test result.chi_squared_average ≈ expected_chi_squared rtol = 32eps()
+    @test measured.bytes < 65536 * length(history)
+
+    rng = Random.MersenneTwister(7)
+    ordinary = map(1:32) do _
+        a = 1 + rand(rng)
+        [-a, a, 9q, 9q]
+    end
+    for perturbed in (false, true)
+        history = [[0.0, 6q, 6q, 6q], copy.(ordinary)...]
+        perturbed && (history[end][end] = 10q)
+        for sign in (-1, 1), batches in (history, reverse(history))
+            result, evaluated = integration(map(batch -> sign .* batch, batches))
+            @test evaluated == length(batches)
+            @test result.integral_estimate == sign * (perturbed ? 5q : 4q)
+            @test result.standard_deviation == q
+            @test iszero(result.chi_squared_average)
+        end
+    end
+
+    ties = repeat([q .* [2, -2, 1, 4], q .* [-5, -4, -2, -3]], 16)
+    for sign in (-1, 1), batches in (ties, reverse(ties))
+        result, _ = integration(map(batch -> sign .* batch, batches))
+        @test result.integral_estimate == -sign * 2q
+        @test iszero(result.standard_deviation)
+        @test result.chi_squared_average ≈ (57 / 5) * 16 / 31
+    end
+end
+
 @testset "VEGAS warm starts with low-precision bounds" begin
     options = (; nbins = 3, ncalls = 32, maxiter = 1)
     previous = vegas(Returns(0), Float32[0], Float32[1]; options...)
