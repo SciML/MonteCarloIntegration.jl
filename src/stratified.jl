@@ -63,7 +63,7 @@ function _sample_strata!(ymat, strata)
             splits = strata.splits[dim]
             splits == 1 && continue
             cell, offset = divrem(cell, splits)
-            limit = prevfloat((offset + 1) / splits)
+            limit = prevfloat(eltype(ymat)(offset + 1) / splits)
             for j in first:last
                 ymat[dim, j] = min((offset + ymat[dim, j]) / splits, limit)
             end
@@ -142,22 +142,34 @@ function _needs_exact_stratum_average(mean, values)
 end
 
 function _exact_stratum_moments(counts, values, exact_variance)
+    exact_variance || return _exact_stratum_mean(counts, values), nothing
     total = variance_total = big(0) // 1
     first = 1
     for count in counts
         last = first + count - 1
         cell = @view values[first:last]
-        if exact_variance
-            mean, variance = _exact_binary64_moments(cell, count)
-            total += mean
-            variance_total += variance
-        else
-            total += _binary64_sum_units(cell) // (BigInt(count) << 1074)
-        end
+        mean, variance = _exact_binary64_moments(cell, count)
+        total += mean
+        variance_total += variance
         first = last + 1
     end
     nstrata = length(counts)
-    return total / nstrata, exact_variance ? variance_total / BigInt(nstrata)^2 : nothing
+    return total / nstrata, variance_total / BigInt(nstrata)^2
+end
+
+function _exact_stratum_mean(counts, values)
+    if all(==(first(counts)), counts)
+        return _binary64_sum_units(values) // (BigInt(length(values)) << 1074)
+    end
+    # Apply the binary64 lattice spacing once after summing the cell means.
+    total = big(0) // 1
+    first_index = 1
+    for count in counts
+        last = first_index + count - 1
+        total += _binary64_sum_units(@view values[first_index:last]) // count
+        first_index = last + 1
+    end
+    return numerator(total) // ((denominator(total) * length(counts)) << 1074)
 end
 
 function _stratum_total(means, scale)

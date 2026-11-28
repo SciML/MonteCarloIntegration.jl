@@ -3,32 +3,26 @@ function _check_vegas_batch(batch)
     throw(ArgumentError("batch must be false, true, or :matrix"))
 end
 
-function _vegas_callback_type(grid, requested)
-    if requested === BigFloat
-        (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat
-        throw(ArgumentError("active BigFloat precision cannot preserve the callback bounds; increase it with setprecision"))
-    end
-    (requested === nothing || requested === Float64) ||
-        throw(ArgumentError("callback_type must be nothing, Float64, or BigFloat"))
-    (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64
-    requested === nothing && return BigFloat
-    throw(ArgumentError("callback_type = Float64 requires the grid bounds to be exactly representable in Float64"))
-end
-
-function _callback_bounds_fit(::Type{T}, grid) where {T}
-    for dim in axes(grid, 2), row in (firstindex(grid, 1), lastindex(grid, 1))
-        bound = grid[row, dim]
-        converted = T(bound)
-        isfinite(converted) && bound == converted || return false
-    end
-    return true
-end
+_vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points)) : points
 
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
+
+function _apply_vegas_weight(weight, value::BigFloat, ::Nothing, _)
+    return _with_vegas_precision(max(64, precision(value))) do
+        Float64(weight * value, RoundNearest)
+    end
+end
 
 function _apply_vegas_weight(weight, value, exponents, j)
     mantissa, exponent = frexp(float(value))
     return ldexp(weight * mantissa, exponents[j] + exponent)
+end
+
+function _apply_vegas_weight(weight, value::BigFloat, exponents, j)
+    return _with_vegas_precision(max(64, precision(value))) do
+        mantissa, exponent = frexp(value)
+        Float64(ldexp(weight * mantissa, exponents[j] + exponent), RoundNearest)
+    end
 end
 
 function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
@@ -39,12 +33,9 @@ function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
         return weighted_values
     end
 
-    if batch === :matrix
-        values = func(xmat)
-        values isa AbstractVector || throw(ArgumentError("batch = :matrix requires the integrand to return a vector"))
-    else
-        values = func(collect(eachcol(xmat)))
-    end
+    values = func(_vegas_batch_argument(xmat, batch))
+    batch === :matrix && !(values isa AbstractVector) &&
+        throw(ArgumentError("batch = :matrix requires the integrand to return a vector"))
     ncalls = length(weighted_values)
     length(values) == ncalls || throw(DimensionMismatch("the integrand must return $ncalls values per batch"))
     for (j, value) in enumerate(values)
@@ -53,133 +44,157 @@ function _evaluate!(weighted_values, func, xmat, batch, exponents = nothing)
     return weighted_values
 end
 
-_initialize_vegas_grid(lb, ub, nbins, initial_grid) = initial_grid
-
 function _set_uniform_grid_axis!(edges, widths, a, b)
-    width = (b - a) / length(widths)
-    _check_uniform_grid_resolution(a, b, width)
-    for i in eachindex(widths)
-        edges[i] = fma(i - 1, width, a)
-        widths[i] = width
+    nbins = length(widths)
+    if a == b
+        fill!(edges, a)
+        fill!(widths, zero(a))
+        return nothing
+    end
+
+    span = b - a
+    width = isfinite(span) ? span / nbins : b / nbins - a / nbins
+    isfinite(width) && !iszero(width) || throw(_grid_resolution_error(a, nbins))
+    edges[1] = a
+    previous = a
+    for i in 1:(nbins - 1)
+        edge = fma(i, width, a)
+        (a < b ? previous < edge < b : previous > edge > b) || throw(_grid_resolution_error(a, nbins))
+        edges[i + 1] = previous = edge
     end
     edges[end] = b
+    if !isfinite(span) || abs(width) <= 2eps(max(abs(a), abs(b))) || abs(width) < floatmin(typeof(width))
+        for i in eachindex(widths)
+            widths[i] = edges[i + 1] - edges[i]
+            isfinite(widths[i]) && !iszero(widths[i]) || throw(_grid_resolution_error(a, nbins))
+        end
+    else
+        fill!(widths, width)
+    end
     return nothing
 end
 
-_check_uniform_grid_resolution(a, b, width) = nothing
+function _set_uniform_grid_axis!(edges, widths, a::T, b::T) where {T <: _LowPrecisionGridFloat}
+    nbins = length(widths)
+    if a == b
+        fill!(edges, a)
+        fill!(widths, zero(T))
+        return nothing
+    end
 
-function _check_uniform_grid_resolution(a::BigFloat, b::BigFloat, width)
-    if a != b && abs(width) <= 2eps(max(abs(a), abs(b)))
-        throw(ArgumentError("active BigFloat precision cannot resolve the uniform grid bins"))
+    origin = Float64(a)
+    span = Float64(b) - origin
+    edges[1] = a
+    previous = a
+    for i in 1:(nbins - 1)
+        edge = T(muladd(i / nbins, span, origin))
+        (a < b ? previous < edge < b : previous > edge > b) || throw(_grid_resolution_error(a, nbins))
+        edges[i + 1] = previous = edge
+    end
+    edges[end] = b
+    for i in eachindex(widths)
+        widths[i] = edges[i + 1] - edges[i]
+        isfinite(widths[i]) && !iszero(widths[i]) || throw(_grid_resolution_error(a, nbins))
     end
     return nothing
+end
+
+function _grid_resolution_error(bound, nbins)
+    return ArgumentError("the selected coordinate precision ($(typeof(bound)), $(precision(bound)) bits) cannot represent $nbins grid bins; use fewer bins or higher-precision bounds")
 end
 
 """
     vegas(f, previous::VEGASResult; kwargs...)
 
-Integrate `f` over the bounds stored in `previous`, starting from a copy of its
-adaptive grid. The estimate and uncertainty use only the samples from this
-call. The number of bins comes from the grid. If supplied, `nbins` must match
-that number. Uniform grids with bins too narrow for `Float64` are reconstructed
-at the active `BigFloat` precision. Reusing a `BigFloat` grid requires active
-precision at least as high as the largest precision stored in its edges or
-widths. The `callback_type` option uses the stored bounds for its default.
-Other keywords have the same meaning as in [`vegas`](@ref).
+Integrate `f` over the stored bounds, starting from a copy of the adaptive grid.
+The point type and BigFloat precision come from the stored grid. The estimate
+and uncertainty use only the samples from this call. If supplied, `nbins` must
+match the grid size. Other keywords have the same meaning as in [`vegas`](@ref).
 """
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)
-    x, delx = _copy_vegas_grid(previous)
-    grid_bins = size(delx, 1)
-    (nbins === nothing || nbins == grid_bins) || throw(ArgumentError("nbins must match the previous grid ($grid_bins)"))
-    return _vegas(func, view(x, 1, :), view(x, size(x, 1), :), (x, delx); nbins = grid_bins, kwargs...)
+    edges, widths = previous.adaptive_grid, previous.grid_spacing
+    return _with_vegas_precision(_stored_grid_precision(edges, widths)) do
+        x, delx = _with_grid_rounding(_grid_coordinate_type(edges, widths)) do
+            _copy_vegas_grid(edges, widths)
+        end
+        grid_bins = size(delx, 1)
+        (nbins === nothing || nbins == grid_bins) || throw(ArgumentError("nbins must match the previous grid ($grid_bins)"))
+        _vegas(func, view(x, 1, :), view(x, size(x, 1), :), (x, delx); nbins = grid_bins, kwargs...)
+    end
 end
 
-function _copy_vegas_grid(previous)
-    edges, widths = previous.adaptive_grid, previous.grid_spacing
+function _copy_vegas_grid(edges, widths)
     edges isa AbstractMatrix{<:Real} && widths isa AbstractMatrix{<:Real} ||
         throw(ArgumentError("the previous grid must contain real matrices of edges and widths"))
     nbins, ndim = size(widths)
     nbins > 0 && ndim > 0 && size(edges) == (nbins + 1, ndim) ||
         throw(ArgumentError("the previous grid must have one more edge than width per dimension"))
-    _check_grid_precision(edges, widths)
     T = _grid_coordinate_type(edges, widths)
     x, delx = Matrix{T}(edges), Matrix{T}(widths)
     all(isfinite, x) && all(isfinite, delx) ||
         throw(ArgumentError("the previous grid must contain finite edges and widths"))
-    rtol = eltype(widths) in (Float16, Float32) ? 2eps(eltype(widths)) : 2eps(eltype(delx))
+    rtol = eltype(widths) in (Float16, Float32) ? 2eps(eltype(widths)) : 2eps(T)
     for dim in axes(x, 2)
         _canonicalize_grid_axis!(view(x, :, dim), view(delx, :, dim), rtol) ||
             throw(ArgumentError("the previous grid has inconsistent edges and widths in dimension $dim"))
     end
     if T === BigFloat
-        p = precision(BigFloat)
-        for i in eachindex(x)
-            precision(x[i]) == p || (x[i] = BigFloat(x[i]; precision = p))
+        bits = precision(BigFloat)
+        for values in (x, delx), i in eachindex(values)
+            precision(values[i]) == bits || (values[i] = BigFloat(values[i]; precision = bits))
         end
     end
-    _unresolved_uniform_grid(x, delx) && return _widen_uniform_grid(x, delx)
     return x, delx
 end
 
 function _sampling_grid(result)
     edges, widths = result.adaptive_grid, result.grid_spacing
-    _check_grid_precision(edges, widths)
-    _unresolved_uniform_grid(edges, widths) && return _copy_vegas_grid(result)
-    return edges, widths
-end
-
-_unresolved_uniform_grid(edges, widths) = false
-
-function _unresolved_uniform_grid(edges::AbstractMatrix{Float64}, widths::AbstractMatrix{Float64})
-    nbins, ndim = size(widths)
-    nbins > 0 && size(edges) == (nbins + 1, ndim) || return false
-    for dim in axes(edges, 2)
-        if _needs_wide_grid_axis(edges[1, dim], edges[end, dim], nbins) &&
-                _is_uniform_grid_axis(view(edges, :, dim), view(widths, :, dim))
-            return true
-        end
-    end
-    return false
-end
-
-function _widen_uniform_grid(edges, widths)
-    wide_edges = Matrix{BigFloat}(edges)
-    wide_edges == edges || throw(ArgumentError("active BigFloat precision cannot represent the stored grid edges"))
-    wide_widths = similar(wide_edges, size(widths))
-    for dim in axes(edges, 2)
-        if _is_uniform_grid_axis(view(edges, :, dim), view(widths, :, dim))
-            _check_bigfloat_grid_bounds(
-                edges[1, dim], edges[end, dim], wide_edges[1, dim], wide_edges[end, dim], size(widths, 1),
-            )
-            _set_uniform_grid_axis!(
-                view(wide_edges, :, dim), view(wide_widths, :, dim), wide_edges[1, dim], wide_edges[end, dim],
-            )
-        else
-            for i in axes(widths, 1)
-                a, b = wide_edges[i, dim], wide_edges[i + 1, dim]
-                _check_bigfloat_grid_bounds(edges[i, dim], edges[i + 1, dim], a, b, 1)
-                wide_widths[i, dim] = b - a
+    T = eltype(edges)
+    if T in (Float16, Float32, Float64)
+        nbins = size(widths, 1)
+        for dim in axes(edges, 2)
+            a, b = edges[begin, dim], edges[end, dim]
+            if a != b && abs((b - a) / nbins) <= 2eps(max(abs(a), abs(b))) &&
+                    _is_uniform_grid_axis(view(edges, :, dim), view(widths, :, dim))
+                return _copy_vegas_grid(edges, widths)
             end
         end
     end
-    return wide_edges, wide_widths
+    return edges, widths
 end
 
 function _canonicalize_grid_axis!(edges, widths, rtol)
     a, b = first(edges), last(edges)
-    span = b - a
-    isfinite(span) || return false
     if _is_uniform_grid_axis(edges, widths)
         _set_uniform_grid_axis!(edges, widths, a, b)
         return true
     end
-    direction = sign(span)
+    direction = cmp(b, a)
     for i in eachindex(widths)
         actual = edges[i + 1] - edges[i]
         width = widths[i]
         width_rtol = width isa BigFloat ? _bigfloat_width_rtol(width) : rtol
-        (iszero(actual) || sign(actual) == direction) && isapprox(actual, width; rtol = width_rtol) || return false
+        isfinite(actual) && (iszero(actual) || sign(actual) == direction) && isapprox(actual, width; rtol = width_rtol) || return false
         widths[i] = actual
+    end
+    return true
+end
+
+function _canonicalize_grid_axis!(edges::AbstractVector{T}, widths, rtol) where {T <: _LowPrecisionGridFloat}
+    a, b = first(edges), last(edges)
+    direction = cmp(b, a)
+    valid = all(eachindex(widths)) do i
+        actual = edges[i + 1] - edges[i]
+        return isfinite(actual) && (iszero(actual) || sign(actual) == direction) && isapprox(actual, widths[i]; rtol)
+    end
+    if valid
+        for i in eachindex(widths)
+            widths[i] = edges[i + 1] - edges[i]
+        end
+    elseif _is_uniform_grid_axis(edges, widths)
+        _set_uniform_grid_axis!(edges, widths, a, b)
+    else
+        return false
     end
     return true
 end

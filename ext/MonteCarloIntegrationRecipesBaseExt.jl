@@ -18,22 +18,21 @@ using RecipesBase: @recipe, @series
     xdim = first(dims)
     xedges = adaptive_grid[:, xdim]
     xlabel --> "Dimension $xdim"
-    xlims --> extrema(xedges)
     grid --> false
     label --> ""
 
     if length(dims) == 2
         ydim = last(dims)
         yedges = adaptive_grid[:, ydim]
+        xlims --> extrema(xedges)
         ylabel --> "Dimension $ydim"
         ylims --> extrema(yedges)
         @series begin
             seriestype := :hline
             yedges
         end
-    else
-        yshowaxis --> false
-        ylims --> (0, 1)
+        primary := false
+        label := ""
     end
 
     seriestype := :vline

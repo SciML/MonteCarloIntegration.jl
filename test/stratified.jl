@@ -52,8 +52,8 @@ using Test
         batches = Ref(0)
         seed!(1618)
         result = vegas(
-            [lb], [ub]; stratified = true, batch = :matrix, nbins = 8,
-            ncalls = 32, maxiter = 3, rtol = 0.0, atol = 0.0, callback_type = BigFloat
+            [BigFloat(lb)], [BigFloat(ub)]; stratified = true, batch = :matrix, nbins = 8,
+            ncalls = 32, maxiter = 3, rtol = 0.0, atol = 0.0
         ) do points
             batches[] += 1
             if batches[] == 1
@@ -70,14 +70,16 @@ using Test
         @test abs(result.integral_estimate - 2.0) < 5 * result.standard_deviation
     end
 
-    @testset "Stratified warm start with rounded Float64 edges" begin
+    @testset "Stratified warm start retains native narrow bounds" begin
         ub = -2.0^53
         lb = prevfloat(ub)
         nbins, ncalls, maxiter = 3, 64, 2
         edges = reshape(collect(range(lb, ub; length = nbins + 1)), :, 1)
         widths = fill((ub - lb) / nbins, nbins, 1)
         @test any(iszero, diff(edges; dims = 1))
-        previous = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        rounded = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        @test_throws ArgumentError vegas(Returns(1.0), rounded; stratified = true, ncalls, maxiter)
+        previous = vegas(Returns(0.0), [BigFloat(lb)], [BigFloat(ub)]; stratified = true, nbins, ncalls, maxiter)
 
         for batch in (false, true, :matrix)
             calls, outside = Ref(0), Ref(0)
@@ -107,13 +109,24 @@ using Test
     @testset "Stratified Jacobians for extreme boxes" begin
         offset = 10^16
         side_lengths = [1.0e-200, 1.0e-200, 1.0e200, 1.0e100]
-        exact_lb = ((offset + 12) // 1, 0.0, 0.0, 0.0)
-        exact_ub = ((offset + 1) // 1, 1.0e-200, 1.0e-200, 1.0e200)
+        exact_lb = (BigFloat(offset + 12), 0.0, 0.0, 0.0)
+        exact_ub = (BigFloat(offset + 1), 1.0e-200, 1.0e-200, 1.0e200)
+        denominator = big(1) << 58
+        narrow_lb = (BigFloat((denominator + 1) // denominator), 0.0, 0.0, 0.0)
+        narrow_ub = (BigFloat((denominator + 2) // denominator), 1.0e-200, 1.0e-200, 1.0e200)
         cases = (
             (zeros(4), side_lengths, 1.0e100, 1.0, Float64),
             (zeros(4), side_lengths[[1, 3, 2, 4]], 1.0e100, 1.0, Float64),
             (exact_lb, exact_ub, 1.0e200, -11.0, BigFloat),
+            ((Float64(offset + 12), 0.0, 0.0, 0.0), (Float64(offset + 2), 1.0e-200, 1.0e-200, 1.0e200), 1.0e200, -10.0, Float64),
+            (narrow_lb, narrow_ub, 1.0e200, exp2(-58), BigFloat),
         )
+        function typed_callback(integrand, batch, ::Type{T}) where {T}
+            scalar(point::AbstractVector{T}) = integrand(point)
+            vectors(points::Vector{<:AbstractVector{T}}) = integrand(points)
+            matrix(points::Matrix{T}) = integrand(points)
+            return batch === false ? scalar : batch === true ? vectors : matrix
+        end
         ncalls, maxiter = 64, 3
         for (lb, ub, value, expected, coordinate_type) in cases, batch in (false, true, :matrix)
             buffer = Ref{AbstractMatrix}()
@@ -142,13 +155,109 @@ using Test
                     fill(value, count)
                 end
             end
+            callback = typed_callback(integrand, batch, coordinate_type)
             seed!(2718)
-            result = vegas(integrand, lb, ub; stratified = true, batch, ncalls, maxiter, nbins = 2, alpha = 0)
+            result = vegas(callback, lb, ub; stratified = true, batch, ncalls, maxiter, nbins = 2, alpha = 0)
             @test result.integral_estimate ≈ expected rtol = 16eps(Float64)
             @test iszero(result.standard_deviation)
             @test batch_sizes == (batch === false ? ones(Int, ncalls * maxiter) : fill(ncalls, maxiter))
             @test reused[]
             @test eltype(buffer[]) === coordinate_type
+        end
+    end
+
+    @testset "Native coordinate precision in all stratified callback layouts" begin
+        options = (; stratified = true, maxiter = 1, ncalls = 128, nbins = 1, alpha = 0.0)
+        for (T, bounds, ambient) in (
+                    (Float32, (Float32[0], Float32[1]), 64),
+                    (Float64, (Float64[0], Float64[1]), 64),
+                    (BigFloat, ([BigFloat(0; precision = 96)], [BigFloat(1; precision = 128)]), 64),
+                ), batch in (false, true, :matrix)
+            setprecision(BigFloat, ambient) do
+                calls, wide = Ref(0), Ref(0)
+                right_type, right_precision = Ref(true), Ref(true)
+                function observe(point)
+                    right_type[] &= eltype(point) === T
+                    x = only(point)
+                    if T === BigFloat
+                        right_precision[] &= precision(x) == 128
+                        wide[] += x != Float64(x)
+                    end
+                    calls[] += 1
+                    return 1.0
+                end
+                integrand = batch === false ? observe : batch === true ? xs -> map(observe, xs) : xs -> map(observe, eachcol(xs))
+                seed!(734)
+                fresh = vegas(integrand, bounds...; options..., batch)
+                seed!(734)
+                warm = vegas(integrand, fresh; options..., batch)
+                @test calls[] == 2options.ncalls
+                @test right_type[] && right_precision[]
+                @test fresh.integral_estimate == warm.integral_estimate == 1
+                @test getfield(fresh, :adaptive_grid) isa Matrix{T}
+                @test getfield(warm, :grid_spacing) isa Matrix{T}
+                @test precision(BigFloat) == ambient
+                seed!(912)
+                points = MonteCarloIntegration.sample_from_adaptive_grid(warm, options.ncalls)
+                @test points isa Vector{Tuple{T}}
+                @test all(p -> 0 <= only(p) <= 1, points)
+                if T === BigFloat
+                    @test wide[] > options.ncalls
+                    @test all(p -> precision(only(p)) == 128, points)
+                    @test count(p -> only(p) != Float64(only(p)), points) > options.ncalls ÷ 2
+                end
+            end
+        end
+    end
+
+    @testset "Low-bit BigFloat stratified bins retain physical widths" begin
+        bits = 11
+        options = (; stratified = true, ncalls = 4096, nbins = 2500, maxiter = 1, alpha = 0.0)
+        lo, hi = BigFloat(-1; precision = bits), BigFloat(1; precision = bits)
+        for batch in (false, true, :matrix)
+            kept_precision = Ref(true)
+            function observe(point)
+                kept_precision[] &= precision(only(point)) == bits
+                return one(only(point))
+            end
+            f = batch === false ? observe : batch === true ? xs -> map(observe, xs) : xs -> map(observe, eachcol(xs))
+            seed!(8274)
+            fresh = vegas(f, [lo], [hi]; options..., batch)
+            seed!(8274)
+            warm = vegas(f, fresh; options..., batch)
+            @test kept_precision[]
+            @test fresh.adaptive_grid == warm.adaptive_grid
+            @test fresh.grid_spacing == warm.grid_spacing
+            @test length(unique(warm.adaptive_grid)) == options.nbins + 1
+            @test abs(warm.integral_estimate - 2.0) <= 6warm.standard_deviation + eps(2.0)
+            @test warm.integral_estimate == fresh.integral_estimate
+            @test warm.standard_deviation == fresh.standard_deviation
+        end
+    end
+
+    @testset "Native BigFloat callbacks resolve the coarse offset polynomial" begin
+        setprecision(BigFloat, 128) do
+            offset = BigFloat(2)^53
+            a, b = offset + 1 // 8, offset + 63 // 8
+            limit = 31 // 8
+            expected = Float64(2 * (limit^7 / 7 - 8limit^5 / 5 + 16limit^3 / 3))
+            options = (; stratified = true, ncalls = 4096, nbins = 4, maxiter = 1, alpha = 0.0)
+            for batch in (false, true, :matrix)
+                function polynomial(point::AbstractVector{BigFloat})
+                    t = only(point) - offset - 4
+                    return abs2(t * (t * t - 4))
+                end
+                f = batch === false ? polynomial : batch === true ? xs -> map(polynomial, xs) : xs -> map(polynomial, eachcol(xs))
+                seed!(440)
+                fresh = vegas(f, [a], [b]; options..., batch)
+                seed!(440)
+                warm = vegas(f, fresh; options..., batch)
+                @test first(warm.adaptive_grid) == a
+                @test last(warm.adaptive_grid) == b
+                @test fresh.integral_estimate == warm.integral_estimate
+                @test fresh.standard_deviation == warm.standard_deviation > 0
+                @test abs(warm.integral_estimate - expected) < 6warm.standard_deviation
+            end
         end
     end
 
@@ -357,6 +466,51 @@ using Test
             @test result.standard_deviation ≈ stderr rtol = 8eps(Float64)
             @test result.chi_squared_average ≈ chi_squared rtol = 8eps(Float64)
         end
+    end
+
+    @testset "Exact mean with one tiny stratum" begin
+        q = nextfloat(0.0)
+        ncalls, nstrata = 2048, 512
+        counts = zeros(Int, nstrata)
+        observed = Matrix{Float64}(undef, 4, nstrata)
+        batch_values = Vector{Float64}(undef, ncalls)
+        function integrand(points)
+            for i in axes(points, 2)
+                x = points[1, i]
+                cell = floor(Int, nstrata * x) + 1
+                counts[cell] += 1
+                value = cell == 1 ? (isodd(counts[cell]) ? 0.0 : q) : 1.0 + x
+                observed[counts[cell], cell] = batch_values[i] = value
+            end
+            return batch_values
+        end
+        function integrate()
+            seed!(177)
+            fill!(counts, 0)
+            return vegas(
+                integrand, [0.0], [1.0]; stratified = true, batch = :matrix,
+                ncalls, nbins = 1, maxiter = 1, alpha = 0.0,
+            )
+        end
+        result = integrate()
+        bytes = @allocated integrate()
+        mean, error = setprecision(BigFloat, 256) do
+            cells = eachcol(observed)
+            centers = map(values -> sum(BigFloat, values) / 4, cells)
+            variance = sum(zip(cells, centers)) do (values, center)
+                sum(value -> (BigFloat(value) - center)^2, values) / 12
+            end
+            return Float64(sum(centers) / nstrata), Float64(sqrt(variance) / nstrata)
+        end
+        @test all(==(4), counts)
+        @test result.integral_estimate === mean
+        @test result.standard_deviation ≈ error rtol = 8eps(Float64)
+        @test result.chi_squared_average == 0.0
+        @test bytes < 1280 * 1024
+
+        uneven_mean, variance = MonteCarloIntegration._exact_stratum_moments([2, 3], [q, 0, 0, 0, q], false)
+        @test uneven_mean == Rational{BigInt}(q) * 5 // 12
+        @test isnothing(variance)
     end
 
     @testset "Diagonal ridge at equal evaluation cost" begin

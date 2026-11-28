@@ -1,25 +1,76 @@
-function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
+function _vegas_bounds_type(lb, ub, nbins)
     length(lb) == length(ub) || throw(DimensionMismatch("bounds must have the same length"))
     isempty(lb) && throw(ArgumentError("the integration box needs at least one dimension"))
-    wide_coordinates = false
-    for dim in eachindex(lb, ub)
-        lo, hi = lb[dim], ub[dim]
-        a, b = _grid_bounds(Float64, lo, hi)
-        if !isfinite(a) || !isfinite(b)
-            isfinite(lo) && isfinite(hi) || throw(ArgumentError("bounds must be finite"))
-            wide_coordinates = true
-            continue
-        end
-        wide_coordinates |= _needs_wide_grid_axis(a, b, nbins, lo != hi) ||
-            _lossy_float64_bounds(lo, hi, a, b)
+    input = Union{}
+    bits = 0
+    for bounds in (lb, ub), bound in bounds
+        bound isa Real && isfinite(bound) || throw(ArgumentError("bounds must be finite real numbers"))
+        bound isa AbstractFloat && (input = promote_type(input, typeof(bound)))
+        bound isa BigFloat && (bits = max(bits, precision(bound)))
     end
-    return _uniform_vegas_grid(wide_coordinates ? BigFloat : Float64, lb, ub, nbins)
+    T = input === Union{} ? Float64 : input
+    T in (Float16, Float32, Float64, BigFloat) ||
+        throw(ArgumentError("bounds must promote to Float16, Float32, Float64, or BigFloat"))
+    if T === BigFloat || (input === Union{} && _needs_exact_grid_precision(lb, ub, nbins))
+        return BigFloat, iszero(bits) ? _exact_grid_bits(lb, ub, nbins) : bits
+    end
+    return T, 0
+end
+
+function _needs_exact_grid_precision(lb, ub, nbins)
+    for (lo, hi) in zip(lb, ub)
+        a, b = _grid_bounds(Float64, lo, hi)
+        isfinite(a) && isfinite(b) || return true
+        span = b - a
+        !isfinite(span) && return true
+        lo != hi && abs(span / nbins) <= max(2eps(max(abs(a), abs(b))), floatmin(Float64)) && return true
+        _grid_bounds_fit(lo, hi, a, b) || return true
+    end
+    return false
+end
+
+function _exact_grid_bits(lb, ub, nbins)
+    bits = 128
+    bins_bits = ndigits(nbins; base = 2)
+    for (lo, hi) in zip(lb, ub)
+        a, b = _exact_bound(lo), _exact_bound(hi)
+        for x in (a, b)
+            numerator_bits = ndigits(abs(numerator(x)); base = 2)
+            !iszero(x) && ispow2(denominator(x)) && (bits = max(bits, numerator_bits - trailing_zeros(abs(numerator(x)))))
+        end
+        if a != b
+            scale = _rational_exponent(max(abs(a), abs(b)))
+            span = _rational_exponent(abs(b - a))
+            bits = max(bits, 64 + bins_bits + scale - span)
+        end
+    end
+    return bits
+end
+
+_exact_bound(bound::Union{AbstractFloat, Integer, Rational}) = Rational{BigInt}(bound)
+
+function _exact_bound(bound)
+    return _with_vegas_precision(256) do
+        Rational{BigInt}(BigFloat(bound))
+    end
+end
+
+_rational_exponent(x) = ndigits(numerator(x); base = 2) - ndigits(denominator(x); base = 2)
+
+function _with_vegas_precision(f, bits)
+    return iszero(bits) || precision(BigFloat) == bits ? f() : setprecision(f, BigFloat, bits)
+end
+
+_with_grid_rounding(f, ::Type) = f()
+
+function _with_grid_rounding(f, ::Type{BigFloat})
+    return rounding(BigFloat) === RoundNearest ? f() : setrounding(f, BigFloat, RoundNearest)
 end
 
 _grid_bound(::Type{T}, bound) where {T} = T(bound)
 
-function _grid_bound(::Type{Float64}, bound::Rational)
-    return Float64(BigFloat(bound, RoundNearest; precision = 128), RoundNearest)
+function _grid_bound(::Type{T}, bound::Rational) where {T <: Union{Float16, Float32, Float64}}
+    return T(BigFloat(bound, RoundNearest; precision = 128), RoundNearest)
 end
 
 function _grid_bound(::Type{BigFloat}, bound::Rational)
@@ -50,12 +101,6 @@ function _grid_bounds(T, lo, hi)
     return _grid_bound(T, lo), _grid_bound(T, hi)
 end
 
-function _needs_wide_grid_axis(a, b, nbins, nonflat = a != b)
-    span = b - a
-    spacing = eps(max(abs(a), abs(b)))
-    return !isfinite(span) || (nonflat && abs(span / nbins) <= max(2spacing, floatmin(Float64)))
-end
-
 _is_binary_exact_bound(bound::Union{Integer, AbstractFloat}) = true
 _is_binary_exact_bound(bound::Rational) = ispow2(denominator(bound))
 _is_binary_exact_bound(bound) = false
@@ -63,62 +108,41 @@ _is_binary_exact_bound(bound) = false
 _binary_bound_rounded(original, converted) =
     _is_binary_exact_bound(original) && original != converted
 
-function _lossy_float64_bounds(lo, hi, a, b)
-    a == lo && b == hi && return false
-    return _binary_bound_rounded(lo, a) || _binary_bound_rounded(hi, b) || !_grid_span_matches(lo, hi, a, b, b - a, 1)
-end
-
-_original_rational_bound(original::Rational, converted) = Rational{BigInt}(original)
-_original_rational_bound(original::Union{Integer, AbstractFloat}, converted) = Rational{BigInt}(converted)
-
-function _original_rational_bound(original, converted)
-    bits = max(256, precision(BigFloat) + 64)
-    value = BigFloat(original; precision = bits)
-    isfinite(value) || throw(ArgumentError("bounds must be finite"))
-    # BigFloat's full decimal rendering uses the stored precision of the value.
-    parts = split(string(value), 'e'; limit = 2)
-    whole, fraction = split(first(parts), '.'; limit = 2)
-    exponent = length(parts) == 2 ? parse(Int, last(parts)) : 0
-    power = exponent - length(fraction)
-    coefficient = parse(BigInt, string(whole, fraction))
-    factor = big(10)^abs(power)
-    return power < 0 ? coefficient // factor : (coefficient * factor) // 1
-end
-
-_span_within_float64_tolerance(expected, actual) =
-    abs(expected - actual) * (Int64(1) << 51) <= max(abs(expected), abs(actual))
-
-function _grid_span_matches(lo, hi, a, b, width, nbins)
-    expected = _original_rational_bound(hi, b) - _original_rational_bound(lo, a)
-    _span_within_float64_tolerance(expected, Rational{BigInt}(width) * nbins) || return false
-    return nbins == 1 || _span_within_float64_tolerance(expected, Rational{BigInt}(width * nbins))
-end
-
-function _check_bigfloat_grid_bounds(lo, hi, a, b, nbins)
-    reason = if _binary_bound_rounded(lo, a) || _binary_bound_rounded(hi, b)
-        "preserve the grid bounds exactly"
-    elseif (lo < hi) != (a < b) || (hi < lo) != (b < a) || !_grid_span_matches(lo, hi, a, b, (b - a) / nbins, nbins)
-        "preserve the signed grid span"
-    else
-        return nothing
-    end
-    throw(ArgumentError("active BigFloat precision ($(precision(BigFloat)) bits) cannot $reason; increase it with setprecision"))
+function _grid_bounds_fit(lo, hi, a, b)
+    a == lo && b == hi && return true
+    _binary_bound_rounded(lo, a) && return false
+    _binary_bound_rounded(hi, b) && return false
+    (lo < hi) == (a < b) && (hi < lo) == (b < a) || return false
+    lo == hi && return true
+    expected = _exact_bound(hi) - _exact_bound(lo)
+    actual = Rational{BigInt}(b) - Rational{BigInt}(a)
+    scale = big(1) << max(0, min(precision(a), precision(b), 53) - 2)
+    return abs(expected - actual) * scale <= max(abs(expected), abs(actual))
 end
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
-    grid = Matrix{T}(undef, nbins + 1, length(lb))
-    widths = Matrix{T}(undef, nbins, length(lb))
-    for dim in eachindex(lb, ub)
-        lo, hi = lb[dim], ub[dim]
-        a, b = _grid_bounds(T, lo, hi)
-        T === BigFloat && _check_bigfloat_grid_bounds(lo, hi, a, b, nbins)
-        _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
+    return _with_grid_rounding(T) do
+        grid = Matrix{T}(undef, nbins + 1, length(lb))
+        widths = Matrix{T}(undef, nbins, length(lb))
+        for (dim, (lo, hi)) in enumerate(zip(lb, ub))
+            a, b = _grid_bounds(T, lo, hi)
+            isfinite(a) && isfinite(b) && _grid_bounds_fit(lo, hi, a, b) ||
+                throw(ArgumentError("the promoted coordinate precision cannot preserve the bounds in dimension $dim"))
+            _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
+        end
+        grid, widths
     end
-    return grid, widths
 end
 
-_grid_coordinate_type(edges, widths) =
-    eltype(edges) === BigFloat || eltype(widths) === BigFloat ? BigFloat : Float64
+_grid_coordinate_type(edges, widths) = float(promote_type(eltype(edges), eltype(widths)))
+
+const _LowPrecisionGridFloat = Union{Float16, Float32}
+
+_grid_bin_width(edges, widths, bin, tail...) = widths[bin, tail...]
+
+function _grid_bin_width(edges::AbstractArray{T}, widths, bin, tail...) where {T <: _LowPrecisionGridFloat}
+    return Float64(edges[bin + 1, tail...]) - Float64(edges[bin, tail...])
+end
 
 function _bound_grid_point(point, grid, dim)
     return clamp(point, minmax(grid[1, dim], grid[end, dim])...)
@@ -126,16 +150,9 @@ end
 
 _stored_grid_precision(grid) = 0
 _stored_grid_precision(grid::AbstractArray{BigFloat}) = maximum(precision, grid; init = 0)
+_stored_grid_precision(edges, widths) = max(_stored_grid_precision(edges), _stored_grid_precision(widths))
 
-function _check_grid_precision(edges, widths)
-    required = max(_stored_grid_precision(edges), _stored_grid_precision(widths))
-    iszero(required) && return nothing
-    active = precision(BigFloat)
-    active >= required || throw(ArgumentError("the grid requires BigFloat precision of at least $required bits (active precision is $active bits)"))
-    return nothing
-end
-
-function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, training_weights = nothing)
+function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, proposed = nothing, training_weights = nothing)
     nbins, ndim = size(mass)
     (iszero(alpha) || nbins == 1) && return
     scale = maximum(abs, values)
@@ -143,7 +160,8 @@ function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, 
     _bin_means!(mass, counts, bins, values, scale, training_weights)
     for dim in 1:ndim
         _smooth_weights!(scratch, view(mass, :, dim), alpha)
-        _rebin!(view(grid, :, dim), view(widths, :, dim), scratch, view(mass, :, dim))
+        candidate = proposed === nothing ? view(mass, :, dim) : proposed
+        _rebin!(view(grid, :, dim), view(widths, :, dim), scratch, candidate)
     end
     return nothing
 end
@@ -183,10 +201,64 @@ function _smooth_weights!(weights, histogram, alpha)
     return weights
 end
 
+function _set_uniform_grid_axis!(edges, widths, a::BigFloat, b::BigFloat)
+    bits = precision(BigFloat)
+    nbins = length(widths)
+    if a == b
+        fill!(edges, a)
+        fill!(widths, zero(a))
+        return nothing
+    end
+    _with_vegas_precision(bits + ndigits(nbins; base = 2) + 32) do
+        span = b - a
+        edges[1] = a
+        previous = a
+        for i in 1:(nbins - 1)
+            edge = BigFloat(fma(BigFloat(i) / nbins, span, a); precision = bits)
+            (a < b ? previous < edge < b : previous > edge > b) || throw(_grid_resolution_error(a, nbins))
+            edges[i + 1] = previous = edge
+        end
+        edges[end] = b
+    end
+    for i in eachindex(widths)
+        width = edges[i + 1] - edges[i]
+        isfinite(width) && !iszero(width) || throw(_grid_resolution_error(a, nbins))
+        widths[i] = width
+    end
+    return nothing
+end
+
+_with_vegas_mapping(f, edges, widths) = f(widths, nothing)
+
+function _with_vegas_mapping(f, edges::AbstractArray{BigFloat}, widths)
+    bits = precision(BigFloat)
+    bits >= 64 && return f(widths, nothing)
+    return _with_vegas_precision(64) do
+        f(diff(edges; dims = 1), bits)
+    end
+end
+
+_round_vegas_coordinate(point, ::Nothing) = point
+_round_vegas_coordinate(point::BigFloat, bits::Int) = BigFloat(point; precision = bits)
+
 function _rebin!(edges, widths, mass, proposed)
+    return _with_grid_rounding(eltype(edges)) do
+        changed = _with_vegas_mapping(edges, widths) do working_widths, bits
+            _rebin_grid_axis!(edges, working_widths, mass, proposed, bits)
+        end
+        if changed
+            for i in eachindex(widths)
+                widths[i] = edges[i + 1] - edges[i]
+            end
+        end
+        nothing
+    end
+end
+
+function _rebin_grid_axis!(edges, working_widths, mass, proposed, bits)
     nbins = length(mass)
     step = sum(mass) / nbins
-    iszero(step) && return
+    iszero(step) && return false
     bin = 1
     left = 0.0
     right = mass[1]
@@ -200,16 +272,15 @@ function _rebin!(edges, widths, mass, proposed)
             right += mass[bin]
         end
         fraction = clamp((target - left) / mass[bin], 0.0, 1.0)
-        edge = muladd(fraction, widths[bin], edges[bin])
+        edge = _round_vegas_coordinate(eltype(edges)(muladd(fraction, _grid_bin_width(edges, working_widths, bin), edges[bin])), bits)
         # Keep the current map if a narrower bin cannot be represented on this axis.
-        (ascending ? previous < edge < last(edges) : previous > edge > last(edges)) || return
+        (ascending ? previous < edge < last(edges) : previous > edge > last(edges)) || return false
+        isfinite(_round_vegas_coordinate(edge - previous, bits)) || return false
         proposed[i] = previous = edge
     end
+    isfinite(_round_vegas_coordinate(last(edges) - previous, bits)) || return false
     edges[2:nbins] .= view(proposed, 1:(nbins - 1))
-    for i in eachindex(widths)
-        widths[i] = edges[i + 1] - edges[i]
-    end
-    return nothing
+    return true
 end
 
 """
