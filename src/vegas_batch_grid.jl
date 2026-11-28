@@ -8,10 +8,11 @@ _vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points))
 _apply_vegas_weight(weight, value, ::Nothing, _) = weight * value
 
 const _WideVegasValue = Union{BigInt, Rational{BigInt}, BigFloat}
-const _BinaryOrExactVegasValue = Union{Integer, Rational, Float16, Float32, Float64, BigFloat}
+const _BinaryVegasFloat = Union{Float16, Float32, Float64}
+const _BinaryOrExactVegasValue = Union{Integer, Rational, _BinaryVegasFloat, BigFloat}
 
 _vegas_weight_significand(value::Union{Integer, Rational}) = value, 0
-_vegas_weight_significand(value::Union{Float16, Float32, Float64}) = Rational{BigInt}(value), 0
+_vegas_weight_significand(value::_BinaryVegasFloat) = Rational{BigInt}(value), 0
 
 function _vegas_weight_significand(value::BigFloat)
     return _with_vegas_precision(precision(value)) do
@@ -42,6 +43,13 @@ _apply_vegas_weight(weight::Float64, value::_WideVegasValue, ::Nothing, _) = _ap
 _apply_vegas_weight(weight::Float64, value::_WideVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
 _apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, ::Nothing, _) = _apply_exact_vegas_weight(weight, value, 0)
 _apply_vegas_weight(weight::BigFloat, value::_BinaryOrExactVegasValue, exponents, j) = _apply_exact_vegas_weight(weight, value, exponents[j])
+
+function _apply_vegas_weight(weight::BigFloat, value::_BinaryVegasFloat, ::Nothing, _)
+    # The binary product needs at most the sum of the two significand lengths.
+    return _with_vegas_precision(precision(weight) + precision(typeof(value))) do
+        Float64(weight * value, RoundNearest)
+    end
+end
 
 function _apply_vegas_weight(weight, value, exponents, j)
     mantissa, exponent = frexp(float(value))

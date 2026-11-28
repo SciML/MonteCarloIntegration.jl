@@ -407,6 +407,52 @@ end
     end
 end
 
+@testset "Native binary callback products straddle Float64 midpoints" begin
+    power(n) = n < 0 ? big(1) // (big(1) << -n) : (big(1) << n) // 1
+    setprecision(BigFloat, 128) do
+        for T in (Float16, Float32, Float64)
+            larger = nextfloat(one(T))
+            smaller = prevfloat(one(T), 4)
+            cases = (
+                (larger, 1 + power(-53)),
+                (smaller, power(-1022) - 3power(-1075)),
+                (larger, power(1024) - power(970)),
+            )
+            for (magnitude, midpoint) in cases, side in (RoundDown, RoundUp)
+                quotient = midpoint / Rational{BigInt}(magnitude)
+                width = BigFloat(quotient, side; precision = 128)
+                product = Rational{BigInt}(width) * Rational{BigInt}(magnitude)
+                @test side === RoundDown ? product < midpoint : product > midpoint
+                @test floatmin(Float64) <= Float64(width, RoundNearest) <= floatmax(Float64)
+                for reversed in (false, true), callback_sign in (-1, 1)
+                    a, b = reversed ? (width, zero(width)) : (zero(width), width)
+                    value = copysign(magnitude, T(callback_sign))
+                    exact = (reversed ? -product : product) * callback_sign
+                    expected = Float64(BigFloat(exact; precision = 256), RoundNearest)
+                    for mode in (RoundNearest, RoundUp, RoundDown)
+                        setrounding(BigFloat, mode) do
+                            observed = Ref(true)
+                            function integrand(_)
+                                observed[] &= precision(BigFloat) == 128 && rounding(BigFloat) === mode
+                                return value
+                            end
+                            run() = vegas(integrand, [a], [b]; ncalls = 4, nbins = 1, maxiter = 1, alpha = 0.0)
+                            if isfinite(expected)
+                                result = run()
+                                @test (result.integral_estimate, result.standard_deviation) === (expected, 0.0)
+                            else
+                                @test_throws DomainError run()
+                            end
+                            @test observed[]
+                            @test precision(BigFloat) == 128 && rounding(BigFloat) === mode
+                        end
+                    end
+                end
+            end
+        end
+    end
+end
+
 @testset "Warm starts use the stored precision of mixed grid matrices" begin
     setprecision(BigFloat, 128) do
         for T in (Float16, Float32, Float64), reverse_axis in (false, true)
