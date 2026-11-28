@@ -83,6 +83,7 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     unit_points = T in (Float64, BigFloat) ? points : similar(points, Float64)
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
+    jacobians = _vegas_weight_buffer(values, T)
     mass = similar(widths, Float64)
     counts = similar(bins, nbins, ndim)
     scratch = zeros(nbins)
@@ -95,8 +96,8 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     lowest = highest = 0.0
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
-        _sample_vegas_iteration!(points, unit_points, bins, values, exponents, grid, widths)
-        _evaluate!(values, func, points, batch, exponents)
+        _sample_vegas_iteration!(points, unit_points, bins, jacobians, exponents, grid, widths)
+        _evaluate!(values, func, points, batch, exponents, jacobians)
         estimate, stderr, exact_mean, exact_variance = _iteration_moments(values)
         if maxiter > 1
             push!(estimates, estimate)
@@ -132,16 +133,20 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     return VEGASResult(_rounded_mean(mean), _rounded_error(error), chi_squared, grid, widths)
 end
 
-function _sample_vegas_iteration!(points, unit_points, bins, values, exponents, grid, widths)
+_vegas_weight_buffer(values, ::Type) = values
+_vegas_weight_buffer(values, ::Type{BigFloat}) = similar(values, BigFloat)
+
+function _sample_vegas_iteration!(points, unit_points, bins, weights, exponents, grid, widths)
     return _with_vegas_mapping(grid, widths) do working_widths, bits
         rand!(unit_points)
-        _map_vegas_points!(points, unit_points, bins, values, exponents, grid, working_widths, bits)
+        _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, working_widths, bits)
     end
 end
 
 function _vegas_jacobian_exponents(grid, widths, ncalls)
     return _with_vegas_mapping(grid, widths) do working_widths, _
-        _requires_scaled_jacobian(working_widths, grid) ? Vector{Int}(undef, ncalls) : nothing
+        _requires_scaled_jacobian(working_widths, grid) || return nothing
+        return eltype(grid) === BigFloat ? Vector{Int128}(undef, ncalls) : Vector{Int}(undef, ncalls)
     end
 end
 
@@ -178,19 +183,24 @@ _vegas_jacobian_factor(width::BigFloat, nbins) = nbins * width
 _float64_jacobian(value::Float64) = value
 _float64_jacobian(value::BigFloat) = Float64(value, RoundNearest)
 
+@inline function _map_vegas_coordinate!(points, unit_points, bins, grid, widths, nbins, bits, dim, j)
+    y = unit_points[dim, j] * nbins
+    bin = floor(Int, y) + 1
+    eltype(unit_points) === BigFloat && (bin = min(nbins, bin))
+    bins[dim, j] = bin
+    width = _grid_bin_width(grid, widths, bin, dim)
+    point = muladd(y - (bin - 1), width, grid[bin, dim])
+    points[dim, j] = _round_vegas_coordinate(_bound_grid_point(point, grid, dim), bits)
+    return width
+end
+
 function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid, widths, bits = nothing)
     nbins = size(widths, 1)
     unit_jacobian = _vegas_jacobian_one(eltype(grid))
     for j in axes(points, 2)
         jacobian, exponent = unit_jacobian, 0
         for dim in axes(points, 1)
-            y = unit_points[dim, j] * nbins
-            bin = floor(Int, y) + 1
-            eltype(unit_points) === BigFloat && (bin = min(nbins, bin))
-            bins[dim, j] = bin
-            width = _grid_bin_width(grid, widths, bin, dim)
-            point = muladd(y - (bin - 1), width, grid[bin, dim])
-            points[dim, j] = _round_vegas_coordinate(_bound_grid_point(point, grid, dim), bits)
+            width = _map_vegas_coordinate!(points, unit_points, bins, grid, widths, nbins, bits, dim, j)
             if exponents === nothing
                 jacobian *= _vegas_jacobian_factor(width, nbins)
             else
@@ -203,6 +213,33 @@ function _map_vegas_points!(points, unit_points, bins, weights, exponents, grid,
         exponents === nothing || (exponents[j] = exponent)
     end
     return nothing
+end
+
+function _map_vegas_points!(points, unit_points, bins, weights::AbstractVector{BigFloat}, exponents, grid, widths, bits = nothing)
+    nbins, ndim = size(widths)
+    for j in axes(points, 2), dim in axes(points, 1)
+        _map_vegas_coordinate!(points, unit_points, bins, grid, widths, nbins, bits, dim, j)
+    end
+    # Each binary factor adds at most its significand length to the exact product.
+    product_bits = Int(widemul(ndim, precision(BigFloat) + ndigits(nbins; base = 2)))
+    return _with_vegas_precision(product_bits) do
+        for j in eachindex(weights)
+            jacobian, exponent = one(BigFloat), Int128(0)
+            for dim in axes(bins, 1)
+                width = _grid_bin_width(grid, widths, bins[dim, j], dim)
+                if exponents === nothing
+                    jacobian *= width * nbins
+                else
+                    mantissa, shift = frexp(width)
+                    jacobian, step = frexp(jacobian * (mantissa * nbins))
+                    exponent += Int128(shift) + step
+                end
+            end
+            weights[j] = jacobian
+            exponents === nothing || (exponents[j] = exponent)
+        end
+        nothing
+    end
 end
 
 """

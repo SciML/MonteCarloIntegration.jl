@@ -644,9 +644,21 @@ end
     edges = reshape(Float64[i * width for i in 0:3], :, 1)
     widths = fill(Float64(width), 3, 1)
     historical = MonteCarloIntegration.VEGASResult(0.0, 0.0, 0.0, edges, widths)
+    physical = diff(edges; dims = 1)
+    nbins, ncalls = options.nbins, options.ncalls
+    Random.seed!(22)
+    bins = floor.(Int, nbins .* rand(ncalls)) .+ 1
+    weights = Rational{BigInt}.(nbins .* physical[bins])
+    expected = sum(weights) / ncalls
+    variance = sum(abs2, weights .- expected) / (ncalls * (ncalls - 1))
+    expected_error = setprecision(BigFloat, 256) do
+        Float64(sqrt(BigFloat(variance)))
+    end
+    Random.seed!(22)
     reused = vegas(Returns(1), historical; ncalls = options.ncalls, maxiter = options.maxiter, alpha = 0.0)
-    @test reused.integral_estimate ≈ 1.0
+    @test reused.integral_estimate === Float64(expected)
+    @test reused.standard_deviation === expected_error
     @test edges[2] == Float64(width)
     @test reused.adaptive_grid == edges
-    @test reused.grid_spacing == diff(edges; dims = 1)
+    @test reused.grid_spacing == physical
 end
