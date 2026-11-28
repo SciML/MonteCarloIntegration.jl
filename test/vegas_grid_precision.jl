@@ -71,17 +71,33 @@ end
     a = 9767792313524413 // 29303376940573329
     b = a + 1 // 8
     cases = (
-        (1 // 3, 5 // 3, 4 / 3),
-        (big(1) // 3, big(5) // 3, 4 / 3),
-        (a, b, 0.125),
-        (big(a), big(b), 0.125),
+        (1 // 3, 5 // 3),
+        (big(1) // 3, big(5) // 3),
+        (a, b),
+        (big(a), big(b)),
     )
+    nbins, ncalls = 2, 16
     setprecision(BigFloat, 16) do
-        for (lo, hi, span) in cases
-            for (x, y, width) in ((lo, hi, span), (hi, lo, -span))
-                result = vegas(Returns(1.0), [x], [y]; nbins = 2, ncalls = 16, maxiter = 1)
+        for (lo, hi) in cases
+            for (x, y, seed) in ((lo, hi, 17), (hi, lo, 2))
+                seed!(seed)
+                units = rand(1, ncalls)
+                seed!(seed)
+                result = vegas(Returns(1.0), [x], [y]; nbins, ncalls, maxiter = 1, alpha = 0.0)
                 @test eltype(result.adaptive_grid) === Float64
-                @test result.integral_estimate ≈ width rtol = 2eps(Float64)
+                grid, widths = result.adaptive_grid, result.grid_spacing
+                exact_edges = map(bound_ratio, vec(grid))
+                bin_spans = diff(exact_edges)
+                expected = sum(u -> nbins * bin_spans[floor(Int, nbins * u) + 1], units) / ncalls
+                @test result.integral_estimate == Float64(BigFloat(expected; precision = 128))
+
+                midpoints = reshape([0.25, 0.75], 1, :)
+                weights = zeros(nbins)
+                MonteCarloIntegration._map_vegas_points!(similar(midpoints), midpoints, zeros(Int, size(midpoints)), weights, nothing, grid, widths)
+                full_bin_span = sum(bound_ratio, weights) / nbins
+                requested_span = bound_ratio(y) - bound_ratio(x)
+                @test full_bin_span == last(exact_edges) - first(exact_edges)
+                @test abs(full_bin_span - requested_span) <= bound_ratio(2eps(Float64)) * abs(requested_span)
                 @test all(p -> lo <= Rational{BigInt}(p) <= hi, result.adaptive_grid)
                 samples = MonteCarloIntegration.sample_from_adaptive_grid(result, 32)
                 @test all(p -> lo <= Rational{BigInt}(only(p)) <= hi, samples)

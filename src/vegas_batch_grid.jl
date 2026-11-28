@@ -63,13 +63,9 @@ function _set_uniform_grid_axis!(edges, widths, a, b)
         edges[i + 1] = previous = edge
     end
     edges[end] = b
-    if !isfinite(span) || abs(width) <= 2eps(max(abs(a), abs(b))) || abs(width) < floatmin(typeof(width))
-        for i in eachindex(widths)
-            widths[i] = edges[i + 1] - edges[i]
-            isfinite(widths[i]) && !iszero(widths[i]) || throw(_grid_resolution_error(a, nbins))
-        end
-    else
-        fill!(widths, width)
+    for i in eachindex(widths)
+        widths[i] = edges[i + 1] - edges[i]
+        isfinite(widths[i]) && !iszero(widths[i]) || throw(_grid_resolution_error(a, nbins))
     end
     return nothing
 end
@@ -150,7 +146,9 @@ end
 function _sampling_grid(result)
     edges, widths = result.adaptive_grid, result.grid_spacing
     T = eltype(edges)
-    if T in (Float16, Float32, Float64)
+    if T === Float64
+        _float64_grid_spans_match(edges, widths) || return _copy_vegas_grid(edges, widths)
+    elseif T in (Float16, Float32)
         nbins = size(widths, 1)
         for dim in axes(edges, 2)
             a, b = edges[begin, dim], edges[end, dim]
@@ -161,6 +159,31 @@ function _sampling_grid(result)
         end
     end
     return edges, widths
+end
+
+function _float64_grid_spans_match(edges, widths)
+    size(edges) == (size(widths, 1) + 1, size(widths, 2)) || return false
+    for dim in axes(widths, 2), i in axes(widths, 1)
+        edges[i + 1, dim] - edges[i, dim] == widths[i, dim] || return false
+    end
+    return true
+end
+
+function _canonicalize_grid_axis!(edges::AbstractVector{Float64}, widths, rtol)
+    a, b = first(edges), last(edges)
+    direction = cmp(b, a)
+    nominal = _is_uniform_grid_axis(edges, widths)
+    if nominal && a != b && any(i -> edges[i + 1] == edges[i], eachindex(widths))
+        _set_uniform_grid_axis!(edges, widths, a, b)
+        return true
+    end
+    for i in eachindex(widths)
+        actual = edges[i + 1] - edges[i]
+        isfinite(actual) && (iszero(actual) || sign(actual) == direction) || return false
+        (nominal || isapprox(actual, widths[i]; rtol)) || return false
+        widths[i] = actual
+    end
+    return true
 end
 
 function _canonicalize_grid_axis!(edges, widths, rtol)

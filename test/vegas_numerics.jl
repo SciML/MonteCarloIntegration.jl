@@ -18,7 +18,7 @@ end
             (Returns(0), zeros(100), ones(100), 0.0),
             (Returns(7), [1.5], [1.5], 0.0),
         )
-        result = vegas(f, lo, hi; maxiter = 3)
+        result = vegas(f, lo, hi; nbins = 2, maxiter = 3)
         @test result.integral_estimate ≈ expected
         @test iszero(result.standard_deviation)
         @test iszero(result.chi_squared_average)
@@ -31,6 +31,29 @@ end
         @test isfinite(result.integral_estimate) && result.integral_estimate >= 0
         @test isfinite(result.standard_deviation) && result.standard_deviation >= 0
         @test all(>(0), diff(result.adaptive_grid; dims = 1))
+    end
+end
+
+@testset "Constant integrands on distinct physical Float64 spans" begin
+    nbins, ncalls = 1000, 256
+    lo, hi = [1.0, 0.0], [0.0, 2.0]
+    Random.seed!(29)
+    units = rand(2, ncalls)
+    Random.seed!(29)
+    result = vegas(Returns(-3), lo, hi; nbins, ncalls, maxiter = 1, alpha = 0.0)
+    spans = diff(result.adaptive_grid; dims = 1)
+    weighted = map(axes(units, 2)) do i
+        first_bin = floor(Int, nbins * units[1, i]) + 1
+        second_bin = floor(Int, nbins * units[2, i]) + 1
+        -3 * ((nbins * spans[first_bin, 1]) * (nbins * spans[second_bin, 2]))
+    end
+    setprecision(BigFloat, 256) do
+        average = sum(BigFloat, weighted) / ncalls
+        sem = sqrt(sum(value -> abs2(BigFloat(value) - average), weighted) / (ncalls * (ncalls - 1)))
+        @test result.grid_spacing == spans
+        @test result.integral_estimate == Float64(average)
+        @test sem > 0
+        @test result.standard_deviation ≈ Float64(sem) rtol = 4eps(Float64)
     end
 end
 
