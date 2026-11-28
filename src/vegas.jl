@@ -17,7 +17,7 @@ include("stratified.jl")
 """
     vegas(f, lb = zeros(2), ub = ones(2); maxiter = 10, nbins = 1000,
           ncalls = 10000, rtol = 1e-4, atol = 1e-4, debug = false, batch = false,
-          alpha = 1.5, stratified = false)
+          alpha = 1.5, callback_type = nothing, stratified = false)
 
 Estimate the integral of a real scalar function over the box from `lb` to `ub`
 using adaptive importance sampling. Each of up to `maxiter` iterations draws
@@ -26,7 +26,7 @@ strongly it adapts, with `alpha = 0` holding the grid fixed. With `batch = true`
 `f` receives a vector of `ncalls` coordinate vectors. With `batch = :matrix`, it
 receives the reusable `length(lb) × ncalls` matrix. Each batch returns one value per point.
 
-Sample coordinates and grid edges normally use `Float64`. Non-dyadic rational
+Grid coordinates normally use `Float64`. Non-dyadic rational
 bounds and built-in irrational constants are rounded inward for intervals of
 nonzero width. VEGAS uses `BigFloat` when bin widths are subnormal or approach
 the spacing between adjacent `Float64` values, a bound or span overflows, a
@@ -35,6 +35,14 @@ The active `BigFloat` precision must preserve binary-exact bounds and the signed
 span to `Float64` accuracy and resolve the bins. Increase it around the call
 with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
 errors use `Float64`.
+
+With `callback_type = nothing`, the integrand receives `Float64` coordinates
+when all grid bounds are exactly representable as finite `Float64` values and
+`BigFloat` coordinates otherwise. This applies to all batch modes. Use
+`callback_type = BigFloat` to receive distinct coordinates between adjacent
+`Float64` values on widened grids. On a `Float64` grid, this converts the existing
+coordinates at the active `BigFloat` precision. An explicit callback type must
+represent the grid bounds exactly.
 
 With `stratified = true`, VEGAS+ partitions the transformed unit box into
 equal-volume strata, samples at least twice per stratum, and uses the previous
@@ -66,7 +74,8 @@ end
 
 function _vegas(
         func, lb, ub, initial_grid; maxiter = 10, nbins = 1000, ncalls = 10000,
-        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5, stratified = false
+        rtol = 1.0e-4, atol = 1.0e-4, debug = false, batch = false, alpha = 1.5,
+        callback_type = nothing, stratified = false
     )
     _check_vegas_batch(batch)
     maxiter >= 1 || throw(ArgumentError("maxiter must be positive"))
@@ -75,22 +84,26 @@ function _vegas(
     isfinite(alpha) && alpha >= 0 || throw(ArgumentError("alpha must be finite and nonnegative"))
     grid, widths = _initialize_vegas_grid(lb, ub, nbins, initial_grid)
     strata = stratified ? _VegasStrata(size(grid, 2), ncalls) : nothing
-    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata)
+    coordinates = _vegas_callback_type(grid, callback_type)
+    return _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata, coordinates)
 end
 
-function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata)
+function _integrate_vegas(
+        func, grid, widths, maxiter, ncalls, rtol, atol, debug, batch, alpha, strata, ::Type{T}
+    ) where {T}
     nbins = size(widths, 1)
     ndim = size(grid, 2)
-    points = Matrix{eltype(grid)}(undef, ndim, ncalls)
-    unit_points = eltype(points) === Float64 ? points : similar(points, Float64)
+    points = Matrix{T}(undef, ndim, ncalls)
+    unit_points = T === Float64 ? points : similar(points, Float64)
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     mass = similar(widths)
     counts = isnothing(strata) ? similar(bins, nbins, ndim) : nothing
     scratch = zeros(nbins)
     exponents = _requires_scaled_jacobian(widths) ? Vector{Int}(undef, ncalls) : nothing
-    estimates = Float64[]
-    errors = Float64[]
+    estimates = _IterationMean[]
+    errors = _IterationError[]
+    exact_means = exact_variances = nothing
     mean = error = chi_squared = 0.0
     for iter in 1:maxiter
         if isnothing(strata)
@@ -100,17 +113,17 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
         end
         _map_vegas_points!(points, unit_points, bins, values, exponents, grid, widths)
         _evaluate!(values, func, points, batch, exponents)
-        estimate, stderr = isnothing(strata) ? _iteration_estimate(values) : _stratified_estimate!(strata, values)
-        push!(estimates, estimate)
-        push!(errors, stderr)
+        estimate, stderr, exact_mean, exact_variance = isnothing(strata) ? _iteration_moments(values) : _stratified_estimate!(strata, values)
+        exact_means = _record_iteration_mean!(estimates, exact_means, estimate, exact_mean)
+        exact_variances = _record_iteration_variance!(errors, exact_variances, stderr, exact_variance)
         adapt_grid = !iszero(stderr) && !iszero(alpha) && nbins > 1
         if adapt_grid
             training_weights = isnothing(strata) ? nothing : _stratified_training_weights!(strata)
             _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, training_weights)
         end
-        mean, error, chi_squared = _combine_estimates(estimates, errors)
-        debug && println("Iteration $iter, abs(sd/Itot) = $(abs(error / mean))")
-        if 0.0 < error < atol && error < rtol * abs(mean)
+        mean, error, chi_squared = _combine_estimates(estimates, errors, exact_means, exact_variances)
+        debug && println("Iteration $iter, abs(sd/Itot) = $(abs(_rounded_error(error) / _rounded_mean(mean)))")
+        if _meets_error_tolerances(error, mean, rtol, atol)
             println("Converged in $(iter * ncalls) evaluations")
             break
         end
@@ -123,7 +136,7 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
             end
         end
     end
-    return VEGASResult(mean, error, chi_squared, grid, widths)
+    return VEGASResult(_rounded_mean(mean), _rounded_error(error), chi_squared, grid, widths)
 end
 
 function _requires_scaled_jacobian(widths)
@@ -188,7 +201,6 @@ function sample_from_adaptive_grid(res, ncalls)
     from_y_to_i(y) = floor(Int, nbins * y) + 1
     delta(y) = y * nbins + 1 - from_y_to_i(y)
     from_y_to_x(y, dim) = _bound_grid_point(x[from_y_to_i(y), dim] + delx[from_y_to_i(y), dim] * delta(y), x, dim)
-    J(y, dim) = nbins * delx[from_y_to_i(y), dim]
 
     xmat = similar(ymat, _grid_coordinate_type(x, delx))
     for dim in 1:ndim

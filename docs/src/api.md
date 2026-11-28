@@ -27,6 +27,24 @@ signed span to `Float64` accuracy and resolve the bins. If needed, use
 integrand can accept both coordinate types by preserving the element type of
 its inputs.
 
+The default `callback_type = nothing` passes `Float64` coordinates to the
+integrand when all grid bounds are exactly representable as finite `Float64`
+values and `BigFloat` coordinates otherwise. This applies to scalar and batch
+calls. Use `callback_type = BigFloat` to observe distinct coordinates between
+adjacent `Float64` values on a widened grid. On a `Float64` grid this converts the
+existing coordinates at the active `BigFloat` precision. An explicit callback
+type must represent all grid bounds exactly.
+
+The function below ranges from 1 to 3 between its bounds and integrates to 4.
+The widened callback coordinates let it evaluate at points between those bounds.
+
+```@example matrix_batch
+a = 1.0e16
+b = nextfloat(a)
+narrow = vegas(x -> 1 + (only(x) - a), [a], [b]; nbins = 2, callback_type = BigFloat)
+narrow.integral_estimate
+```
+
 On boxes with extreme axis lengths, VEGAS scales its Jacobian to avoid
 intermediate overflow or underflow. This applies to scalar and batched
 evaluations in both sampling modes.
@@ -36,7 +54,8 @@ evaluations in both sampling modes.
 Pass a previous result to start a fresh estimate on its stored bounds and grid.
 For example, reuse the Gaussian's grid to compute its second radial moment.
 When reusing or sampling a `BigFloat` grid, set the active precision to at
-least the largest precision stored in the grid's edges or widths.
+least the largest precision stored in the grid's edges or widths. The default
+`callback_type` is selected from the stored bounds when reusing a grid.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))
@@ -62,7 +81,8 @@ region.
 Enable VEGAS+ with `stratified = true`. VEGAS+ divides the transformed unit box
 into equal-volume strata and allocates more evaluations to strata with larger
 estimated variation. Each iteration uses exactly `ncalls` evaluations and
-reserves at least two per stratum to estimate its variance. Stratification can
+reserves at least two per stratum to estimate its variance. Stratum errors
+retain their scale for allocation and iteration weighting. Stratification can
 help with narrow ridges and peaks aligned along a diagonal.
 
 ```@example matrix_batch

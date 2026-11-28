@@ -53,7 +53,7 @@ using Test
         seed!(1618)
         result = vegas(
             [lb], [ub]; stratified = true, batch = :matrix, nbins = 8,
-            ncalls = 32, maxiter = 3, rtol = 0.0, atol = 0.0
+            ncalls = 32, maxiter = 3, rtol = 0.0, atol = 0.0, callback_type = BigFloat
         ) do points
             batches[] += 1
             if batches[] == 1
@@ -244,15 +244,16 @@ using Test
         strata = MonteCarloIntegration._VegasStrata(1, 8)
         strata.counts .= [3, 5]
         estimate, error = MonteCarloIntegration._stratified_estimate!(strata, [1.0, 2, 3, 8, 9, 10, 11, 12])
-        @test estimate ≈ 6.0
-        @test error^2 ≈ 5 / 24
+        @test MonteCarloIntegration._rounded_mean(estimate) ≈ 6.0
+        @test MonteCarloIntegration._rounded_error(error)^2 ≈ 5 / 24
         weights = MonteCarloIntegration._stratified_training_weights!(strata)
         @test weights ≈ [fill(4 / 3, 3); fill(4 / 5, 5)]
 
         MonteCarloIntegration._stratified_estimate!(strata, [0.0, 10, 20, 0, 0, 0, 0, 0])
         MonteCarloIntegration._redistribute_strata!(strata)
         @test strata.counts == [6, 2]
-        @test MonteCarloIntegration._stratified_estimate!(strata, [fill(10.0, 6); 2.0; 2.0]) == (6.0, 0.0)
+        estimate, error = MonteCarloIntegration._stratified_estimate!(strata, [fill(10.0, 6); 2.0; 2.0])
+        @test (MonteCarloIntegration._rounded_mean(estimate), MonteCarloIntegration._rounded_error(error)) == (6.0, 0.0)
         MonteCarloIntegration._redistribute_strata!(strata)
         @test strata.counts == [4, 4]
     end
@@ -276,8 +277,9 @@ using Test
         end
 
         large = floatmax(Float64)
-        @test MonteCarloIntegration._stratum_average([large, large]) == large
-        @test MonteCarloIntegration._stratum_average([large, large, -large, -large, 1.0e-200]) ≈ 2.0e-201
+        average(values) = MonteCarloIntegration._rounded_mean(first(MonteCarloIntegration._stratum_average(values)))
+        @test average([large, large]) == large
+        @test average([large, large, -large, -large, 1.0e-200]) ≈ 2.0e-201
     end
 
     @testset "Scaled moments" begin
@@ -285,8 +287,8 @@ using Test
         for scale in (1.0e-250, 1.0e250)
             values = [fill(scale, 4); -scale; 0.0; 0.0; scale]
             estimate, error = MonteCarloIntegration._stratified_estimate!(strata, values)
-            @test estimate / scale ≈ 0.5
-            @test error / scale ≈ sqrt(1 / 24)
+            @test MonteCarloIntegration._rounded_mean(estimate) / scale ≈ 0.5
+            @test MonteCarloIntegration._rounded_error(error) / scale ≈ sqrt(1 / 24)
             MonteCarloIntegration._redistribute_strata!(strata)
             @test strata.counts == [2, 6]
             strata.counts .= 4
@@ -298,6 +300,62 @@ using Test
             )
             @test 0 < res.integral_estimate / scale < 1
             @test 0 < res.standard_deviation / scale < 1
+        end
+    end
+
+    @testset "Unrounded stratum moments" begin
+        q = nextfloat(0.0)
+        edge = floatmin(Float64)
+        tiny_cases = (
+            ([0.0, q, q, q], [0.0, q, q, q], nothing, 2, [4, 4], q, 0.0, 50.0),
+            ([0.0, 0.0, 2q, 2q], fill(q, 4), nothing, 2, [6, 2], q, 0.0, 98 / 5),
+            ([0.0, q, q, q], fill(q, 4), nothing, 2, [6, 2], q, 0.0, 98 / 5),
+            ([-q, q, q, q], [0.0, q, q, q], nothing, 1, [4, 4], q, 0.0, 0.0),
+            ([1.0, -1.0, 0.0, 2q], [0.0, q, q, q], nothing, 1, [4, 4], q, sqrt(1 / 24), 0.0),
+            ([nextfloat(edge, 2), edge, -edge, -edge], [0.0, q, q, q], nothing, 1, [4, 4], q, edge / sqrt(12), 0.0),
+            ([0.0, 0.0, 0.0, 3q], [0.0, 0.0, 0.0, 3q], [0.0, 0.0, q, q], 2, [4, 4], q, 0.0, 6 / 31),
+            (zeros(4), fill(q, 4), fill(q, 4), 2, [4, 4], q, 0.0, 0.0),
+            ([-4q, -4q, -4q, -3q], [-4q, -4q, -4q, -3q], [-2q, q, q, 3q], 2, [4, 4], -4q, 0.0, 36.0),
+            ([-4q, -4q, -q, 5q], [-4q, -3q, 2q, 5q], nothing, 1, [4, 4], -0.0, 2q, 0.0),
+            ([2q, -2q, q, 4q], [2q, -2q, q, 4q], [-5q, -4q, -2q, -3q], 2, [4, 4], -2q, 0.0, 114 / 5),
+            ([-3q, 2q, -2q, -3q], [-3q, 2q, -2q, -3q], [-q, 2q, -2q, 2q], 2, [4, 4], -0.0, q, 42 / 17),
+        )
+        translated_cases = map(((1.0, 1), (1.0e100, 1), (1.0, 1025))) do (a, steps)
+            b = nextfloat(a, steps)
+            delta = b - a
+            return ([a, b, b, b], [a, a, a, b], [a, a, a, b], 2, [4, 4], muladd(3 / 8, delta, a), delta / 8, 1.0)
+        end
+        for (left, right, second, maxiter, final_counts, estimate, stderr, chi_squared) in (tiny_cases..., translated_cases...),
+                batch in (false, true, :matrix)
+            calls = Ref(0)
+            counts = zeros(Int, 2, maxiter)
+            function evaluate(point)
+                iteration = calls[] ÷ 8 + 1
+                cell = only(point) < 0.5 ? 1 : 2
+                counts[cell, iteration] += 1
+                calls[] += 1
+                index = counts[cell, iteration]
+                iteration == 1 && return (left, right)[cell][index]
+                second === nothing && return index == 1 ? 1.0 : 3.0
+                return second[index]
+            end
+            integrand = if batch === false
+                evaluate
+            elseif batch === true
+                points -> map(evaluate, points)
+            else
+                points -> map(evaluate, eachcol(points))
+            end
+            seed!(131)
+            result = vegas(
+                integrand, [0.0], [1.0]; stratified = true, batch, maxiter, ncalls = 8,
+                nbins = 1, alpha = 0.0, atol = 0.0, rtol = 0.0,
+            )
+            @test calls[] == 8maxiter
+            @test counts[:, end] == final_counts
+            @test result.integral_estimate === estimate
+            @test result.standard_deviation ≈ stderr rtol = 8eps(Float64)
+            @test result.chi_squared_average ≈ chi_squared rtol = 8eps(Float64)
         end
     end
 

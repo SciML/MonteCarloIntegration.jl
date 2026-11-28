@@ -1,7 +1,7 @@
 struct _VegasStrata
     splits::Vector{Int}
     counts::Vector{Int}
-    means::Vector{Float64}
+    means::Vector{_IterationMean}
     scores::Vector{Float64}
     training_weights::Vector{Float64}
 end
@@ -36,7 +36,10 @@ function _VegasStrata(ndim, ncalls)
         count = other * splits[dim]
     end
 
-    strata = _VegasStrata(splits, Vector{Int}(undef, count), zeros(count), zeros(count), Vector{Float64}(undef, ncalls))
+    strata = _VegasStrata(
+        splits, Vector{Int}(undef, count), Vector{_IterationMean}(undef, count), zeros(count),
+        Vector{Float64}(undef, ncalls)
+    )
     _uniform_stratum_counts!(strata.counts, ncalls)
     return strata
 end
@@ -72,34 +75,115 @@ end
 
 function _stratified_estimate!(strata, values)
     first = 1
-    scale = 0.0
-    scaled_variance = 0.0
+    normal_scale = normal_variance = narrow_variance = 0.0
+    narrow_scale = _IterationError(0.0, 0)
+    exact_mean = false
     @inbounds for i in eachindex(strata.counts)
         count = strata.counts[i]
         last = first + count - 1
-        strata.means[i], error = _iteration_estimate(@view values[first:last])
-        strata.scores[i] = log(error) + 0.5 * log(count)
-        if error > scale
-            scaled_variance = scaled_variance * abs2(scale / error) + 1
-            scale = error
-        elseif error > 0
-            scaled_variance += abs2(error / scale)
+        cell_values = @view values[first:last]
+        mean, error, unrounded = _iteration_moments(cell_values)
+        strata.means[i] = mean
+        exact_mean |= unrounded !== nothing
+        if iszero(error)
+            strata.scores[i] = -Inf
+        elseif _needs_extended_error(error)
+            strata.scores[i] = log(error.mantissa) + error.exponent * log(2.0) + 0.5 * log(count)
+            if iszero(narrow_scale) || error.exponent > narrow_scale.exponent ||
+                    (error.exponent == narrow_scale.exponent && error.mantissa > narrow_scale.mantissa)
+                narrow_variance = narrow_variance * abs2(_stratum_error_ratio(narrow_scale, error)) + 1
+                narrow_scale = error
+            else
+                narrow_variance += abs2(_stratum_error_ratio(error, narrow_scale))
+            end
+        else
+            stderr = _rounded_error(error)
+            strata.scores[i] = log(stderr) + 0.5 * log(count)
+            if stderr > normal_scale
+                normal_variance = normal_variance * abs2(normal_scale / stderr) + 1
+                normal_scale = stderr
+            else
+                normal_variance += abs2(stderr / normal_scale)
+            end
         end
         first = last + 1
     end
 
     nstrata = length(strata.counts)
-    return _stratum_average(strata.means), scale * (sqrt(scaled_variance) / nstrata)
+    mean, tiny_tail = _stratum_average(strata.means)
+    if iszero(normal_scale)
+        scale, scaled_variance = narrow_scale, narrow_variance
+    else
+        scale = _scaled_error(normal_scale, 0)
+        scaled_variance = normal_variance + narrow_variance * abs2(_stratum_error_ratio(narrow_scale, scale))
+    end
+    error = _scaled_error(scale.mantissa * (sqrt(scaled_variance) / nstrata), scale.exponent)
+    exact_variance = _needs_extended_error(error)
+    if exact_variance || exact_mean || tiny_tail || _needs_exact_stratum_average(mean, strata.means)
+        unrounded, variance = _exact_stratum_moments(strata.counts, values, exact_variance)
+        return _IterationMean(_rounded_mean(unrounded), 0.0), error, unrounded, variance
+    end
+    return mean, error, nothing, nothing
 end
 
-function _stratum_average(values)
-    n = length(values)
-    total = _compensated_sum(identity, values)
-    isfinite(total) && return total / n
+_stratum_error_ratio(small, large) =
+    ldexp(small.mantissa / large.mantissa, small.exponent - large.exponent)
 
-    scale = exp2(ceil(log2(n)) + 1)
-    scaled_total = _compensated_sum(x -> x / scale, values)
-    return clamp(scaled_total * (scale / n), extrema(values)...)
+function _needs_exact_stratum_average(mean, values)
+    high = _rounded_mean(mean)
+    isfinite(high) || return true
+    abs(high) <= floatmin(Float64) || return false
+    !iszero(high) && return true
+    # A nonzero sum on a coarser lattice cannot round to zero after division by the count.
+    cutoff = length(values) * floatmin(Float64)
+    return any(values) do value
+        0 < abs(_rounded_mean(value)) <= cutoff || !iszero(_mean_low(value))
+    end
+end
+
+function _exact_stratum_moments(counts, values, exact_variance)
+    total = variance_total = big(0) // 1
+    first = 1
+    for count in counts
+        last = first + count - 1
+        cell = @view values[first:last]
+        if exact_variance
+            mean, variance = _exact_binary64_moments(cell, count)
+            total += mean
+            variance_total += variance
+        else
+            total += _binary64_sum_units(cell) // (BigInt(count) << 1074)
+        end
+        first = last + 1
+    end
+    nstrata = length(counts)
+    return total / nstrata, exact_variance ? variance_total / BigInt(nstrata)^2 : nothing
+end
+
+function _stratum_total(means, scale)
+    total = correction = 0.0
+    for mean in means
+        total, residual = _two_sum(total, _rounded_mean(mean) / scale)
+        correction += residual + _mean_low(mean) / scale
+    end
+    return total, correction
+end
+
+function _stratum_average(means)
+    n = length(means)
+    scale = 1.0
+    total, correction = _stratum_total(means, scale)
+    if !isfinite(total + correction)
+        scale = exp2(ceil(log2(n)) + 1)
+        total, correction = _stratum_total(means, scale)
+    end
+    average = total / n
+    residual = fma(-average, Float64(n), total) + correction
+    adjustment = residual / n
+    high, low = _two_sum(average, adjustment)
+    tail = low * scale
+    tiny_tail = !iszero(residual) && abs(adjustment * scale) < floatmin(Float64)
+    return _IterationMean(high * scale, tail), tiny_tail
 end
 
 function _stratified_training_weights!(strata)
