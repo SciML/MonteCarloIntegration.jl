@@ -4,37 +4,31 @@ function _check_vegas_batch(batch)
 end
 
 function _vegas_callback_coordinates(func, grid, batch, requested)
-    if requested === BigFloat
-        (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat, nothing
-        throw(ArgumentError("active BigFloat precision cannot preserve the callback bounds; increase it with setprecision"))
-    end
+    requested === BigFloat && return _bigfloat_callback_coordinates(grid)
     (requested === nothing || requested === Float64) ||
         throw(ArgumentError("callback_type must be nothing, Float64, or BigFloat"))
-    (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64, nothing
-    if requested === nothing
-        wide = _vegas_callback_argument(BigFloat, batch)
-        narrow = _vegas_callback_argument(Float64, batch)
-        if applicable(func, wide)
-            applicable(func, narrow) || return BigFloat, nothing
-            bounds = _inward_float64_callback_bounds(grid)
-            if bounds !== nothing && _float64_callback_geometry_is_fine(grid, bounds) &&
-                    which(func, (typeof(wide),)) === which(func, (typeof(narrow),))
-                return Float64, bounds
-            end
-            return BigFloat, nothing
-        end
-        applicable(func, narrow) ||
-            throw(ArgumentError("the integrand must accept BigFloat or Float64 coordinates in the selected batch mode"))
+    accepts_float64 = requested === Float64 || applicable(func, _vegas_callback_argument(Float64, batch))
+    if accepts_float64
+        (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64, nothing
+        bounds = _inward_float64_callback_bounds(grid)
+        bounds !== nothing && return Float64, bounds
     end
-    bounds = _inward_float64_callback_bounds(grid)
-    bounds !== nothing && return Float64, bounds
-    throw(ArgumentError("Float64 callback coordinates require at least one finite Float64 value within every axis"))
+    if requested === nothing && applicable(func, _vegas_callback_argument(BigFloat, batch))
+        return _bigfloat_callback_coordinates(grid)
+    end
+    accepts_float64 && throw(ArgumentError("Float64 callback coordinates require at least one finite Float64 value within every axis"))
+    throw(ArgumentError("the integrand must accept Float64 or BigFloat coordinates in the selected batch mode"))
+end
+
+function _bigfloat_callback_coordinates(grid)
+    (eltype(grid) === BigFloat || _callback_bounds_fit(BigFloat, grid)) && return BigFloat, nothing
+    throw(ArgumentError("active BigFloat precision cannot preserve the callback bounds; increase it with setprecision"))
 end
 
 _vegas_batch_argument(points, batch) = batch === true ? collect(eachcol(points)) : points
 
 function _vegas_callback_argument(::Type{T}, batch) where {T}
-    points = Matrix{T}(undef, 1, 1)
+    points = Matrix{T}(undef, 0, 1)
     return batch === false ? first(eachcol(points)) : _vegas_batch_argument(points, batch)
 end
 
@@ -57,23 +51,6 @@ function _inward_float64_callback_bounds(grid)
         lower[dim], upper[dim] = lo, hi
     end
     return lower, upper
-end
-
-function _float64_callback_geometry_is_fine(grid, bounds)
-    lower, upper = bounds
-    nbins = size(grid, 1) - 1
-    for dim in axes(grid, 2)
-        a, b = minmax(grid[begin, dim], grid[end, dim])
-        a == b && continue
-        lo, hi = lower[dim], upper[dim]
-        lo < hi || return false
-        inward_span = BigFloat(hi) - BigFloat(lo)
-        removed = (BigFloat(lo) - a) + (b - BigFloat(hi))
-        spacing = max(nextfloat(lo) - lo, hi - prevfloat(hi))
-        removed <= 2eps(Float64) * inward_span || return false
-        spacing <= sqrt(eps(Float64)) * (inward_span / nbins) || return false
-    end
-    return true
 end
 
 _callback_grid_point(point, grid, dim, ::Nothing) = _bound_grid_point(point, grid, dim)
@@ -140,8 +117,8 @@ call. The number of bins comes from the grid. If supplied, `nbins` must match
 that number. Uniform grids with bins too narrow for `Float64` are reconstructed
 at the active `BigFloat` precision. Reusing a `BigFloat` grid requires active
 precision at least as high as the largest precision stored in its edges or
-widths. The default `callback_type` uses the stored bounds and the integrand's
-supported coordinate type in the selected batch mode.
+widths. The default `callback_type` prefers `Float64` when the integrand accepts
+it and each stored axis contains a finite `Float64` value.
 Other keywords have the same meaning as in [`vegas`](@ref).
 """
 function vegas(func, previous::VEGASResult; nbins = nothing, kwargs...)

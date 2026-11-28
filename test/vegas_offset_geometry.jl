@@ -36,13 +36,14 @@ end
         t = only(x) - offset - 4
         return abs2(t * (t * t - 4))
     end
+    wide_polynomial(x::AbstractVector{BigFloat}) = polynomial(x)
     t = big(31) // 8
     exact = Float64(2 * (t^7 / 7 - 8t^5 / 5 + 16t^3 / 3))
     options = (; nbins = 1, ncalls = 32_768, maxiter = 1, alpha = 0.0)
     seed!(440)
-    fresh = vegas(polynomial, [lo], [hi]; options...)
+    fresh = vegas(wide_polynomial, [lo], [hi]; options...)
     seed!(440)
-    reused = vegas(polynomial, fresh; options...)
+    reused = vegas(wide_polynomial, fresh; options...)
     seed!(440)
     explicit = vegas(polynomial, [lo], [hi]; options..., callback_type = BigFloat)
     @test fresh.standard_deviation > 0
@@ -53,57 +54,74 @@ end
 
 @testset "VEGAS dispatches on the callback argument shape" begin
     offset = BigFloat(2)^53
-    lo, hi = offset + 1 // 8, offset + 63 // 8
+    coarse = (offset + 1 // 8, offset + 63 // 8)
+    fine = BigFloat(2)^20 + BigFloat(2)^-34
     seen = Float64[]
     wide = BigFloat[]
+    calls = Ref(0)
     point64 = typeof(first(eachcol(zeros(1, 1))))
     views64 = typeof(collect(eachcol(zeros(1, 1))))
-    scalar64(x::point64) = (push!(seen, only(x)); 1.0)
-    batch64(x::views64) = map(scalar64, x)
+    record(x) = (push!(seen, only(x)); 1.0)
+    scalar64(x::point64) = (calls[] += 1; record(x))
+    batch64(x::views64) = (calls[] += 1; map(record, x))
     options = (; nbins = 4, ncalls = 64, maxiter = 2, alpha = 0.0)
     output = zeros(options.ncalls)
-    matrix64(x::Matrix{Float64}) = map!(scalar64, output, eachcol(x))
+    matrix64(x::Matrix{Float64}) = (calls[] += 1; map!(record, output, eachcol(x)))
+    scalar_wide(x::AbstractVector{BigFloat}) = (push!(wide, only(x)); 2.0)
+    batch_wide(x::Vector{<:AbstractVector{BigFloat}}) = map(scalar_wide, x)
+    matrix_wide(x::Matrix{BigFloat}) = map!(scalar_wide, output, eachcol(x))
     scalar_dual(x::point64) = scalar64(x)
-    scalar_dual(x::AbstractVector{BigFloat}) = (push!(wide, only(x)); 2.0)
+    scalar_dual(x::AbstractVector{BigFloat}) = scalar_wide(x)
     batch_dual(x::views64) = batch64(x)
-    batch_dual(x::Vector{<:AbstractVector{BigFloat}}) = map(scalar_dual, x)
+    batch_dual(x::Vector{<:AbstractVector{BigFloat}}) = batch_wide(x)
     matrix_dual(x::Matrix{Float64}) = matrix64(x)
-    matrix_dual(x::Matrix{BigFloat}) = map!(scalar_dual, output, eachcol(x))
+    matrix_dual(x::Matrix{BigFloat}) = matrix_wide(x)
 
-    for (a, b) in ((lo, hi), (hi, lo)), (batch, narrow, dual) in ((false, scalar64, scalar_dual), (true, batch64, batch_dual), (:matrix, matrix64, matrix_dual))
+    layouts = ((false, scalar64, scalar_wide, scalar_dual), (true, batch64, batch_wide, batch_dual), (:matrix, matrix64, matrix_wide, matrix_dual))
+    for (lo, hi) in (coarse, (fine, fine + 1)), (a, b) in ((lo, hi), (hi, lo)), (batch, narrow, wide_only, dual) in layouts
         @testset "$batch, $a → $b" begin
             expected = Float64(b - a)
             empty!(seen)
             empty!(wide)
+            calls[] = 0
             fresh = vegas(narrow, [a], [b]; options..., batch)
             @test fresh.integral_estimate == expected
             @test eltype(fresh.adaptive_grid) === BigFloat
             @test vegas(narrow, fresh; options..., batch).integral_estimate == expected
             wrapper(x) = narrow(x)
-            @test vegas(wrapper, [a], [b]; options..., batch, callback_type = Float64).integral_estimate == expected
+            @test vegas(wrapper, [a], [b]; options..., batch).integral_estimate == expected
+            @test vegas(wrapper, fresh; options..., batch).integral_estimate == expected
+            @test vegas(dual, [a], [b]; options..., batch).integral_estimate == expected
+            @test vegas(dual, fresh; options..., batch).integral_estimate == expected
             @test vegas(wrapper, fresh; options..., batch, callback_type = Float64).integral_estimate == expected
-            @test length(seen) == 4 * options.ncalls * options.maxiter
+            @test calls[] == 7 * options.maxiter * (batch === false ? options.ncalls : 1)
+            @test length(seen) == 7 * options.ncalls * options.maxiter
             @test all(p -> lo <= p <= hi, seen)
-            @test vegas(dual, [a], [b]; options..., batch).integral_estimate == 2expected
-            @test vegas(dual, fresh; options..., batch).integral_estimate == 2expected
-            @test length(wide) == 2 * options.ncalls * options.maxiter
+            @test vegas(wide_only, [a], [b]; options..., batch).integral_estimate == 2expected
+            @test vegas(wide_only, fresh; options..., batch).integral_estimate == 2expected
+            @test vegas(dual, fresh; options..., batch, callback_type = BigFloat).integral_estimate == 2expected
+            @test length(wide) == 3 * options.ncalls * options.maxiter
             @test all(p -> lo <= p <= hi, wide)
         end
     end
 
+    lo, hi = coarse
     seed!(441)
     next_draw = rand(UInt64)
     seed!(441)
     @test_throws ArgumentError vegas(matrix64, [lo], [hi]; options..., batch = false)
     @test rand(UInt64) == next_draw
 
-    calls = Ref(0)
-    function wrapper_needing_float64(x)
+    calls[] = 0
+    failure = ErrorException("callback failed")
+    function failing_callback(_)
         calls[] += 1
-        return scalar64(x)
+        throw(failure)
     end
-    @test_throws MethodError vegas(wrapper_needing_float64, [lo], [hi]; options...)
+    @test_throws failure vegas(failing_callback, [lo], [hi]; options...)
     @test calls[] == 1
+
+    @test vegas(matrix_wide, [0.0], [1.0]; options..., batch = :matrix).integral_estimate == 2.0
 end
 
 @testset "VEGAS preserves Float64 callbacks on resolvable inexact bounds" begin
@@ -159,7 +177,8 @@ end
         fresh = vegas(wrapper, [a], [b]; options...)
         @test fresh.integral_estimate == expected
         @test vegas(wrapper, fresh; options...).integral_estimate == expected
-        @test vegas(dual, fresh; options...).integral_estimate == 2expected
+        @test vegas(dual, fresh; options...).integral_estimate == expected
+        @test vegas(dual, fresh; options..., callback_type = BigFloat).integral_estimate == 2expected
     end
 end
 

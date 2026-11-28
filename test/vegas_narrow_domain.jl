@@ -52,7 +52,7 @@ end
     lo, hi, previous = setprecision(BigFloat, 256) do
         lo, hi = BigFloat(1), BigFloat(1) + BigFloat(2)^-80
         Random.seed!(2518)
-        trained = vegas(x -> (x[1] - lo) / (hi - lo), [lo], [hi]; nbins = 4, ncalls = 256, maxiter = 2)
+        trained = vegas(x -> (x[1] - lo) / (hi - lo), [lo], [hi]; nbins = 4, ncalls = 256, maxiter = 2, callback_type = BigFloat)
         # The widths fit in 64 bits of precision even when coordinates need more.
         spacing = (hi - lo) / 2^48
         edges = lo .+ round.((trained.adaptive_grid .- lo) ./ spacing) .* spacing
@@ -72,7 +72,7 @@ end
     setprecision(BigFloat, 256) do
         interior = BigFloat[]
         Random.seed!(2519)
-        vegas(previous; ncalls = 64, maxiter = 1) do x
+        vegas(previous; ncalls = 64, maxiter = 1, callback_type = BigFloat) do x
             push!(interior, only(x))
             return 1
         end

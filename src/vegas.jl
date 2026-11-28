@@ -35,21 +35,16 @@ span to `Float64` accuracy and resolve the bins. Increase it around the call
 with `setprecision(BigFloat, bits)` if needed. Integral estimates and standard
 errors use `Float64`.
 
-With `callback_type = nothing`, the integrand receives `Float64` coordinates when
-all stored bounds are exactly representable as finite `Float64` values. For
-inexact bounds on a widened grid, VEGAS prefers an applicable `BigFloat` method.
-A method shared by both coordinate types keeps `Float64` when inward rounding
-preserves the span to `Float64` accuracy and the spacing is small relative to the
-nominal bin widths. A `Float64`-only callback receives inward-clamped coordinates
-if each axis contains a finite `Float64` value. Narrow intervals can produce
-repeated coordinates, including a single representable value. The grid and
-weights keep their precision.
-
-Use `callback_type = Float64` for a generic wrapper around a Float64-only function
-when the wrapper needs to receive `Float64` regardless of the grid spacing.
-Use `callback_type = BigFloat` to receive interior coordinates from a widened grid.
-On a `Float64` grid, this converts the existing coordinates at the active
-`BigFloat` precision, which must preserve the bounds.
+With `callback_type = nothing`, VEGAS uses `Float64` when the integrand accepts
+the selected argument shape and each axis contains a finite `Float64` value.
+Otherwise it uses `BigFloat` when the integrand accepts that shape. This rule
+applies to a scalar coordinate view, a vector of views, and a matrix batch.
+Float64 coordinates are clamped inward, while grid edges and weights retain their
+precision. Narrow intervals can produce repeated coordinates, including a single
+representable value. Use `callback_type = BigFloat` to receive interior coordinates
+from a widened grid. On a `Float64` grid, this converts existing coordinates at
+the active `BigFloat` precision, which must preserve the bounds. An explicit
+`callback_type = Float64` requires a finite `Float64` value inside every axis.
 
 The result contains `integral_estimate`, its estimated standard error
 `standard_deviation`, the reduced chi-squared `chi_squared_average`, and the

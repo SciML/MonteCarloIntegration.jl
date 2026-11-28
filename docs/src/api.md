@@ -27,27 +27,24 @@ and the signed span to `Float64` accuracy and resolve the bins. If needed, use
 integrand can accept both coordinate types by preserving the element type of
 its inputs.
 
-The default `callback_type = nothing` passes `Float64` coordinates when all
-stored bounds are exactly representable as finite `Float64` values. When a widened
-grid has inexact `Float64` bounds, VEGAS looks for an applicable `BigFloat`
-method for the scalar view, vector of views, or matrix in the selected batch
-mode. When both coordinate types select the same method, VEGAS keeps `Float64`
-if inward rounding removes at most `2eps(Float64)` of each interval's inward
-span and the `Float64` spacing is at most `sqrt(eps(Float64))` of a nominal bin
-width on each axis. Float64-only callbacks receive inward-clamped values if
-each axis contains a finite `Float64` coordinate. They can receive repeated
-values on narrow intervals, including the same value for every sample. The grid
-and its weights retain their precision.
+With `callback_type = nothing`, VEGAS supplies `Float64` coordinates when the
+integrand accepts the selected callback shape and every axis contains a finite
+`Float64` value. This preference applies to scalar views, vectors of views, and
+matrix batches. When the Float64 path is unavailable, VEGAS supplies `BigFloat`
+coordinates if the integrand accepts that shape. Float64 coordinates are clamped
+inward. Narrow intervals can produce repeated points, including a single
+representable value for every sample. The grid and its weights keep their
+precision. Explicit `callback_type = Float64` requires a finite `Float64` value
+inside each axis.
 
-VEGAS checks which argument types the callable accepts through Julia dispatch.
-For a generic wrapper around a Float64-only function, select `callback_type = Float64`
-explicitly.
+The default preserves Float64 dispatch for a generic wrapper around a Float64-only
+function on the following inexact interval.
 
 ```@example matrix_batch
 float64_only(x::AbstractVector{Float64}) = 1.0
-offset = BigFloat(2)^53
-lower, upper = offset + 1 // 8, offset + 63 // 8
-legacy = vegas(x -> float64_only(x), [lower], [upper]; nbins = 4, callback_type = Float64)
+lower = BigFloat(2)^20 + BigFloat(2)^-34
+upper = lower + 1
+legacy = vegas(x -> float64_only(x), [lower], [upper]; nbins = 4)
 legacy.integral_estimate
 ```
 
