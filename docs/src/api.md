@@ -18,10 +18,13 @@ trained.integral_estimate
 ```
 
 VEGAS uses `BigFloat` coordinates when bin widths are subnormal or approach the
-local spacing between representable `Float64` values, a span overflows, an
-integer bound is rounded, or rounding the bounds materially changes the
-interval's span. A matrix-batched integrand can accept both types by preserving
-the element type of its inputs.
+local spacing between representable `Float64` values, a bound or span overflows,
+a binary-exact bound is rounded, or rounding the bounds materially changes the
+interval's span. The active precision must preserve binary-exact bounds and the
+signed span to `Float64` accuracy, and it must resolve the bins. If needed, use
+`setprecision(BigFloat, bits)` around the integration call. A matrix-batched
+integrand can accept both coordinate types by preserving the element type of
+its inputs.
 
 ### Reuse the adaptive grid
 
