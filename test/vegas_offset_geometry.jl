@@ -1,6 +1,6 @@
 using MonteCarloIntegration: MonteCarloIntegration, vegas
 using Random: seed!
-using Test: @test, @testset, @test_throws
+using Test: @test, @test_logs, @testset, @test_throws
 
 @testset "VEGAS preserves integer bounds above binary64 precision" begin
     offset = 2^53
@@ -50,6 +50,38 @@ end
     @test abs(fresh.integral_estimate - exact) < 4 * fresh.standard_deviation
     @test fresh.integral_estimate == reused.integral_estimate == explicit.integral_estimate
     @test fresh.standard_deviation == reused.standard_deviation == explicit.standard_deviation
+end
+
+@testset "VEGAS warns about sparse default Float64 coordinates" begin
+    offset = BigFloat(2)^53
+    lo, hi = offset + 1 // 8, offset + 63 // 8
+    options = (; batch = true, nbins = 4, ncalls = 64, maxiter = 1, alpha = 0.0)
+    seen = Float64[]
+    calls = Ref(0)
+    function narrow(points::Vector{<:AbstractVector{Float64}})
+        calls[] += 1
+        append!(seen, only.(points))
+        return ones(length(points))
+    end
+    wrapper(points) = narrow(points)
+    seed!(440)
+    sampled = @test_logs (:warn, r"at most four distinct Float64 coordinates.*callback_type = BigFloat") vegas(wrapper, [lo], [hi]; options...)
+    @test sampled.integral_estimate == 7.75
+    @test calls[] == 1
+    @test length(seen) == options.ncalls
+    @test length(unique(seen)) == 3
+    @test all(p -> lo <= p <= hi, seen)
+    seed!(440)
+    explicit = @test_logs vegas(wrapper, [lo], [hi]; options..., callback_type = Float64)
+    @test explicit.integral_estimate == sampled.integral_estimate
+    @test calls[] == 2
+
+    wide(points::Vector{<:AbstractVector{BigFloat}}) = ones(length(points))
+    @test_logs vegas(wide, [lo], [hi]; options..., callback_type = BigFloat)
+    @test_logs vegas(wide, [lo], [hi]; options...)
+    fine = BigFloat(2)^20 + BigFloat(2)^-34
+    @test_logs vegas(wrapper, [fine], [fine + 1]; options...)
+    @test_logs vegas(wrapper, [0.0], [1.0]; options...)
 end
 
 @testset "VEGAS dispatches on the callback argument shape" begin

@@ -35,7 +35,9 @@ coordinates if the integrand accepts that shape. Float64 coordinates are clamped
 inward. Narrow intervals can produce repeated points, including a single
 representable value for every sample. The grid and its weights keep their
 precision. Explicit `callback_type = Float64` requires a finite `Float64` value
-inside each axis.
+inside each axis. The default warns when a nonzero axis of a widened grid has
+at most four distinct `Float64` coordinates. Use `callback_type = Float64` to
+select those coordinates explicitly and suppress this diagnostic.
 
 The default preserves Float64 dispatch for a generic wrapper around a Float64-only
 function on the following inexact interval.

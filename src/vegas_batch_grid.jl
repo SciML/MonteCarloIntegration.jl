@@ -9,9 +9,12 @@ function _vegas_callback_coordinates(func, grid, batch, requested)
         throw(ArgumentError("callback_type must be nothing, Float64, or BigFloat"))
     accepts_float64 = requested === Float64 || applicable(func, _vegas_callback_argument(Float64, batch))
     if accepts_float64
-        (eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)) && return Float64, nothing
-        bounds = _inward_float64_callback_bounds(grid)
-        bounds !== nothing && return Float64, bounds
+        exact = eltype(grid) === Float64 || _callback_bounds_fit(Float64, grid)
+        bounds = exact ? nothing : _inward_float64_callback_bounds(grid)
+        if exact || bounds !== nothing
+            requested === nothing && eltype(grid) === BigFloat && _warn_sparse_float64_callbacks(grid, bounds)
+            return Float64, bounds
+        end
     end
     if requested === nothing && applicable(func, _vegas_callback_argument(BigFloat, batch))
         return _bigfloat_callback_coordinates(grid)
@@ -51,6 +54,19 @@ function _inward_float64_callback_bounds(grid)
         lower[dim], upper[dim] = lo, hi
     end
     return lower, upper
+end
+
+function _warn_sparse_float64_callbacks(grid, bounds)
+    for dim in axes(grid, 2)
+        a, b = minmax(grid[begin, dim], grid[end, dim])
+        a == b && continue
+        lo, hi = bounds === nothing ? (Float64(a), Float64(b)) : (bounds[1][dim], bounds[2][dim])
+        if hi <= nextfloat(lo, 3)
+            @warn "VEGAS callbacks can receive at most four distinct Float64 coordinates on this axis. Use callback_type = BigFloat for higher-precision samples." axis = dim maxlog = 1
+            return nothing
+        end
+    end
+    return nothing
 end
 
 _callback_grid_point(point, grid, dim, ::Nothing) = _bound_grid_point(point, grid, dim)
