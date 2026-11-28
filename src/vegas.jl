@@ -28,9 +28,11 @@ receives the reusable `length(lb) × ncalls` matrix. Each batch returns one valu
 
 Sample coordinates and grid edges normally use `Float64`. VEGAS uses `BigFloat`
 when bin widths are subnormal or approach the spacing between adjacent `Float64`
-values, a span overflows, an integer bound is rounded, or rounding the bounds
-materially changes the interval's span. Sample coordinates, edges, and widths
-then use the active `BigFloat` precision, which must resolve the bins.
+values, a bound or span overflows, a binary-exact bound is rounded, or rounding
+the bounds materially changes the interval's span. Sample coordinates, edges,
+and widths then use the active `BigFloat` precision. It must preserve binary-exact
+bounds, preserve the signed span to `Float64` accuracy, and resolve the bins.
+Increase the active precision with `setprecision(BigFloat, bits)` if needed.
 Integral estimates and standard errors use `Float64`.
 
 With `stratified = true`, VEGAS+ partitions the transformed unit box into
