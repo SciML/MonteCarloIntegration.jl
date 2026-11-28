@@ -70,6 +70,54 @@ using Test
         @test abs(result.integral_estimate - 2.0) < 5 * result.standard_deviation
     end
 
+    @testset "Stratified Jacobians for extreme boxes" begin
+        offset = 10^16
+        side_lengths = [1.0e-200, 1.0e-200, 1.0e200, 1.0e100]
+        exact_lb = ((offset + 12) // 1, 0.0, 0.0, 0.0)
+        exact_ub = ((offset + 1) // 1, 1.0e-200, 1.0e-200, 1.0e200)
+        cases = (
+            (zeros(4), side_lengths, 1.0e100, 1.0, Float64),
+            (zeros(4), side_lengths[[1, 3, 2, 4]], 1.0e100, 1.0, Float64),
+            (exact_lb, exact_ub, 1.0e200, -11.0, BigFloat),
+        )
+        ncalls, maxiter = 64, 3
+        for (lb, ub, value, expected, coordinate_type) in cases, batch in (false, true, :matrix)
+            buffer = Ref{AbstractMatrix}()
+            reused = Ref(true)
+            batch_sizes = Int[]
+            function observe!(points, count)
+                isassigned(buffer) || (buffer[] = points)
+                reused[] &= points === buffer[]
+                push!(batch_sizes, count)
+                return nothing
+            end
+            integrand = if batch === false
+                point -> begin
+                    observe!(parent(point), 1)
+                    value
+                end
+            elseif batch === true
+                points -> begin
+                    observe!(parent(first(points)), length(points))
+                    fill(value, length(points))
+                end
+            else
+                points -> begin
+                    count = size(points, 2)
+                    observe!(points, count)
+                    fill(value, count)
+                end
+            end
+            seed!(2718)
+            result = vegas(integrand, lb, ub; stratified = true, batch, ncalls, maxiter, nbins = 2, alpha = 0)
+            @test result.integral_estimate ≈ expected rtol = 16eps(Float64)
+            @test iszero(result.standard_deviation)
+            @test batch_sizes == (batch === false ? ones(Int, ncalls * maxiter) : fill(ncalls, maxiter))
+            @test reused[]
+            @test eltype(buffer[]) === coordinate_type
+        end
+    end
+
     @testset "Zero-error convergence" begin
         calls = Ref(0)
         options = (; stratified = true, ncalls = 100, nbins = 1, maxiter = 5)

@@ -3,14 +3,28 @@ function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
     isempty(lb) && throw(ArgumentError("the integration box needs at least one dimension"))
     wide_coordinates = false
     for dim in eachindex(lb, ub)
-        a, b = Float64(lb[dim]), Float64(ub[dim])
+        lo, hi = lb[dim], ub[dim]
+        a, b = Float64(lo), Float64(hi)
         isfinite(a) && isfinite(b) || throw(ArgumentError("bounds must be finite"))
+        span = b - a
         spacing = eps(max(abs(a), abs(b)))
-        lossy_endpoint = (lb[dim] isa Integer && a != lb[dim]) || (ub[dim] isa Integer && b != ub[dim])
-        wide_coordinates |= lossy_endpoint || (lb[dim] != ub[dim] && abs((b - a) / nbins) <= 2spacing)
+        wide_coordinates |= !isfinite(span) || (lo != hi && abs(span / nbins) <= 2spacing) ||
+            _lossy_float64_bounds(lo, hi, a, b)
     end
     return _uniform_vegas_grid(wide_coordinates ? BigFloat : Float64, lb, ub, nbins)
 end
+
+function _lossy_float64_bounds(lo, hi, a, b)
+    a == lo && b == hi && return false
+    ((lo isa Union{Integer, BigFloat} && a != lo) || (hi isa Union{Integer, BigFloat} && b != hi)) && return true
+    return !isapprox(_original_span(lo, hi), b - a; rtol = 2eps(Float64))
+end
+
+function _original_span(lo::Union{Integer, Rational, AbstractFloat}, hi::Union{Integer, Rational, AbstractFloat})
+    return Float64(Rational{BigInt}(hi) - Rational{BigInt}(lo))
+end
+
+_original_span(lo, hi) = Float64(BigFloat(hi) - BigFloat(lo))
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
     grid = Matrix{T}(undef, nbins + 1, length(lb))
@@ -24,6 +38,17 @@ end
 
 _grid_coordinate_type(edges, widths) =
     eltype(edges) === BigFloat || eltype(widths) === BigFloat ? BigFloat : Float64
+
+_stored_grid_precision(grid) = 0
+_stored_grid_precision(grid::AbstractArray{BigFloat}) = maximum(precision, grid; init = 0)
+
+function _check_grid_precision(edges, widths)
+    required = max(_stored_grid_precision(edges), _stored_grid_precision(widths))
+    iszero(required) && return nothing
+    active = precision(BigFloat)
+    active >= required || throw(ArgumentError("the grid requires BigFloat precision of at least $required bits (active precision is $active bits)"))
+    return nothing
+end
 
 function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, training_weights = nothing)
     nbins, ndim = size(mass)
