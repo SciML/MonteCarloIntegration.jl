@@ -153,12 +153,16 @@ function _grid_bounds_fit(lo, hi, a, b)
     _binary_bound_rounded(hi, b) && return false
     lo == hi && return a == b
     a == b && return false
-    actual = _exact_bound(b) - _exact_bound(a)
     scale = big(1) << max(0, min(precision(a), precision(b), 53) - 2)
     if !(lo isa Irrational || hi isa Irrational)
+        if a isa BigFloat && b isa BigFloat
+            return _bigfloat_grid_span_fits(lo, hi, a, b, scale)
+        end
+        actual = _exact_bound(b) - _exact_bound(a)
         expected = _exact_bound(hi) - _exact_bound(lo)
         return sign(expected) == sign(actual) && abs(expected - actual) * scale <= max(abs(expected), abs(actual))
     end
+    actual = _exact_bound(b) - _exact_bound(a)
     bits = max(64, precision(a), precision(b)) + 32
     magnitude = abs(actual)
     while true
@@ -170,6 +174,18 @@ function _grid_bounds_fit(lo, hi, a, b)
         bits *= 2
     end
     return
+end
+
+_grid_bound_error(original, rounded) = original == rounded ? 0 : _exact_bound(original) - _exact_bound(rounded)
+
+function _bigfloat_grid_span_fits(lo, hi, a, b, scale)
+    direction = cmp(b, a)
+    cmp(hi, lo) == direction || return false
+    error = _grid_bound_error(hi, b) - _grid_bound_error(lo, a)
+    # The larger of the two signed magnitudes is the stored span plus any outward error.
+    minimum_span = abs(error) * scale - max(0, direction * error)
+    return direction > 0 ? _compare_grid_span(b, a, minimum_span) >= 0 :
+        _compare_grid_span(a, b, minimum_span) >= 0
 end
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
@@ -186,7 +202,16 @@ function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
     end
 end
 
-_grid_coordinate_type(edges, widths) = float(promote_type(eltype(edges), eltype(widths)))
+_grid_value_type(grid) = eltype(grid)
+
+function _grid_value_type(grid::AbstractArray{T}) where {T}
+    return isconcretetype(T) ? T : mapreduce(typeof, promote_type, grid; init = Union{})
+end
+
+function _grid_coordinate_type(edges, widths)
+    T = promote_type(_grid_value_type(edges), _grid_value_type(widths))
+    return T === Union{} ? Float64 : float(T)
+end
 
 const _LowPrecisionGridFloat = Union{Float16, Float32}
 
@@ -205,14 +230,54 @@ function _bound_grid_point(point, grid, dim)
 end
 
 _stored_grid_precision(grid) = 0
+
+function _stored_grid_precision(grid::AbstractArray{T}) where {T}
+    return isconcretetype(T) ? 0 : maximum(x -> x isa BigFloat ? precision(x) : 0, grid; init = 0)
+end
 _stored_grid_precision(grid::AbstractArray{BigFloat}) = maximum(precision, grid; init = 0)
 _stored_grid_precision(edges, widths) = max(_stored_grid_precision(edges), _stored_grid_precision(widths))
 
-function _adapt_grid!(edges, widths, weights, proposed)
-    for dim in axes(weights, 2)
-        _rebin!(view(edges, :, dim), view(widths, :, dim), view(weights, :, dim), proposed)
+function _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, proposed = nothing)
+    nbins, ndim = size(mass)
+    (iszero(alpha) || nbins == 1) && return
+    scale = maximum(abs, values)
+    iszero(scale) && return
+    _bin_means!(mass, counts, bins, values, scale)
+    for dim in 1:ndim
+        _smooth_weights!(scratch, view(mass, :, dim), alpha)
+        candidate = proposed === nothing ? view(mass, :, dim) : proposed
+        _rebin!(view(grid, :, dim), view(widths, :, dim), scratch, candidate)
     end
     return nothing
+end
+
+function _bin_means!(mass, counts, bins, values, scale)
+    fill!(mass, 0)
+    fill!(counts, 0)
+    for j in eachindex(values)
+        squared = abs2(values[j] / scale)
+        for dim in axes(bins, 1)
+            bin = bins[dim, j]
+            mass[bin, dim] += squared
+            counts[bin, dim] += 1
+        end
+    end
+    for i in eachindex(mass, counts)
+        mass[i] /= max(1, counts[i])
+    end
+    return nothing
+end
+
+function _smooth_weights!(weights, histogram, alpha)
+    total = sum(histogram)
+    iszero(total) && return fill!(weights, 0)
+    n = length(histogram)
+    for i in 1:n
+        smoothed = (histogram[max(i - 1, 1)] + 6histogram[i] + histogram[min(i + 1, n)]) / 8
+        p = clamp(smoothed / total, 0.0, 1.0)
+        weights[i] = iszero(alpha) || isone(p) ? 1.0 : iszero(p) ? 0.0 : ((p - 1) / log(p))^alpha
+    end
+    return weights
 end
 
 function _set_uniform_grid_axis!(edges, widths, a::BigFloat, b::BigFloat)
@@ -307,44 +372,19 @@ function _rebin_grid_axis!(edges, working_widths, mass, proposed, bits)
 end
 
 """
-    calculate_d(Jsf, imat, nbins, alpha = 1.5)
+    calculate_d(values, bins, nbins, alpha = 1.5)
 
 Calculate smoothed importance weights for each bin and integration axis from
-Jacobian-weighted samples and their bin indices.
+Jacobian-weighted samples `values` and their `dimension × sample` bin indices.
 """
-function calculate_d(Jsf, imat, nbins, alpha = 1.5, scale = maximum(abs, Jsf))
-    ndim = size(imat, 1)
-    d = zeros(nbins, ndim)
-    (!isfinite(scale) || iszero(scale)) && return d
-    values = 1.0e-100 <= scale <= 1.0e100 ? Jsf : Jsf ./ scale
-    ni = length(values) / nbins
-    for i in eachindex(values)
-        squared = abs2(values[i]) / ni
-        for dim in 1:ndim
-            d[imat[dim, i], dim] += squared
-        end
-    end
-
-    weights = similar(d)
-    for dim in 1:ndim
-        mass = view(d, :, dim)
-        total = sum(mass)
-        if !isfinite(total) || iszero(total)
-            weights[:, dim] .= 0
-            continue
-        end
-        for i in 1:nbins
-            left, right = max(1, i - 1), min(nbins, i + 1)
-            smoothed = if i == 1
-                (7mass[i] + mass[right]) / 8
-            elseif i == nbins
-                (mass[left] + 7mass[i]) / 8
-            else
-                (mass[left] + 6mass[i] + mass[right]) / 8
-            end
-            p = clamp(smoothed / total, 0.0, 1.0)
-            weights[i, dim] = iszero(alpha) || isone(p) ? 1.0 : iszero(p) ? 0.0 : ((1 - p) / log(1 / p))^alpha
-        end
+function calculate_d(values, bins, nbins, alpha = 1.5)
+    mass = zeros(nbins, size(bins, 1))
+    scale = maximum(abs, values)
+    iszero(scale) && return mass
+    _bin_means!(mass, zeros(Int, size(mass)), bins, values, scale)
+    weights = similar(mass)
+    for dim in axes(weights, 2)
+        _smooth_weights!(view(weights, :, dim), view(mass, :, dim), alpha)
     end
     return weights
 end
@@ -359,6 +399,8 @@ function update_grid(edges, widths, weights)
     new_edges = copy(edges)
     new_widths = copy(widths)
     proposed = similar(new_widths, size(weights, 1))
-    _adapt_grid!(new_edges, new_widths, weights, proposed)
+    for dim in axes(weights, 2)
+        _rebin!(view(new_edges, :, dim), view(new_widths, :, dim), view(weights, :, dim), proposed)
+    end
     return new_edges, new_widths
 end

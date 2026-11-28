@@ -62,6 +62,8 @@ variation in the sampled integrand values.
 
 Pass a previous result to start a fresh estimate on its stored bounds and grid.
 The stored grid also determines the point type and BigFloat precision.
+In a manually supplied grid, an axis with integer or rational widths must have
+one set of edges that fits every edge and width at its stored precision.
 
 ```@example matrix_batch
 moment(x) = sum(abs2, x) * exp(-sum(abs2, x))

@@ -86,7 +86,10 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
     bins = Matrix{Int}(undef, ndim, ncalls)
     values = Vector{Float64}(undef, ncalls)
     jacobians = _vegas_weight_buffer(values, T)
-    proposed = similar(widths, nbins)
+    mass = similar(widths, Float64)
+    counts = similar(bins, nbins, ndim)
+    scratch = zeros(nbins)
+    proposed = T === BigFloat ? similar(widths, nbins) : nothing
     exponents = _vegas_jacobian_exponents(grid, widths, ncalls)
     estimates = _IterationMean[]
     errors = _IterationError[]
@@ -109,9 +112,8 @@ function _integrate_vegas(func, grid, widths, maxiter, ncalls, rtol, atol, debug
                 push!(history.variances, sample_variance)
             end
         end
-        if !iszero(stderr) && !iszero(alpha) && nbins > 1
-            weights = calculate_d(values, bins, nbins, alpha)
-            _adapt_grid!(grid, widths, weights, proposed)
+        if !iszero(stderr)
+            _adapt_grid!(grid, widths, bins, values, mass, counts, scratch, alpha, proposed)
         end
         if maxiter == 1
             mean = exact_mean === nothing ? _rounded_mean(estimate) : exact_mean
@@ -185,7 +187,8 @@ _float64_jacobian(value::BigFloat) = Float64(value, RoundNearest)
 
 @inline function _map_vegas_coordinate!(points, unit_points, bins, grid, widths, nbins, bits, dim, j)
     y = unit_points[dim, j] * nbins
-    bin = min(nbins, floor(Int, y) + 1)
+    bin = floor(Int, y) + 1
+    eltype(unit_points) === BigFloat && (bin = min(nbins, bin))
     bins[dim, j] = bin
     width = _grid_bin_width(grid, widths, bin, dim)
     point = muladd(y - (bin - 1), width, grid[bin, dim])
@@ -248,8 +251,8 @@ Sample within the bounds stored in the adaptive grid. Coordinates use the
 stored coordinate type and BigFloat precision.
 """
 function sample_from_adaptive_grid(res, ncalls)
-    x, delx = _sampling_grid(res)
-    return _with_vegas_precision(_stored_grid_precision(x, delx)) do
+    return _with_vegas_precision(_stored_grid_precision(res.adaptive_grid, res.grid_spacing)) do
+        x, delx = _sampling_grid(res)
         _with_vegas_mapping(x, delx) do working_widths, bits
             _sample_adaptive_grid(x, working_widths, ncalls, _grid_coordinate_type(x, delx), bits)
         end
