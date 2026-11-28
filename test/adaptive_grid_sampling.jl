@@ -124,3 +124,93 @@ end
         @test length(points) == 1 && -largest < only(only(points)) < largest
     end
 end
+
+@testset "Direct BigFloat sampling preserves seeded coordinates across rounding modes" begin
+    for bits in (8, 112)
+        lo = BigFloat(1; precision = bits)
+        hi = nextfloat(lo)
+        edges = reshape([lo, hi], :, 1)
+        widths = reshape([BigFloat(hi - lo; precision = bits)], :, 1)
+        result = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        for ncalls in (0, 1, 64)
+            function observe(mode)
+                return setrounding(BigFloat, mode) do
+                    seed!(54171)
+                    points = sample_from_adaptive_grid(result, ncalls)
+                    @test points isa Vector{Tuple{BigFloat}}
+                    @test all(p -> precision(only(p)) == bits, points)
+                    @test all(p -> only(p) == lo || only(p) == hi, points)
+                    @test ncalls < 2 || length(unique(points)) == 2
+                    @test rounding(BigFloat) === mode
+                    return points, rand(UInt64, 4)
+                end
+            end
+            nearest = observe(RoundNearest)
+            for mode in (RoundUp, RoundDown)
+                @test isequal(observe(mode), nearest)
+            end
+        end
+    end
+end
+
+@testset "Direct sampling uses nearest rounding for mixed stored matrices" begin
+    lo, hi = 1.0, nextfloat(1.0)
+    for (a, b) in ((lo, hi), (hi, lo)), big_edges in (false, true)
+        edge_values = big_edges ? BigFloat.([a, b]; precision = 53) : [a, b]
+        width_values = big_edges ? [b - a] : [BigFloat(b - a; precision = 53)]
+        edges = reshape(edge_values, :, 1)
+        widths = reshape(width_values, :, 1)
+        result = VEGASResult(0.0, 0.0, 0.0, edges, widths)
+        saved = (copy(edges), copy(widths))
+        function sample(mode)
+            return setrounding(BigFloat, mode) do
+                seed!(1)
+                points = sample_from_adaptive_grid(result, 256)
+                @test points isa Vector{Tuple{BigFloat}}
+                @test all(p -> precision(only(p)) == 53, points)
+                @test all(p -> only(p) == a || only(p) == b, points)
+                @test length(unique(points)) == 2
+                @test rounding(BigFloat) === mode
+                return points, rand(UInt64, 4)
+            end
+        end
+        nearest = sample(RoundNearest)
+        for mode in (RoundUp, RoundDown)
+            @test isequal(sample(mode), nearest)
+        end
+        @test isequal((edges, widths), saved)
+    end
+end
+
+@testset "Direct sampling accepts rounded mixed spacing" begin
+    edges, widths = setprecision(BigFloat, 128) do
+        grid = BigFloat[BigFloat(0), BigFloat("0.1"), BigFloat(1)]
+        grid, diff(grid)
+    end
+    reversed_widths = setprecision(BigFloat, 128) do
+        -reverse(widths)
+    end
+    for (edge_values, width_values) in ((edges, widths), (reverse(edges), reversed_widths))
+        grid = reshape(edge_values, :, 1)
+        nominal_widths = reshape(Float64.(width_values), :, 1)
+        result = VEGASResult(0.0, 0.0, 0.0, grid, nominal_widths)
+        reference = VEGASResult(0.0, 0.0, 0.0, grid, reshape(width_values, :, 1))
+        original = (copy(grid), copy(nominal_widths))
+        seed!(521)
+        expected = sample_from_adaptive_grid(reference, 128)
+        next_draw = rand(UInt64, 4)
+        for mode in (RoundNearest, RoundUp, RoundDown)
+            setrounding(BigFloat, mode) do
+                seed!(521)
+                points = sample_from_adaptive_grid(result, 128)
+                @test points isa Vector{Tuple{BigFloat}}
+                @test all(p -> precision(only(p)) == 128, points)
+                @test all(p -> first(edges) <= only(p) <= last(edges), points)
+                @test isequal(points, expected)
+                @test rand(UInt64, 4) == next_draw
+                @test rounding(BigFloat) === mode
+            end
+        end
+        @test isequal((grid, nominal_widths), original)
+    end
+end
