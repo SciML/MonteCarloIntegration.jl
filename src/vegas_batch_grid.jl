@@ -126,12 +126,17 @@ function _widen_uniform_grid(edges, widths)
     wide_widths = similar(wide_edges, size(widths))
     for dim in axes(edges, 2)
         if _is_uniform_grid_axis(view(edges, :, dim), view(widths, :, dim))
+            _check_bigfloat_grid_bounds(
+                edges[1, dim], edges[end, dim], wide_edges[1, dim], wide_edges[end, dim], size(widths, 1),
+            )
             _set_uniform_grid_axis!(
                 view(wide_edges, :, dim), view(wide_widths, :, dim), wide_edges[1, dim], wide_edges[end, dim],
             )
         else
             for i in axes(widths, 1)
-                wide_widths[i, dim] = wide_edges[i + 1, dim] - wide_edges[i, dim]
+                a, b = wide_edges[i, dim], wide_edges[i + 1, dim]
+                _check_bigfloat_grid_bounds(edges[i, dim], edges[i + 1, dim], a, b, 1)
+                wide_widths[i, dim] = b - a
             end
         end
     end

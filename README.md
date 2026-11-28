@@ -74,9 +74,12 @@ second_moment = vegas(x -> sum(abs2, x) * exp(-sum(abs2, x)), trained)
 the adaptive grid in `trained`.
 
 When the integration bounds or bin widths require extra precision, VEGAS uses
-`BigFloat` coordinates. A batch callback can accept both coordinate types by
-preserving the type of its inputs. Reusing a `BigFloat` grid requires an active
-precision at least as high as the precision stored in its edges or widths.
+`BigFloat` coordinates. The active precision must preserve binary-exact bounds
+and the signed span to `Float64` accuracy, and it must resolve the bins. Increase
+it with `setprecision(BigFloat, bits)` if needed. A batch callback can accept both
+coordinate types by preserving the type of its inputs. Reusing a `BigFloat` grid
+requires active precision at least as high as the precision stored in its edges
+or widths.
 
 ### Roadmap 
 - Supporting vector valued functions

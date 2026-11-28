@@ -4,12 +4,22 @@ function _initialize_vegas_grid(lb, ub, nbins, ::Nothing)
     wide_coordinates = false
     for dim in eachindex(lb, ub)
         lo, hi = lb[dim], ub[dim]
-        a, b = Float64(lo), Float64(hi)
-        isfinite(a) && isfinite(b) || throw(ArgumentError("bounds must be finite"))
+        a, b = _grid_bound(Float64, lo), _grid_bound(Float64, hi)
+        if !isfinite(a) || !isfinite(b)
+            isfinite(lo) && isfinite(hi) || throw(ArgumentError("bounds must be finite"))
+            wide_coordinates = true
+            continue
+        end
         wide_coordinates |= _needs_wide_grid_axis(a, b, nbins, lo != hi) ||
             _lossy_float64_bounds(lo, hi, a, b)
     end
     return _uniform_vegas_grid(wide_coordinates ? BigFloat : Float64, lb, ub, nbins)
+end
+
+_grid_bound(::Type{T}, bound) where {T} = T(bound)
+
+function _grid_bound(::Type{Float64}, bound::Rational)
+    return Float64(BigFloat(bound, RoundNearest; precision = 128), RoundNearest)
 end
 
 function _needs_wide_grid_axis(a, b, nbins, nonflat = a != b)
@@ -18,27 +28,62 @@ function _needs_wide_grid_axis(a, b, nbins, nonflat = a != b)
     return !isfinite(span) || (nonflat && abs(span / nbins) <= max(2spacing, floatmin(Float64)))
 end
 
+_is_binary_exact_bound(bound::Union{Integer, AbstractFloat}) = true
+_is_binary_exact_bound(bound::Rational) = ispow2(denominator(bound))
+_is_binary_exact_bound(bound) = false
+
+_binary_bound_rounded(original, converted) =
+    _is_binary_exact_bound(original) && original != converted
+
 function _lossy_float64_bounds(lo, hi, a, b)
     a == lo && b == hi && return false
-    ((lo isa Union{Integer, BigFloat} && a != lo) || (hi isa Union{Integer, BigFloat} && b != hi)) && return true
-    return !isapprox(_original_span(lo, hi), b - a; rtol = 2eps(Float64))
+    return _binary_bound_rounded(lo, a) || _binary_bound_rounded(hi, b) || !_grid_span_matches(lo, hi, a, b, b - a, 1)
 end
 
-function _original_span(lo::Union{Integer, Rational, AbstractFloat}, hi::Union{Integer, Rational, AbstractFloat})
-    return Float64(Rational{BigInt}(hi) - Rational{BigInt}(lo))
+_original_rational_bound(original::Rational, converted) = Rational{BigInt}(original)
+_original_rational_bound(original::Union{Integer, AbstractFloat}, converted) = Rational{BigInt}(converted)
+
+function _original_rational_bound(original, converted)
+    bits = max(256, precision(BigFloat) + 64)
+    value = BigFloat(original; precision = bits)
+    isfinite(value) || throw(ArgumentError("bounds must be finite"))
+    # BigFloat's full decimal rendering uses the stored precision of the value.
+    parts = split(string(value), 'e'; limit = 2)
+    whole, fraction = split(first(parts), '.'; limit = 2)
+    exponent = length(parts) == 2 ? parse(Int, last(parts)) : 0
+    power = exponent - length(fraction)
+    coefficient = parse(BigInt, string(whole, fraction))
+    factor = big(10)^abs(power)
+    return power < 0 ? coefficient // factor : (coefficient * factor) // 1
 end
 
-_original_span(lo, hi) = Float64(BigFloat(hi) - BigFloat(lo))
+_span_within_float64_tolerance(expected, actual) =
+    abs(expected - actual) * (Int64(1) << 51) <= max(abs(expected), abs(actual))
+
+function _grid_span_matches(lo, hi, a, b, width, nbins)
+    expected = _original_rational_bound(hi, b) - _original_rational_bound(lo, a)
+    _span_within_float64_tolerance(expected, Rational{BigInt}(width) * nbins) || return false
+    return nbins == 1 || _span_within_float64_tolerance(expected, Rational{BigInt}(width * nbins))
+end
+
+function _check_bigfloat_grid_bounds(lo, hi, a, b, nbins)
+    reason = if _binary_bound_rounded(lo, a) || _binary_bound_rounded(hi, b)
+        "preserve the grid bounds exactly"
+    elseif !_grid_span_matches(lo, hi, a, b, (b - a) / nbins, nbins)
+        "preserve the signed grid span"
+    else
+        return nothing
+    end
+    throw(ArgumentError("active BigFloat precision ($(precision(BigFloat)) bits) cannot $reason; increase it with setprecision"))
+end
 
 function _uniform_vegas_grid(::Type{T}, lb, ub, nbins) where {T}
     grid = Matrix{T}(undef, nbins + 1, length(lb))
     widths = Matrix{T}(undef, nbins, length(lb))
     for dim in eachindex(lb, ub)
         lo, hi = lb[dim], ub[dim]
-        a, b = T(lo), T(hi)
-        if T === BigFloat && a == b && lo != hi
-            throw(ArgumentError("active BigFloat precision cannot distinguish the grid bounds"))
-        end
+        a, b = _grid_bound(T, lo), _grid_bound(T, hi)
+        T === BigFloat && _check_bigfloat_grid_bounds(lo, hi, a, b, nbins)
         _set_uniform_grid_axis!(view(grid, :, dim), view(widths, :, dim), a, b)
     end
     return grid, widths
