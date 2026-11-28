@@ -638,3 +638,119 @@ end
         @test rand(UInt64) == next_draw
     end
 end
+
+@testset "Exact widths and mixed-grid sampling" begin
+    options = (; ncalls = 4, maxiter = 1, alpha = 0.0)
+    draw(grid) = MonteCarloIntegration.sample_from_adaptive_grid(grid, 16)
+    stored(points, widths) = VEGASResult(0.0, 0.0, 0.0, reshape(points, :, 1), reshape(widths, :, 1))
+    function rejects(grid)
+        calls = Ref(0)
+        observe(_) = (calls[] += 1; 1.0)
+        seed!(4659)
+        next_draw = rand(UInt64)
+        seed!(4659)
+        @test_throws ArgumentError vegas(observe, grid; options...)
+        @test calls[] == 0
+        @test rand(UInt64) == next_draw
+        seed!(4659)
+        @test_throws ArgumentError draw(grid)
+        @test rand(UInt64) == next_draw
+    end
+    function canonical(grid)
+        result = vegas(Returns(1), grid; options...)
+        @test result.grid_spacing == diff(result.adaptive_grid; dims = 1)
+        seed!(5739)
+        actual = draw(grid)
+        next_draw = rand(UInt64)
+        seed!(5739)
+        @test actual == draw(result)
+        @test rand(UInt64) == next_draw
+    end
+    setprecision(BigFloat, 128) do
+        for (reverse_axis, direction) in ((identity, 1), (reverse, -1)), sign in (1, -1)
+            sign_widths = sign * direction
+            float16_axis = reverse_axis(sign .* Float16[0, 1, 2])
+            for I in (Int, BigInt)
+                width = Rational{I}[1 + 7 // 4096, 1 - 7 // 4096]
+                rejects(stored(float16_axis, sign_widths .* reverse_axis(width)))
+                allowed = Rational{I}[1 + 1 // 8192, 1 - 1 // 8192]
+                canonical(stored(float16_axis, sign_widths .* reverse_axis(allowed)))
+                rejects(stored(reverse_axis(sign .* Float16[1, nextfloat(Float16(1))]), [zero(I)]))
+                rejects(stored(reverse_axis(sign .* Float16[0, 2048, 4096]), sign_widths .* reverse_axis(I[2051, 2045])))
+                canonical(stored(float16_axis, fill(I(sign_widths), 2)))
+                exact_axis = reverse_axis(sign .* Rational{I}[0, 1, 2])
+                forged = Rational{I}[1 + 1 // 2^60, 1 - 1 // 2^60]
+                rejects(stored(exact_axis, sign_widths .* reverse_axis(forged)))
+            end
+
+            closed_span = reverse_axis(sign .* Float16[1, 2])
+            canonical(stored(closed_span, [sign_widths * (1 + 5 // 4096)]))
+            open_span = reverse_axis(sign .* Float16[1, nextfloat(Float16(2))])
+            rejects(stored(open_span, [sign_widths * (1 + 13 // 4096)]))
+
+            rational_axis = reverse_axis(sign .* [0 // 1, 1 // 3])
+            for width in (Float16(1 // 3), Float64(1 // 3), BigFloat(1 // 3; precision = 128))
+                canonical(stored(rational_axis, [copysign(width, sign_widths)]))
+                rejects(stored(rational_axis, [copysign(nextfloat(width), sign_widths)]))
+            end
+            for edge_precision in ((11, 11, 11), (128, 11, 128))
+                points = [BigFloat(sign * i; precision = edge_precision[i + 1]) for i in 0:2]
+                for (offset, check) in ((1 // 8192, canonical), (7 // 4096, rejects))
+                    widths = [BigFloat(sign_widths * w; precision = 128) for w in reverse_axis((1 + offset, 1 - offset))]
+                    check(stored(reverse_axis(points), widths))
+                end
+            end
+        end
+    end
+end
+
+@testset "Anchored mixed nominal widths preserve distinct stored edges" begin
+    options = (; ncalls = 16, maxiter = 1, alpha = 0.0)
+    sample(grid) = MonteCarloIntegration.sample_from_adaptive_grid(grid, 8)
+    setprecision(BigFloat, 128) do
+        nominal = Float16(1365 // 4096)
+        extent = 1 + ldexp(one(BigFloat), -80)
+        for sign in (1, -1), reversed in (false, true)
+            lo, hi = reversed ? (sign * extent, BigFloat(0)) : (BigFloat(0), sign * extent)
+            step = sign * (reversed ? -nominal : nominal)
+            function make_grid(bound, width)
+                edges = reshape([lo, lo + BigFloat(step), lo + 2BigFloat(step), bound], :, 1)
+                return VEGASResult(0.0, 0.0, 0.0, edges, fill(width, 3, 1))
+            end
+            @testset "$sign, reversed=$reversed" begin
+                grid = make_grid(hi, step)
+                widths = diff(grid.adaptive_grid; dims = 1)
+                reference = VEGASResult(0.0, 0.0, 0.0, grid.adaptive_grid, widths)
+                seed!(9462)
+                expected = vegas(Returns(1), reference; options...)
+                seed!(9462)
+                actual = vegas(Returns(1), grid; options...)
+                @test actual.adaptive_grid == grid.adaptive_grid
+                @test actual.grid_spacing == widths
+                @test (actual.integral_estimate, actual.standard_deviation) == (expected.integral_estimate, expected.standard_deviation)
+                seed!(7543)
+                expected_points = sample(reference)
+                next_draw = rand(UInt64)
+                seed!(7543)
+                @test sample(grid) == expected_points
+                @test rand(UInt64) == next_draw
+            end
+            @testset "Wrong final span, $sign, reversed=$reversed" begin
+                wrong = hi + copysign(ldexp(one(BigFloat), -9), step)
+                for invalid in (make_grid(wrong, step), make_grid(hi, Rational{BigInt}(step)))
+                    calls = Ref(0)
+                    callback(_) = (calls[] += 1; 1.0)
+                    seed!(96855)
+                    next_draw = rand(UInt64)
+                    seed!(96855)
+                    @test_throws ArgumentError vegas(callback, invalid; options...)
+                    @test calls[] == 0
+                    @test rand(UInt64) == next_draw
+                    seed!(96855)
+                    @test_throws ArgumentError sample(invalid)
+                    @test rand(UInt64) == next_draw
+                end
+            end
+        end
+    end
+end
